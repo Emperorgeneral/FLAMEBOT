@@ -116,6 +116,24 @@
       white-space: nowrap;
     }
 
+    .cardTitle {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .osIcon {
+      width: 18px;
+      height: 18px;
+      flex: 0 0 auto;
+      opacity: 0.92;
+    }
+
+    .osIcon path,
+    .osIcon rect {
+      fill: rgba(243, 244, 246, 0.88);
+    }
+
     h1 {
       font-size: 40px;
       letter-spacing: -0.02em;
@@ -202,7 +220,6 @@
         <div class="logo" aria-label="FlameBot">
           <img class="logoImg" src="assets/icon.ico" alt="FlameBot" />
         </div>
-        <div class="pill">Windows • MT4/MT5 Bundle</div>
       </div>
       <h1>FlameBot Downloads</h1>
       <p class="muted">Download the desktop app bundle. The MT4 + MT5 EAs are included inside the same download.</p>
@@ -211,7 +228,15 @@
 
     <div class="cards">
       <div class="card">
-        <h2>Windows (App + MT4/MT5 EAs)</h2>
+        <h2 class="cardTitle">
+          <svg class="osIcon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <rect x="2" y="3" width="9" height="9" rx="1.2" />
+            <rect x="13" y="3" width="9" height="9" rx="1.2" />
+            <rect x="2" y="14" width="9" height="9" rx="1.2" />
+            <rect x="13" y="14" width="9" height="9" rx="1.2" />
+          </svg>
+          Windows (App + MT4/MT5 EAs)
+        </h2>
         <p class="muted">Single zip bundle: FlameBot + EAs + installer helper.</p>
         <!-- Replace OWNER/REPO with your GitHub repo (recommended: GitHub Releases). -->
         <a class="btn" href="https://github.com/OWNER/REPO/releases/latest/download/FlameBot-Windows.zip">Download FlameBot for Windows</a>
@@ -222,7 +247,13 @@
       </div>
 
       <div class="card">
-        <h2>macOS</h2>
+        <h2 class="cardTitle">
+          <svg class="osIcon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M16.6 13.2c0-2.2 1.8-3.4 1.9-3.5-1-1.5-2.7-1.7-3.2-1.7-1.4-.1-2.7.8-3.4.8-.7 0-1.8-.8-3-.8-1.5 0-2.9.9-3.7 2.2-1.6 2.7-.4 6.7 1.1 8.9.7 1.1 1.6 2.3 2.8 2.2 1.1 0 1.5-.7 2.9-.7 1.3 0 1.7.7 2.9.7 1.2 0 2-.9 2.7-2 .8-1.2 1.1-2.4 1.1-2.4-.1 0-2.1-.8-2.1-3.7z"/>
+            <path d="M14.9 6.1c.6-.7 1-1.8.9-2.8-.9.1-2 .6-2.6 1.3-.6.7-1.1 1.7-.9 2.7 1 0 2-.5 2.6-1.2z"/>
+          </svg>
+          macOS
+        </h2>
         <p class="muted">Coming soon. (Best built on a Mac for code-signing/notarization.)</p>
         <a class="btn" href="#" onclick="return false;">Download for macOS (soon)</a>
       </div>

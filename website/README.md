@@ -13,7 +13,9 @@ This is a static website with:
 
 ## What to upload
 
-- Build output zip: `..\\dist\\FlameBot-Windows.zip`
+- Build output zips:
+	- `..\\dist\\FlameBot-Windows.zip`
+	- `..\\dist\\FlameBot-macOS.zip`
 
 ## Screenshots (optional)
 
@@ -31,9 +33,11 @@ Note: screenshots are shown on `download.html`.
 
 1) Create a GitHub repository and push this project.
 2) On GitHub: Releases -> New release
-3) Upload `dist/FlameBot-Windows.zip` as a release asset.
+3) Upload `dist/FlameBot-Windows.zip` and `dist/FlameBot-macOS.zip` as release assets.
 4) Use this URL format on the website:
 
 `https://github.com/Emperorgeneral/FLAMEBOT/releases/latest/download/FlameBot-Windows.zip`
+
+`https://github.com/Emperorgeneral/FLAMEBOT/releases/latest/download/FlameBot-macOS.zip`
 
 Update the Windows download link in `index.html` to point to wherever you host that zip (GitHub Release asset URL, S3/R2 public URL, etc.).

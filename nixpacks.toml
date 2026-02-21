@@ -1,0 +1,12 @@
+# Force Railway/Nixpacks to deploy the static site from the `website/` folder.
+# This avoids auto-detection picking up the Python desktop app in the repo root.
+
+providers = ["node"]
+
+[phases.install]
+cmds = [
+  "cd website && npm install"
+]
+
+[start]
+cmd = "cd website && npm start"

@@ -1,0 +1,21171 @@
+"""FlameBot Telegram Copier - Premium Wizard UI (Option C).
+
+This module provides a PyQt5 wizard interface that guides users through
+Telegram authentication (API credentials → phone number → code/password)
+while delegating all Telethon logic to a background worker thread.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import enum
+import os
+import sys
+import re
+import socket
+import threading
+import contextlib
+import shutil
+import webbrowser
+import urllib.error
+import urllib.parse
+import urllib.request
+import base64
+import ctypes
+import ctypes.wintypes
+import hmac
+import hashlib
+import unicodedata
+try:
+    from importlib import metadata as importlib_metadata
+except Exception:  # pragma: no cover
+    importlib_metadata = None  # type: ignore[assignment]
+from logging.handlers import RotatingFileHandler
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+import time
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Tuple
+import copy
+from collections import OrderedDict, deque
+
+import ctypes
+from ctypes import wintypes
+from PyQt5 import QtCore, QtGui, QtWidgets
+from telethon import TelegramClient, events, utils as tg_utils
+from telethon.errors import (
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberBannedError,
+    PhoneNumberInvalidError,
+    RPCError,
+    SessionPasswordNeededError,
+)
+from telethon.sessions import SQLiteSession, StringSession
+from telethon.tl.types import Channel, Chat
+
+try:
+    import winreg
+except ImportError:  # pragma: no cover - Windows-only dependency
+    winreg = None
+
+# Windows taskbar app ID
+if hasattr(ctypes, "windll"):
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("FlameBot.App")
+    except Exception:
+        pass
+
+SESSION_DIR = Path.home() / ".tg_copier"
+SETTINGS_FILE = Path("settings.json")
+SETTINGS_FALLBACK_FILE = SESSION_DIR / "settings.json"
+
+# Local signal/message persistence (append-only).
+SIGNALS_NDJSON_FILE = Path("signals.ndjson")
+SIGNALS_MAX_BYTES = int(os.environ.get("FLAMEBOT_SIGNALS_MAX_BYTES", str(1_000_000)))
+SIGNALS_BACKUPS = int(os.environ.get("FLAMEBOT_SIGNALS_BACKUPS", str(3)))
+SIGNALS_LOCK_WAIT_SEC = float(os.environ.get("FLAMEBOT_SIGNALS_LOCK_WAIT_SEC", "0.10"))
+
+# Persist per-chat Telegram cursors (last seen message id). This prevents missed
+# message skipping when the user closes and re-opens the app.
+TG_CURSORS_FILE = SESSION_DIR / "tg_cursors.json"
+TG_CURSORS_LOCK_WAIT_SEC = float(os.environ.get("FLAMEBOT_TG_CURSORS_LOCK_WAIT_SEC", "0.35"))
+
+# Persist unsent backend posts so messages are eventually delivered even if the
+# network/backend is down (and across app restarts).
+BACKEND_OUTBOX_FILE = SESSION_DIR / "backend_outbox.json"
+
+# Persist unsent *settings* saves so user configuration is not lost when
+# the network/backend is down (and across app restarts).
+SETTINGS_OUTBOX_FILE = SESSION_DIR / "settings_outbox.json"
+
+LOCK_STALE_SEC = float(os.environ.get("FLAMEBOT_LOCK_STALE_SEC", "30"))
+LOCK_WAIT_SEC = float(os.environ.get("FLAMEBOT_LOCK_WAIT_SEC", "0.35"))
+
+# Watchdogs to prevent UI getting stuck in "Loading settings…" if a poll/hydration
+# callback is missed or a threadpool task wedges.
+BACKEND_POLL_STUCK_SEC = float(os.environ.get("FLAMEBOT_BACKEND_POLL_STUCK_SEC", "25"))
+HYDRATION_PENDING_STUCK_SEC = float(os.environ.get("FLAMEBOT_HYDRATION_PENDING_STUCK_SEC", "40"))
+APP_STATE_STUCK_SEC = float(os.environ.get("FLAMEBOT_APP_STATE_STUCK_SEC", "20"))
+
+# Splash should remain visible long enough for the full intro UX.
+# Default: 25 seconds (matches the old FlameApp behavior you requested).
+SPLASH_MIN_VISIBLE_MS = int(os.environ.get("FLAMEBOT_SPLASH_MIN_VISIBLE_MS", "25000"))
+
+
+@contextlib.contextmanager
+def _cross_process_lock(lock_path: Path, *, wait_sec: float, stale_sec: float) -> "Any":
+    """Best-effort cross-process lock using an exclusive lock file.
+
+    Yields True if acquired, False otherwise.
+    """
+    try:
+        p = Path(lock_path)
+    except Exception:
+        yield False
+        return
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    start = time.monotonic()
+    fd: Optional[int] = None
+    acquired = False
+    while True:
+        try:
+            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            acquired = True
+            try:
+                os.write(fd, f"pid={os.getpid()} ts={time.time()}\n".encode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+            break
+        except FileExistsError:
+            # Stale lock cleanup (crash recovery).
+            try:
+                age = time.time() - float(p.stat().st_mtime)
+                if float(stale_sec) > 0 and age > float(stale_sec):
+                    try:
+                        p.unlink()
+                        continue
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if (time.monotonic() - start) >= float(wait_sec):
+                break
+            time.sleep(0.01)
+        except Exception:
+            break
+
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                if fd is not None:
+                    os.close(fd)
+            except Exception:
+                pass
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+
+def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> bool:
+    """Atomically write text to `path`.
+
+    Writes to a temp file in the same directory and replaces the target.
+    Returns True on success.
+    """
+    try:
+        path = Path(path)
+    except Exception:
+        return False
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+    except Exception:
+        return False
+
+    lock_path = None
+    try:
+        lock_path = path.with_name(path.name + ".lock")
+    except Exception:
+        lock_path = None
+
+    # Cross-process lock prevents two instances from clobbering each other's writes.
+    if lock_path is not None:
+        with _cross_process_lock(lock_path, wait_sec=float(LOCK_WAIT_SEC), stale_sec=float(LOCK_STALE_SEC)) as ok:
+            if not ok:
+                return False
+            try:
+                tmp.write_text(str(content), encoding=encoding)
+                os.replace(str(tmp), str(path))
+                return True
+            except Exception:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except Exception:
+                    pass
+                return False
+
+    try:
+        tmp.write_text(str(content), encoding=encoding)
+        os.replace(str(tmp), str(path))
+        return True
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def _atomic_write_json(path: Path, payload: dict) -> bool:
+    try:
+        content = json.dumps(payload, indent=2, ensure_ascii=False)
+    except Exception:
+        return False
+    return _atomic_write_text(Path(path), content, encoding="utf-8")
+
+
+def _safe_read_json_dict(path: Path) -> Optional[dict]:
+    """Read a JSON file as a dict.
+
+    If the file is corrupt JSON, it is best-effort renamed to a .corrupt-* backup
+    and an empty dict is returned.
+    """
+    try:
+        path = Path(path)
+    except Exception:
+        return None
+
+    try:
+        if not path.exists():
+            return None
+    except Exception:
+        return None
+
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    try:
+        obj = json.loads(raw) if str(raw or "").strip() else {}
+    except Exception:
+        # Preserve the corrupt file for debugging/support.
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = path.with_name(f"{path.stem}.corrupt-{ts}{path.suffix}")
+            os.replace(str(path), str(backup))
+        except Exception:
+            pass
+        return {}
+
+    return obj if isinstance(obj, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# Managed Telegram API app credentials (public distribution)
+#
+# For the login-token registration model to work, the client must export login
+# tokens for the same Telegram API app that the backend uses to import.
+#
+# Public UX requirement:
+# - End users should NOT have to enter API ID/API Hash
+# - No PowerShell/env-var setup required
+#
+# Rotation requirement:
+# - Allow updating credentials without rebuilding the app
+#
+# Implementation:
+# - Prefer a local `telegram_app.json` file
+# - Optional env overrides remain as a developer-only escape hatch
+# ---------------------------------------------------------------------------
+
+_MANAGED_TG_APP_CACHE: dict = {
+    "api_id": 0,
+    "api_hash": "",
+    "source": "",
+    "path": "",
+    "mtime": 0.0,
+}
+
+_MANAGED_TG_APP_LOCK = threading.Lock()
+
+
+def _find_telegram_app_config_file() -> Optional[Path]:
+    candidates: List[Path] = []
+    # Packaged executable location (PyInstaller/py2exe style)
+    try:
+        exe = str(getattr(sys, "executable", "") or "").strip()
+        if exe:
+            candidates.append(Path(exe).resolve().parent / "telegram_app.json")
+    except Exception:
+        pass
+    # Script location
+    try:
+        candidates.append(Path(__file__).resolve().parent / "telegram_app.json")
+    except Exception:
+        pass
+    # Launch location
+    try:
+        argv0 = str(sys.argv[0] or "").strip()
+        if argv0:
+            candidates.append(Path(argv0).resolve().parent / "telegram_app.json")
+    except Exception:
+        pass
+    # Current working directory
+    try:
+        candidates.append(Path.cwd() / "telegram_app.json")
+    except Exception:
+        pass
+    # Per-user app directory
+    try:
+        candidates.append(Path(SESSION_DIR) / "telegram_app.json")
+    except Exception:
+        pass
+
+    for p in candidates:
+        try:
+            if p and Path(p).is_file():
+                return Path(p)
+        except Exception:
+            continue
+    return None
+
+
+def _get_managed_telegram_app_credentials() -> Tuple[int, str, str]:
+    """Return (api_id, api_hash, source).
+
+    Source is a safe string (path) indicating where creds came from.
+    Never logs the api_hash.
+    """
+    global _MANAGED_TG_APP_CACHE
+
+    # Developer-only escape hatch (not required for public users).
+    try:
+        env_id = str(os.environ.get("FLAMEBOT_TG_EXPORT_API_ID", "") or "").strip()
+        env_hash = str(os.environ.get("FLAMEBOT_TG_EXPORT_API_HASH", "") or "").strip()
+        if env_id and env_hash:
+            try:
+                api_id = int(env_id)
+            except Exception:
+                api_id = 0
+            if api_id > 0:
+                return api_id, env_hash, "env:FLAMEBOT_TG_EXPORT_API_ID/HASH"
+    except Exception:
+        pass
+
+    cfg = _find_telegram_app_config_file()
+    if not cfg:
+        return 0, "", ""
+
+    try:
+        mtime = float(cfg.stat().st_mtime)
+    except Exception:
+        mtime = 0.0
+
+    try:
+        with _MANAGED_TG_APP_LOCK:
+            if (
+                str(_MANAGED_TG_APP_CACHE.get("path") or "") == str(cfg)
+                and float(_MANAGED_TG_APP_CACHE.get("mtime") or 0.0) == mtime
+                and int(_MANAGED_TG_APP_CACHE.get("api_id") or 0) > 0
+                and str(_MANAGED_TG_APP_CACHE.get("api_hash") or "").strip()
+            ):
+                return (
+                    int(_MANAGED_TG_APP_CACHE.get("api_id") or 0),
+                    str(_MANAGED_TG_APP_CACHE.get("api_hash") or ""),
+                    str(_MANAGED_TG_APP_CACHE.get("source") or ""),
+                )
+    except Exception:
+        pass
+
+    try:
+        raw = cfg.read_text(encoding="utf-8-sig", errors="ignore")
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+
+    api_id_val = 0
+    api_hash_val = ""
+    try:
+        api_id_val = int(str((data or {}).get("api_id", "") or "").strip() or 0)
+    except Exception:
+        api_id_val = 0
+    try:
+        api_hash_val = str((data or {}).get("api_hash", "") or "").strip()
+    except Exception:
+        api_hash_val = ""
+
+    if api_id_val <= 0 or not api_hash_val:
+        return 0, "", ""
+
+    try:
+        with _MANAGED_TG_APP_LOCK:
+            _MANAGED_TG_APP_CACHE = {
+                "api_id": int(api_id_val),
+                "api_hash": str(api_hash_val),
+                "source": f"file:{str(cfg)}",
+                "path": str(cfg),
+                "mtime": float(mtime),
+            }
+    except Exception:
+        pass
+    return api_id_val, api_hash_val, f"file:{str(cfg)}"
+
+
+def _dpapi_protect_string(value: str) -> str:
+    """Best-effort Windows DPAPI protection.
+
+    Returns a tagged string: dpapi:<base64>
+    Falls back to obf:<base64> if DPAPI is unavailable.
+    """
+    try:
+        if value is None:
+            return ""
+        s = str(value)
+        if not s:
+            return ""
+
+        if os.name != "nt":
+            return "obf:" + base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        CryptProtectData = crypt32.CryptProtectData
+        CryptProtectData.argtypes = [
+            ctypes.POINTER(DATA_BLOB),
+            ctypes.c_wchar_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+            ctypes.POINTER(DATA_BLOB),
+        ]
+        CryptProtectData.restype = ctypes.wintypes.BOOL
+
+        LocalFree = kernel32.LocalFree
+        LocalFree.argtypes = [ctypes.c_void_p]
+        LocalFree.restype = ctypes.c_void_p
+
+        raw = s.encode("utf-8")
+        in_blob = DATA_BLOB(len(raw), ctypes.cast(ctypes.create_string_buffer(raw, len(raw)), ctypes.POINTER(ctypes.c_byte)))
+        out_blob = DATA_BLOB()
+        ok = CryptProtectData(ctypes.byref(in_blob), "FlameBot", None, None, None, 0, ctypes.byref(out_blob))
+        if not ok:
+            return "obf:" + base64.b64encode(raw).decode("ascii")
+
+        try:
+            buf = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        finally:
+            try:
+                LocalFree(out_blob.pbData)
+            except Exception:
+                pass
+
+        return "dpapi:" + base64.b64encode(buf).decode("ascii")
+    except Exception:
+        try:
+            return "obf:" + base64.b64encode(str(value).encode("utf-8")).decode("ascii")
+        except Exception:
+            return ""
+
+
+def _dpapi_unprotect_string(value: str) -> str:
+    """Reverse of _dpapi_protect_string (best-effort)."""
+    try:
+        if value is None:
+            return ""
+        s = str(value)
+        if not s:
+            return ""
+
+        if s.startswith("dpapi:") and os.name == "nt":
+            b = base64.b64decode(s.split(":", 1)[1].encode("ascii"))
+
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+            crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            CryptUnprotectData = crypt32.CryptUnprotectData
+            CryptUnprotectData.argtypes = [
+                ctypes.POINTER(DATA_BLOB),
+                ctypes.POINTER(ctypes.c_wchar_p),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.wintypes.DWORD,
+                ctypes.POINTER(DATA_BLOB),
+            ]
+            CryptUnprotectData.restype = ctypes.wintypes.BOOL
+
+            LocalFree = kernel32.LocalFree
+            LocalFree.argtypes = [ctypes.c_void_p]
+            LocalFree.restype = ctypes.c_void_p
+
+            in_blob = DATA_BLOB(len(b), ctypes.cast(ctypes.create_string_buffer(b, len(b)), ctypes.POINTER(ctypes.c_byte)))
+            out_blob = DATA_BLOB()
+            ok = CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob))
+            if not ok:
+                return ""
+            try:
+                raw = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+            finally:
+                try:
+                    LocalFree(out_blob.pbData)
+                except Exception:
+                    pass
+            return raw.decode("utf-8", errors="replace")
+
+        if s.startswith("obf:"):
+            b = base64.b64decode(s.split(":", 1)[1].encode("ascii"))
+            return b.decode("utf-8", errors="replace")
+
+        return s
+    except Exception:
+        return ""
+ICON_CACHE = Path("cache/icons")
+BACKEND_BASE_URL = "https://web-production-49c22.up.railway.app"
+# Platform can be overridden by environment variable or command line
+# Separate executables should set this to "mt4" or "mt5"
+PLATFORM = os.environ.get("FLAMEBOT_PLATFORM", "mt5").lower()
+HYDRATION_TTL = 30  # seconds of freshness before rehydrating settings
+
+# Telegram reconnect tuning (UI responsiveness)
+# - When internet drops, reconnect checks should be frequent.
+# - On repeated failures, apply backoff to avoid hammering.
+TG_RECONNECT_POLL_CONNECTED_SEC = float(os.environ.get("FLAMEBOT_TG_POLL_CONNECTED", "2"))
+TG_RECONNECT_POLL_DISCONNECTED_SEC = float(os.environ.get("FLAMEBOT_TG_POLL_DISCONNECTED", "1"))
+TG_RECONNECT_BACKOFF_MAX_SEC = float(os.environ.get("FLAMEBOT_TG_POLL_BACKOFF_MAX", "20"))
+
+# Network calls must never block the Qt UI thread.
+# Default timeout for backend HTTP requests. 3s is often too low for TLS handshakes
+# on slower connections/VPNs and can cause intermittent "handshake timed out".
+DEFAULT_HTTP_TIMEOUT = float(os.environ.get("FLAMEBOT_HTTP_TIMEOUT", "8"))
+
+
+def _friendly_network_error_message(exc: BaseException) -> str:
+    """Return a user-friendly message for urlopen failures."""
+    try:
+        raw = str(exc)
+    except Exception:
+        raw = ""
+    lower = raw.lower() if isinstance(raw, str) else ""
+
+    # Common Windows/OpenSSL phrasing.
+    if "handshake" in lower and "timed out" in lower:
+        return "Server connection timed out during secure handshake. Check VPN/firewall or try again."
+    if "timed out" in lower or "timeout" in lower:
+        return "Server request timed out. Check your connection and try again."
+    if "name or service not known" in lower or "nodename nor servname provided" in lower or "getaddrinfo failed" in lower:
+        return "Server address could not be resolved (DNS). Check the server URL."
+    if "certificate" in lower:
+        return "Secure connection failed (certificate error). Check date/time and server URL."
+    if "forcibly closed" in lower or "connection reset" in lower:
+        return "Server connection was reset. Try again."
+
+    # Fallback.
+    return "Network error while contacting server. Please try again."
+
+# Registration involves an extra server-side Telegram verification step.
+# Keep the default UI polling timeout small, but allow registration to wait longer.
+REGISTER_HTTP_TIMEOUT = float(os.environ.get("FLAMEBOT_REGISTER_HTTP_TIMEOUT", "20"))
+
+def _is_complete_jpeg_file(path: Path) -> bool:
+    """Return True if `path` looks like a complete JPEG.
+
+    This is a pragmatic guard against partially-written downloads that trigger
+    libjpeg warnings like: "Corrupt JPEG data: premature end of data segment".
+    """
+    try:
+        p = Path(path)
+    except Exception:
+        return False
+
+    try:
+        st = p.stat()
+        if int(getattr(st, "st_size", 0) or 0) < 64:
+            return False
+    except Exception:
+        return False
+
+    try:
+        with path.open("rb") as f:
+            head8 = f.read(16)
+            # If the file is not actually a JPEG (Telegram/Telethon may save PNG/WebP
+            # while the filename is "*.jpg"), do NOT treat it as corrupt.
+            if head8.startswith(b"\x89PNG\r\n\x1a\n"):
+                return True
+            if head8.startswith(b"GIF87a") or head8.startswith(b"GIF89a"):
+                return True
+            if head8.startswith(b"BM"):
+                return True
+            if len(head8) >= 12 and head8[0:4] == b"RIFF" and head8[8:12] == b"WEBP":
+                return True
+
+            if len(head8) < 2 or head8[0:2] != b"\xff\xd8":
+                # Unknown/other format: don't delete; it's not a JPEG.
+                return True
+
+            try:
+                f.seek(-2, os.SEEK_END)
+            except Exception:
+                return False
+            tail = f.read(2)
+            return tail == b"\xff\xd9"
+    except Exception:
+        return False
+
+
+def _find_cached_icon_file(icons_dir: Path, entity_id: int) -> Optional[Path]:
+    """Find an existing cached icon for a Telegram entity.
+
+    Supports both the legacy forced `.jpg` naming and the newer extensionless
+    base-name downloads (Telethon chooses the final extension).
+    """
+    try:
+        d = Path(icons_dir)
+    except Exception:
+        return None
+
+    try:
+        eid = int(entity_id)
+    except Exception:
+        return None
+
+    candidates: List[Path] = []
+    # Preferred: any extension (Telethon may emit .jpg/.png/.webp).
+    try:
+        candidates.extend(sorted(d.glob(f"{eid}.*")))
+    except Exception:
+        pass
+
+    # Legacy: forced .jpg name.
+    try:
+        legacy = d / f"{eid}.jpg"
+        if legacy.exists():
+            candidates.insert(0, legacy)
+    except Exception:
+        pass
+
+    # Pick the most recently modified to avoid stale duplicates.
+    best: Optional[Path] = None
+    best_mtime = -1.0
+    for p in candidates:
+        try:
+            if not p.exists() or not p.is_file():
+                continue
+        except Exception:
+            continue
+        try:
+            mt = float(p.stat().st_mtime)
+        except Exception:
+            mt = 0.0
+        if best is None or mt > best_mtime:
+            best = p
+            best_mtime = mt
+    return best
+
+
+def setup_dev_logging() -> None:
+    """Configure developer-only logging to a local rotating log file.
+
+    UI must never surface raw network/Telethon exceptions; those go here.
+    """
+    try:
+        if os.environ.get("FLAMEBOT_DEV_LOG", "0") != "1" and os.environ.get("FLAMEBOT_DEBUG", "0") != "1":
+            return
+        log_dir = SESSION_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "flamebot-ui.log"
+
+        logger = logging.getLogger("flame_ui")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+
+        if any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+            return
+
+        handler = RotatingFileHandler(
+            str(log_path),
+            maxBytes=2_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        logger.addHandler(handler)
+    except Exception:
+        # Never crash the UI due to logging.
+        pass
+
+
+class _TelethonNoiseFilter(logging.Filter):
+    """Rate-limit known noisy Telethon log lines.
+
+    These messages are usually caused by local clock skew or unstable networks.
+    They are not actionable for end users and can flood stderr via
+    logging.lastResort.
+    """
+
+    _NOISY_SUBSTRINGS = (
+        "Security error while unpacking a received message: Too many messages had to be ignored consecutively",
+        "Server sent a very new message with ID",
+        "Server resent the older message",
+    )
+
+    def __init__(self, *, burst: int = 3, window_sec: float = 30.0) -> None:
+        super().__init__()
+        self._burst = int(max(1, burst))
+        self._window_sec = float(max(1.0, window_sec))
+        self._t0 = 0.0
+        self._count = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+
+        if not msg:
+            return True
+
+        if not any(s in msg for s in self._NOISY_SUBSTRINGS):
+            return True
+
+        try:
+            now = time.monotonic()
+        except Exception:
+            return True
+
+        if (now - float(self._t0)) > self._window_sec:
+            self._t0 = now
+            self._count = 0
+
+        self._count += 1
+        return self._count <= self._burst
+
+
+def setup_telethon_logging() -> None:
+    """Prevent Telethon warnings/errors from spamming stderr for end users.
+
+    Python's `logging.lastResort` prints WARNING+ records when no handlers exist.
+    Telethon emits some very noisy lines during unstable connectivity or clock
+    skew; these should be dev-log only.
+    """
+
+    try:
+        telethon_logger = logging.getLogger("telethon")
+
+        # Ensure Telethon logs don't propagate to root/lastResort.
+        telethon_logger.propagate = False
+
+        # Always attach a handler so `logging.lastResort` is not used.
+        if not telethon_logger.handlers:
+            telethon_logger.addHandler(logging.NullHandler())
+
+        if not any(isinstance(f, _TelethonNoiseFilter) for f in telethon_logger.filters):
+            telethon_logger.addFilter(_TelethonNoiseFilter())
+
+        debug_enabled = (
+            os.environ.get("FLAMEBOT_DEV_LOG", "0") == "1"
+            or os.environ.get("FLAMEBOT_DEBUG", "0") == "1"
+        )
+
+        if debug_enabled:
+            # Mirror Telethon logs into the same rotating developer log.
+            ui_logger = logging.getLogger("flame_ui")
+            for handler in ui_logger.handlers:
+                if handler not in telethon_logger.handlers:
+                    telethon_logger.addHandler(handler)
+            telethon_logger.setLevel(logging.DEBUG)
+        else:
+            # End users don't need to see Telethon internals.
+            telethon_logger.setLevel(logging.CRITICAL)
+    except Exception:
+        return
+
+
+def _configure_crash_logging() -> logging.Logger:
+    """Ensure unhandled exceptions have somewhere to be recorded.
+
+    The app intentionally avoids surfacing raw exceptions in the UI. However,
+    unexpected crashes (main thread, threads, or background asyncio tasks)
+    still need a durable breadcrumb for support.
+    """
+    logger = logging.getLogger("flame_ui")
+    try:
+        logger.setLevel(logging.DEBUG)
+    except Exception:
+        pass
+    try:
+        logger.propagate = False
+    except Exception:
+        pass
+
+    try:
+        if logger.handlers:
+            return logger
+    except Exception:
+        return logger
+
+    # Fallback crash log (small rotating file) even when dev logs are disabled.
+    try:
+        log_dir = SESSION_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "flamebot-ui-crash.log"
+        handler = RotatingFileHandler(
+            str(log_path),
+            maxBytes=1_000_000,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        handler.setLevel(logging.WARNING)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logger.addHandler(handler)
+    except Exception:
+        # Last resort: keep running even if we can't write logs.
+        pass
+    return logger
+
+
+def _install_crash_protection_hooks() -> None:
+    """Install last-resort hooks so unexpected exceptions get logged.
+
+    Note: these hooks do not prevent process termination for a truly unhandled
+    exception on the main thread; they ensure we capture the traceback.
+    """
+    logger = _configure_crash_logging()
+
+    def _sys_excepthook(exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
+        try:
+            if exc_type is KeyboardInterrupt:
+                # Preserve default Ctrl+C behavior.
+                try:
+                    sys.__excepthook__(exc_type, exc, tb)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        try:
+            logger.critical("Unhandled exception (main thread)", exc_info=(exc_type, exc, tb))
+        except Exception:
+            pass
+        try:
+            sys.__excepthook__(exc_type, exc, tb)
+        except Exception:
+            pass
+
+    def _threading_excepthook(args) -> None:  # type: ignore[no-untyped-def]
+        try:
+            if isinstance(getattr(args, "exc_value", None), KeyboardInterrupt):
+                return
+        except Exception:
+            pass
+        try:
+            thr = getattr(args, "thread", None)
+            name = getattr(thr, "name", "") if thr is not None else ""
+        except Exception:
+            name = ""
+        try:
+            logger.critical(
+                "Unhandled exception in thread%s",
+                f" '{name}'" if name else "",
+                exc_info=(getattr(args, "exc_type", None), getattr(args, "exc_value", None), getattr(args, "exc_traceback", None)),
+            )
+        except Exception:
+            pass
+
+    def _unraisablehook(hook_args) -> None:  # type: ignore[no-untyped-def]
+        try:
+            et = getattr(hook_args, "exc_type", None)
+            ev = getattr(hook_args, "exc_value", None)
+            tb = getattr(hook_args, "exc_traceback", None)
+        except Exception:
+            et, ev, tb = None, None, None
+        try:
+            if et is not None and ev is not None:
+                logger.error("Unraisable exception", exc_info=(et, ev, tb))
+            else:
+                logger.error("Unraisable exception: %r", hook_args)
+        except Exception:
+            pass
+
+    try:
+        sys.excepthook = _sys_excepthook
+    except Exception:
+        pass
+    try:
+        if hasattr(threading, "excepthook"):
+            threading.excepthook = _threading_excepthook  # type: ignore[assignment]
+    except Exception:
+        pass
+    try:
+        if hasattr(sys, "unraisablehook"):
+            sys.unraisablehook = _unraisablehook  # type: ignore[assignment]
+    except Exception:
+        pass
+
+
+def _read_pinned_requirements(req_path: Path) -> Dict[str, str]:
+    """Parse simple `name==version` pins from a requirements.txt file."""
+    pins: Dict[str, str] = {}
+    try:
+        if not req_path.exists():
+            return pins
+        for raw_line in req_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("-"):
+                continue
+            if "==" not in line:
+                continue
+            name, ver = line.split("==", 1)
+            name = name.strip().lower()
+            ver = ver.strip()
+            if name and ver:
+                pins[name] = ver
+    except Exception:
+        return pins
+    return pins
+
+
+def _log_dependency_drift_warning() -> None:
+    """Warn (via dev log) if installed deps differ from pinned requirements."""
+    try:
+        # In a frozen distribution (.exe/.app), dependencies are bundled.
+        # Drift checks against a local requirements.txt are not meaningful.
+        try:
+            if bool(getattr(sys, "frozen", False)):
+                return
+        except Exception:
+            pass
+        if importlib_metadata is None:
+            return
+        try:
+            base_dir = Path(__file__).resolve().parent
+        except Exception:
+            base_dir = Path.cwd()
+        pins = _read_pinned_requirements(base_dir / "requirements.txt")
+        if not pins:
+            return
+
+        logger = logging.getLogger("flame_ui")
+        for dist in ("pyqt5", "telethon"):
+            expected = pins.get(dist)
+            if not expected:
+                continue
+            try:
+                installed = importlib_metadata.version(dist)
+            except Exception:
+                installed = None
+            if not installed:
+                logger.warning("Dependency missing: %s (pinned %s)", dist, expected)
+                continue
+            if str(installed).strip() != str(expected).strip():
+                logger.warning(
+                    "Dependency drift: %s installed=%s pinned=%s (run: python -m pip install -r requirements.txt)",
+                    dist,
+                    installed,
+                    expected,
+                )
+    except Exception:
+        # Never crash the UI due to version checks.
+        return
+
+
+class NetworkState(str, enum.Enum):
+    ONLINE = "online"
+    OFFLINE = "offline"
+    RECONNECTING = "reconnecting"
+
+
+class _NetworkProbeSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, bool, str)  # seq, online, detail
+
+
+class _NetworkProbeTask(QtCore.QRunnable):
+    def __init__(self, seq: int, timeout_sec: float = 0.8) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self.seq = int(seq)
+        self.timeout_sec = float(timeout_sec)
+        self.signals = _NetworkProbeSignals()
+
+    def run(self) -> None:
+        online = False
+        detail = ""
+        try:
+            # Some networks block outbound DNS (53) and some block certain HTTP
+            # connectivity endpoints. Also, backend downtime should NOT be treated
+            # as "no internet".
+            #
+            # We treat the user as ONLINE if *any* general internet probe succeeds.
+            # Backend reachability is checked elsewhere.
+            last_exc: Optional[BaseException] = None
+
+            # 1) TCP 443 probes (fast, usually allowed)
+            if not online:
+                for host, port, tag in [
+                    ("1.1.1.1", 443, "tcp:1.1.1.1:443"),
+                    ("8.8.8.8", 443, "tcp:8.8.8.8:443"),
+                    ("www.microsoft.com", 443, "tcp:microsoft:443"),
+                ]:
+                    try:
+                        with socket.create_connection((host, port), timeout=max(1.0, float(self.timeout_sec))):
+                            online = True
+                            detail = tag
+                            break
+                    except Exception as e:
+                        last_exc = e
+
+            # 2) HTTP fallback (captive-portal style probe)
+            if not online:
+                for url in [
+                    "https://www.msftconnecttest.com/connecttest.txt",
+                    "https://www.msftncsi.com/ncsi.txt",
+                ]:
+                    try:
+                        req = urllib.request.Request(
+                            url,
+                            headers={"User-Agent": "FlameBot"},
+                            method="GET",
+                        )
+                        with urllib.request.urlopen(req, timeout=max(1.4, float(self.timeout_sec) * 2.0)) as resp:
+                            if 200 <= int(getattr(resp, "status", 200)) < 400:
+                                online = True
+                                detail = "http"
+                                break
+                    except Exception as e:
+                        last_exc = e
+
+            if not online and last_exc is not None:
+                detail = f"{last_exc.__class__.__name__}: {last_exc}"
+        except Exception as e:
+            online = False
+            detail = f"{e.__class__.__name__}: {e}"
+        self.signals.finished.emit(self.seq, bool(online), str(detail or ""))
+
+
+class NetworkStateManager(QtCore.QObject):
+    """Poll-based network state manager.
+
+    Emits OFFLINE quickly when connectivity drops, and transitions
+    OFFLINE -> RECONNECTING -> ONLINE after consecutive successful probes.
+    """
+
+    stateChanged = QtCore.pyqtSignal(object, str)  # NetworkState, detail
+
+    def __init__(
+        self,
+        *,
+        poll_ms: int = 1200,
+        thread_pool: Optional[QtCore.QThreadPool] = None,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._pool = thread_pool or QtCore.QThreadPool.globalInstance()
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(int(poll_ms))
+        self._timer.timeout.connect(self._tick)
+        self._seq = 0
+        self._inflight = False
+        self._state: NetworkState = NetworkState.RECONNECTING
+        self._online_streak = 0
+        self._offline_streak = 0
+        # Hysteresis thresholds to prevent flapping.
+        self._offline_fail_threshold = int(os.environ.get("FLAMEBOT_NET_FAILS_OFFLINE", "3"))
+        self._online_success_threshold = int(os.environ.get("FLAMEBOT_NET_SUCC_ONLINE", "2"))
+
+    @property
+    def state(self) -> NetworkState:
+        return self._state
+
+    def is_online(self) -> bool:
+        return self._state == NetworkState.ONLINE
+
+    def start(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start()
+            self._tick()
+
+    def stop(self) -> None:
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+
+    def _set_state(self, new_state: NetworkState, detail: str = "") -> None:
+        if new_state == self._state:
+            return
+        self._state = new_state
+        self.stateChanged.emit(new_state, detail or "")
+
+    def _tick(self) -> None:
+        if self._inflight:
+            return
+        self._inflight = True
+        self._seq += 1
+        seq = self._seq
+        task = _NetworkProbeTask(seq)
+        task.signals.finished.connect(self._on_probe_finished)
+        self._pool.start(task)
+
+    def _on_probe_finished(self, seq: int, online: bool, detail: str) -> None:
+        if seq != self._seq:
+            return
+        self._inflight = False
+
+        if not online:
+            self._online_streak = 0
+            self._offline_streak += 1
+            # Only enter OFFLINE after several consecutive failures.
+            if self._offline_streak >= max(1, int(self._offline_fail_threshold or 3)):
+                self._set_state(NetworkState.OFFLINE, detail)
+            return
+
+        # online
+        self._offline_streak = 0
+        self._online_streak += 1
+        if self._state == NetworkState.OFFLINE:
+            self._set_state(NetworkState.RECONNECTING, detail)
+            return
+        if self._state == NetworkState.RECONNECTING:
+            if self._online_streak >= max(1, int(self._online_success_threshold or 2)):
+                self._set_state(NetworkState.ONLINE, detail)
+            return
+        if self._state != NetworkState.ONLINE:
+            self._set_state(NetworkState.ONLINE, detail)
+
+
+
+def _format_telegram_local_time(dt: Optional[datetime]) -> str:
+    """Format a Telegram message date as local time.
+
+    Telethon typically provides message.date as a naive UTC datetime.
+    Telegram desktop/mobile show local time. Convert to local timezone
+    to avoid 1-hour offsets (DST/timezone).
+    """
+    if not dt:
+        # Unknown Telegram time; do NOT substitute PC time.
+        return ""
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%H:%M")
+    except Exception:
+        try:
+            return dt.strftime("%H:%M")
+        except Exception:
+            return ""
+
+
+def _telegram_utc_epoch_seconds(dt: Optional[datetime]) -> int:
+    """Return Telegram message timestamp as UTC epoch seconds.
+
+    Telethon usually provides naive UTC datetimes for message.date.
+    Backend needs Telegram server time in UTC to compute delivery delay.
+    """
+    if not dt:
+        return 0
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+
+def _format_local_hhmmss_from_utc_epoch(ts: int) -> str:
+    """Format a UTC epoch seconds timestamp as local HH:MM."""
+    try:
+        v = int(ts or 0)
+    except Exception:
+        v = 0
+    if v <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(v, tz=timezone.utc).astimezone().strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def _format_local_ymd_from_utc_epoch(ts: int) -> str:
+    """Format a UTC epoch seconds timestamp as local YYYY-MM-DD."""
+    try:
+        v = int(ts or 0)
+    except Exception:
+        v = 0
+    if v <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(v, tz=timezone.utc).astimezone().date().isoformat()
+    except Exception:
+        return ""
+
+
+def _extract_ymd_from_recv_time(recv_time: str) -> str:
+    """Best-effort YYYY-MM-DD extraction from a local recv_time string."""
+    try:
+        s = str(recv_time or "").strip()
+    except Exception:
+        return ""
+    if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
+        return s[:10]
+    return ""
+
+
+def _tail_lines_utf8(path: Path, *, max_lines: int = 2000) -> List[str]:
+    """Return up to the last N lines of a text file.
+
+    Used to restore local message history efficiently on startup.
+    """
+    try:
+        n = int(max_lines or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return []
+
+    try:
+        p = Path(path)
+        if not p.is_file():
+            return []
+    except Exception:
+        return []
+
+    # If the file is small (default is ~1MB), it's fine to read it whole.
+    try:
+        if int(p.stat().st_size) <= 8_000_000:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            lines = (text.splitlines() if text else [])
+            return lines[-n:]
+    except Exception:
+        pass
+
+    # Tail-read for larger files.
+    try:
+        chunk = 64 * 1024
+        buf = b""
+        with p.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = int(fh.tell())
+            while pos > 0 and buf.count(b"\n") <= (n + 1):
+                step = chunk if pos >= chunk else pos
+                pos -= step
+                fh.seek(pos, os.SEEK_SET)
+                buf = fh.read(step) + buf
+        # splitlines() handles both \n and \r\n.
+        raw_lines = buf.splitlines()[-n:]
+        out: List[str] = []
+        for b in raw_lines:
+            try:
+                out.append(b.decode("utf-8", errors="ignore"))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def fetch_backend_json(base_url: str, path: str, params: Optional[dict] = None, timeout: float = DEFAULT_HTTP_TIMEOUT) -> Optional[dict]:
+    base = (base_url or "").rstrip("/") + "/"
+    url = base + path.lstrip("/")
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    # Retry a couple times on transient network errors.
+    try:
+        retries = int(os.environ.get("FLAMEBOT_HTTP_RETRIES", "2") or 2)
+    except Exception:
+        retries = 2
+    retries = max(0, min(5, int(retries)))
+    try:
+        timeout_f = float(timeout or DEFAULT_HTTP_TIMEOUT)
+    except Exception:
+        timeout_f = float(DEFAULT_HTTP_TIMEOUT)
+
+    payload = b""
+    last_exc: Optional[BaseException] = None
+    for attempt in range(0, retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=max(3.0, timeout_f)) as response:
+                payload = response.read()
+            last_exc = None
+            break
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read()
+                return json.loads(body.decode("utf-8"))
+            except Exception:
+                return {"status": "HTTP_ERROR", "message": f"HTTP {getattr(e, 'code', '??')} {getattr(e, 'reason', '')}"}
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                try:
+                    time.sleep(min(1.6, 0.35 * (2 ** attempt)))
+                except Exception:
+                    pass
+                continue
+            break
+    if last_exc is not None:
+        try:
+            if os.environ.get("FLAMEBOT_HTTP_DEBUG", "0") == "1":
+                logging.getLogger("flame_ui_http").warning("GET failed %s: %r", url, last_exc)
+        except Exception:
+            pass
+        return {"status": "NET_ERROR", "message": _friendly_network_error_message(last_exc)}
+    try:
+        decoded = payload.decode("utf-8")
+    except Exception:
+        return {"status": "BAD_RESPONSE", "message": "Backend returned non-text response"}
+
+    try:
+        obj = json.loads(decoded)
+    except json.JSONDecodeError:
+        return {"status": "BAD_JSON", "message": "Backend returned invalid JSON"}
+
+    if not isinstance(obj, dict):
+        return {"status": "BAD_JSON", "message": "Backend returned non-object JSON"}
+
+    return obj
+
+
+def post_backend_json(base_url: str, path: str, payload: dict, timeout: float = DEFAULT_HTTP_TIMEOUT) -> Optional[dict]:
+    base = (base_url or "").rstrip("/") + "/"
+    url = base + path.lstrip("/")
+    data = json.dumps(payload or {}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # Retry a couple times on transient network errors.
+    try:
+        retries = int(os.environ.get("FLAMEBOT_HTTP_RETRIES", "2") or 2)
+    except Exception:
+        retries = 2
+    retries = max(0, min(5, int(retries)))
+    try:
+        timeout_f = float(timeout or DEFAULT_HTTP_TIMEOUT)
+    except Exception:
+        timeout_f = float(DEFAULT_HTTP_TIMEOUT)
+
+    body = b""
+    last_exc: Optional[BaseException] = None
+    for attempt in range(0, retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=max(3.0, timeout_f)) as response:
+                body = response.read()
+            last_exc = None
+            break
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read()
+                return json.loads(body.decode("utf-8"))
+            except Exception:
+                return {"status": "HTTP_ERROR", "message": f"HTTP {getattr(e, 'code', '??')} {getattr(e, 'reason', '')}"}
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                try:
+                    time.sleep(min(1.6, 0.35 * (2 ** attempt)))
+                except Exception:
+                    pass
+                continue
+            break
+    if last_exc is not None:
+        try:
+            if os.environ.get("FLAMEBOT_HTTP_DEBUG", "0") == "1":
+                logging.getLogger("flame_ui_http").warning("POST failed %s: %r", url, last_exc)
+        except Exception:
+            pass
+        return {"status": "NET_ERROR", "message": _friendly_network_error_message(last_exc)}
+    try:
+        decoded = body.decode("utf-8")
+    except Exception:
+        return {"status": "BAD_RESPONSE", "message": "Backend returned non-text response"}
+
+    try:
+        obj = json.loads(decoded)
+    except json.JSONDecodeError:
+        return {"status": "BAD_JSON", "message": "Backend returned invalid JSON"}
+
+    if not isinstance(obj, dict):
+        return {"status": "BAD_JSON", "message": "Backend returned non-object JSON"}
+
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Desktop configuration loading (no hardcoded secrets)
+# ---------------------------------------------------------------------------
+
+_DOTENV_LOADED = False
+_TELEGRAM_INGEST_SECRET_SOURCE = ""  # "env" | ".env:<path>" | "missing"
+_DOTENV_DIAG = ""  # safe debug hint: paths checked + existence only
+
+
+def _maybe_load_dotenv(required_keys: Optional[List[str]] = None) -> None:
+    """Best-effort .env loader for desktop runtime.
+
+    Supports providing secrets via:
+    - OS environment variables (preferred)
+    - A local .env file (for desktop distribution)
+
+    This function never logs or returns secret values.
+    """
+    global _DOTENV_LOADED, _TELEGRAM_INGEST_SECRET_SOURCE, _DOTENV_DIAG
+
+    keys = [str(k) for k in (required_keys or []) if str(k or "").strip()]
+    if not keys:
+        return
+
+    def _has_all_required() -> bool:
+        try:
+            return all(bool(str(os.environ.get(k, "")).strip()) for k in keys)
+        except Exception:
+            return False
+
+    # Allow retry if required keys are still missing. This matters when the user
+    # creates/saves a .env file while the app is already running.
+    if _DOTENV_LOADED and _has_all_required():
+        if str(os.environ.get("FLAMEBOT_TELEGRAM_INGEST_SECRET", "")).strip():
+            _TELEGRAM_INGEST_SECRET_SOURCE = _TELEGRAM_INGEST_SECRET_SOURCE or "env"
+        return
+    _DOTENV_LOADED = True
+
+    # If already set in environment, prefer it and do not override.
+    try:
+        if _has_all_required():
+            if str(os.environ.get("FLAMEBOT_TELEGRAM_INGEST_SECRET", "")).strip():
+                _TELEGRAM_INGEST_SECRET_SOURCE = "env"
+            return
+    except Exception:
+        pass
+
+    candidates: List[Path] = []
+    diag_items: List[str] = []
+    try:
+        override = str(os.environ.get("FLAMEBOT_DOTENV_PATH", "")).strip()
+        if override:
+            candidates.append(Path(override))
+    except Exception:
+        pass
+
+    try:
+        prev = str(globals().get("_TELEGRAM_INGEST_SECRET_SOURCE") or "")
+        if prev.startswith(".env:"):
+            pp = prev.split(":", 1)[1].strip()
+            if pp:
+                candidates.append(Path(pp))
+    except Exception:
+        pass
+
+    # Common locations.
+    # Prefer script/launch-local .env files over a home-directory .env.
+    try:
+        candidates.append(Path(__file__).resolve().parent / ".env")
+    except Exception:
+        pass
+    # Launch location (useful if cwd differs from script directory)
+    try:
+        argv0 = str(sys.argv[0] or "").strip()
+        if argv0:
+            candidates.append(Path(argv0).resolve().parent / ".env")
+    except Exception:
+        pass
+    try:
+        candidates.append(Path.cwd() / ".env")
+    except Exception:
+        pass
+    # Packaged executable location (PyInstaller/py2exe style)
+    try:
+        exe = str(getattr(sys, "executable", "") or "").strip()
+        if exe:
+            candidates.append(Path(exe).resolve().parent / ".env")
+    except Exception:
+        pass
+    try:
+        candidates.append(Path.home() / ".tg_copier" / ".env")
+    except Exception:
+        pass
+    # Home .env should be last (it can exist but not contain the key).
+    try:
+        candidates.append(Path.home() / ".env")
+    except Exception:
+        pass
+
+    def _parse_set_line(line: str) -> None:
+        s = (line or "").strip()
+        # Windows editors / PowerShell can write UTF-8 with BOM.
+        # If present, it can prefix the first key and break matching.
+        if s.startswith("\ufeff"):
+            s = s.lstrip("\ufeff").strip()
+        if not s or s.startswith("#"):
+            return
+        if "=" not in s:
+            return
+        k, v = s.split("=", 1)
+        key = (k or "").strip()
+        if not key:
+            return
+        val = (v or "").strip()
+        # Strip optional quotes.
+        if len(val) >= 2 and ((val[0] == val[-1]) and val[0] in ('"', "'")):
+            val = val[1:-1]
+        # Do not override existing env vars if they are already set to a
+        # non-empty value. If an env var exists but is blank, allow .env to
+        # populate it (common on Windows after creating a variable but leaving
+        # the value empty).
+        try:
+            if key in os.environ and str(os.environ.get(key, "")).strip():
+                return
+        except Exception:
+            if key in os.environ:
+                return
+        os.environ[key] = val
+
+    loaded_from: Optional[Path] = None
+    # Try each .env candidate until it actually provides the required key(s).
+    for p in candidates:
+        try:
+            if not p or not Path(p).is_file():
+                continue
+        except Exception:
+            continue
+        try:
+            text = Path(p).read_text(encoding="utf-8-sig", errors="ignore")
+        except Exception:
+            continue
+        try:
+            for ln in text.splitlines():
+                _parse_set_line(ln)
+            # Only stop once all required key(s) are actually present.
+            try:
+                if _has_all_required():
+                    loaded_from = Path(p)
+                    break
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    # Safe diagnostics: record a short list of checked paths + existence + whether keys exist.
+    try:
+        seen: set[str] = set()
+        diag_items = []
+        for p in candidates[:8]:
+            try:
+                pp = Path(p)
+                ps = str(pp)
+            except Exception:
+                continue
+            if ps in seen:
+                continue
+            seen.add(ps)
+            try:
+                if not pp.is_file():
+                    diag_items.append(f"{ps}(N)")
+                    continue
+            except Exception:
+                diag_items.append(f"{ps}(N)")
+                continue
+            try:
+                text = pp.read_text(encoding="utf-8-sig", errors="ignore")
+            except Exception:
+                diag_items.append(f"{ps}(Y,read=FAIL)")
+                continue
+            try:
+                # Ensure BOM doesn't affect key matching in diagnostics.
+                text = (text or "").lstrip("\ufeff")
+                def _key_len(key: str) -> Optional[int]:
+                    pat = rf"(?m)^\\s*{re.escape(str(key))}\\s*=\\s*([^\\r\\n#;]+)"
+                    mm = re.search(pat, text or "")
+                    if not mm:
+                        return None
+                    return len(str(mm.group(1) or "").strip())
+
+                ing_len = _key_len("FLAMEBOT_TELEGRAM_INGEST_SECRET")
+                diag_items.append(
+                    f"{ps}(Y,ing={'Y' if ing_len is not None else 'N'}"
+                    + (f",ing_len={ing_len}" if ing_len is not None else "")
+                    + ")"
+                )
+            except Exception:
+                diag_items.append(f"{ps}(Y,keys=?)")
+        _DOTENV_DIAG = "; ".join(diag_items)
+    except Exception:
+        _DOTENV_DIAG = ""
+
+    try:
+        if str(os.environ.get("FLAMEBOT_TELEGRAM_INGEST_SECRET", "")).strip():
+            if loaded_from is not None:
+                _TELEGRAM_INGEST_SECRET_SOURCE = f".env:{str(loaded_from)}"
+            else:
+                _TELEGRAM_INGEST_SECRET_SOURCE = "env"
+        else:
+            _TELEGRAM_INGEST_SECRET_SOURCE = "missing"
+    except Exception:
+        _TELEGRAM_INGEST_SECRET_SOURCE = "missing"
+
+
+def _compute_register_proof(telegram_id: str, platform: str, ts: int) -> Optional[str]:
+    # LEGACY: shared-secret registration model removed.
+    return None
+
+
+def _b64url(data: bytes) -> str:
+    try:
+        return base64.urlsafe_b64encode(bytes(data or b"")).decode("ascii")
+    except Exception:
+        return ""
+
+
+class _BackendPollSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, dict, dict)  # seq, auth_params, responses
+    error = QtCore.pyqtSignal(int, dict, str)      # seq, auth_params, message
+
+
+class _BackendPollTask(QtCore.QRunnable):
+    def __init__(self, seq: int, backend_url: str, auth_params: dict, resources: Optional[List[str]] = None, timeout: float = DEFAULT_HTTP_TIMEOUT) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self.seq = seq
+        self.backend_url = backend_url
+        self.auth_params = dict(auth_params or {})
+        self.resources = list(resources or [])
+        self.timeout = timeout
+        self.signals = _BackendPollSignals()
+
+    def run(self) -> None:
+        try:
+            requested = self.resources or [
+                "ea_status",
+                "get_lot_settings",
+                "get_symbol_settings",
+                "get_psl_settings",
+            ]
+            responses = {"_polled": list(requested)}
+            if "ea_status" in requested:
+                responses["ea_status"] = post_backend_json(self.backend_url, "ea_status", self.auth_params, timeout=self.timeout)
+            if "get_lot_settings" in requested:
+                responses["get_lot_settings"] = post_backend_json(self.backend_url, "get_lot_settings", self.auth_params, timeout=self.timeout)
+            if "get_symbol_settings" in requested:
+                responses["get_symbol_settings"] = post_backend_json(self.backend_url, "get_symbol_settings", self.auth_params, timeout=self.timeout)
+            if "get_psl_settings" in requested:
+                responses["get_psl_settings"] = post_backend_json(self.backend_url, "get_psl_settings", self.auth_params, timeout=self.timeout)
+            self.signals.finished.emit(self.seq, self.auth_params, responses)
+        except Exception as e:
+            self.signals.error.emit(self.seq, self.auth_params, str(e))
+
+
+class _BackendMultiPostSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, dict)  # seq, results
+    error = QtCore.pyqtSignal(int, str)      # seq, message
+
+
+class _BackendMultiPostTask(QtCore.QRunnable):
+    def __init__(self, seq: int, backend_url: str, posts: List[Tuple[str, dict]], timeout: float = DEFAULT_HTTP_TIMEOUT) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self.seq = seq
+        self.backend_url = backend_url
+        self.posts = list(posts or [])
+        self.timeout = timeout
+        self.signals = _BackendMultiPostSignals()
+
+    def run(self) -> None:
+        try:
+            results: Dict[str, Optional[dict]] = {}
+            for path, payload in self.posts:
+                results[path] = post_backend_json(self.backend_url, path, payload, timeout=self.timeout)
+            self.signals.finished.emit(self.seq, results)
+        except Exception as e:
+            self.signals.error.emit(self.seq, str(e))
+
+
+class _BackendRegisterSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, dict, dict)  # seq, context, response
+    challenge = QtCore.pyqtSignal(int, dict, dict)  # seq, context, challenge
+    error = QtCore.pyqtSignal(int, dict, str)      # seq, context, message
+
+
+class _BackendRegisterTask(QtCore.QRunnable):
+    def __init__(
+        self,
+        seq: int,
+        backend_url: str,
+        worker: "TelegramWorker",
+        *,
+        telegram_id: str,
+        platform: str,
+        account_type: str,
+        verify_all_platforms: bool = True,
+        user_start_event: Optional[threading.Event] = None,
+        cancel_event: Optional[threading.Event] = None,
+        challenge_state: Optional[dict] = None,
+        challenge_state_lock: Optional[threading.Lock] = None,
+        timeout: float = DEFAULT_HTTP_TIMEOUT,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self.seq = int(seq)
+        self.backend_url = backend_url
+        self.worker = worker
+        self.timeout = float(timeout)
+        self.verify_all_platforms = bool(verify_all_platforms)
+        self.user_start_event = user_start_event
+        self.cancel_event = cancel_event
+        self._challenge_state = challenge_state
+        self._challenge_state_lock = challenge_state_lock
+        self.context = {
+            "telegram_id": str(telegram_id or ""),
+            "platform": (platform or "mt5").lower(),
+            "account_type": (account_type or "prop").lower(),
+        }
+        self.signals = _BackendRegisterSignals()
+
+    def _export_login_token(self) -> Tuple[Optional[str], str]:
+        """Return a base64 login token for /register/verify.
+
+        Mechanism (minimal-privilege verification):
+        - Use the already-authorized Telethon session
+        - Call ExportLoginTokenRequest
+        - Send the returned short-lived login_token to backend
+
+        SECURITY:
+        - Do NOT export StringSession
+        - Do NOT send any persistent session credential
+        - Do NOT use Saved Messages proof
+        """
+        w = getattr(self, "worker", None)
+        if w is None:
+            return None, "Telegram not ready. Please login first."
+        try:
+            loop = getattr(w, "loop", None)
+        except Exception:
+            loop = None
+        if loop is None:
+            return None, "Telegram not ready. Please login first."
+
+        async def _export() -> Tuple[Optional[str], str]:
+            try:
+                client = getattr(w, "client", None)
+                if client is None:
+                    return None, "Telegram not ready. Please login first."
+                try:
+                    if not client.is_connected():
+                        await asyncio.wait_for(client.connect(), timeout=12)
+                except Exception:
+                    # Best-effort self-heal: restart the client if connect is stuck.
+                    try:
+                        if hasattr(w, "_restart_client_and_catch_up"):
+                            await asyncio.wait_for(w._restart_client_and_catch_up("export_login_token connect"), timeout=20)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                try:
+                    if not await asyncio.wait_for(client.is_user_authorized(), timeout=6):
+                        return None, "Please login to Telegram in the app, then try registration again."
+                except Exception:
+                    return None, "Please login to Telegram in the app, then try registration again."
+
+                # If another request (e.g., group fetching) wedged the client, recover before export.
+                try:
+                    if hasattr(w, "_ensure_reconnect_lock") and hasattr(w, "_is_client_healthy") and hasattr(w, "_restart_client_and_catch_up"):
+                        await w._ensure_reconnect_lock()  # type: ignore[attr-defined]
+                        lock = getattr(w, "_reconnect_lock", None)
+                        if lock is not None:
+                            async with lock:
+                                healthy = False
+                                try:
+                                    healthy = bool(await asyncio.wait_for(w._is_client_healthy(), timeout=5))  # type: ignore[attr-defined]
+                                except Exception:
+                                    healthy = False
+                                if not healthy:
+                                    try:
+                                        await asyncio.wait_for(w._restart_client_and_catch_up("export_login_token health"), timeout=25)  # type: ignore[attr-defined]
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
+
+                api_id = int(getattr(w, "api_id", 0) or 0)
+                api_hash = str(getattr(w, "api_hash", "") or "").strip()
+                if api_id <= 0 or not api_hash:
+                    # Public builds may manage creds; but if the worker doesn't have a configured
+                    # Telethon client yet, the user still needs to login first.
+                    return None, "Telegram is not ready. Please login first."
+
+                # IMPORTANT:
+                # ExportLoginTokenRequest(api_id, api_hash) specifies the *target* Telegram API app
+                # that will import the token. For server-side verification, this must match the
+                # backend's FLAMEBOT_TG_API_ID/FLAMEBOT_TG_API_HASH.
+                managed_api_id, managed_api_hash, _src = _get_managed_telegram_app_credentials()
+                export_api_id = int(managed_api_id or 0) if int(managed_api_id or 0) > 0 else api_id
+                export_api_hash = str(managed_api_hash or "").strip() if str(managed_api_hash or "").strip() else api_hash
+                if export_api_id <= 0 or not export_api_hash:
+                    return None, "Telegram API credentials missing. Please re-login and retry."
+
+                try:
+                    from telethon.tl import functions, types
+                except Exception:
+                    return None, "Telegram library missing required auth methods. Please update the app."
+
+                try:
+                    res = await client(
+                        functions.auth.ExportLoginTokenRequest(
+                            api_id=int(export_api_id),
+                            api_hash=str(export_api_hash),
+                            except_ids=[],
+                        )
+                    )
+                except Exception:
+                    return None, "Could not export Telegram login token. Please retry."
+
+                if isinstance(res, types.auth.LoginTokenMigrateTo):
+                    # Rare; backend will handle migration on import. Client export migration is not handled here.
+                    return None, "Telegram requested a DC migration. Please retry registration."
+                if not isinstance(res, types.auth.LoginToken):
+                    return None, "Could not export Telegram login token. Please retry."
+
+                try:
+                    token_bytes = bytes(getattr(res, "token", b"") or b"")
+                except Exception:
+                    token_bytes = b""
+                if not token_bytes:
+                    return None, "Could not export Telegram login token (empty). Please retry."
+
+                try:
+                    token_b64 = base64.urlsafe_b64encode(token_bytes).decode("ascii")
+                except Exception:
+                    return None, "Could not encode Telegram login token. Please retry."
+                if not token_b64:
+                    return None, "Could not encode Telegram login token. Please retry."
+
+                return token_b64, ""
+            except Exception:
+                return None, "Could not generate Telegram verification token. Please retry (or re-login)."
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_export(), loop)
+            # Register so the worker can cancel it during connectivity drops.
+            try:
+                lock = getattr(w, "_pending_futures_lock", None)
+                pending = getattr(w, "_pending_futures", None)
+                if lock is not None and pending is not None:
+                    with lock:
+                        try:
+                            pending.append(fut)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            try:
+                # Allow more time than a typical backend call; Telegram RPC can be slow.
+                wait_sec = max(60.0, float(self.timeout or DEFAULT_HTTP_TIMEOUT) + 60.0)
+                return fut.result(timeout=wait_sec)
+            except Exception:
+                # Best-effort cancellation + client reset so the next attempt works.
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(w, "cancel_pending_requests"):
+                        w.cancel_pending_requests()
+                except Exception:
+                    pass
+                return None, "Could not generate Telegram verification token (timeout). Please retry."
+            finally:
+                try:
+                    lock = getattr(w, "_pending_futures_lock", None)
+                    pending = getattr(w, "_pending_futures", None)
+                    if lock is not None and pending is not None:
+                        with lock:
+                            try:
+                                if fut in pending:
+                                    pending.remove(fut)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            return None, "Could not generate Telegram verification token. Please retry."
+
+    def _worker_login_hint(self) -> str:
+        """Return a UI-safe hint explaining why proof export may be unavailable."""
+        w = getattr(self, "worker", None)
+        if w is None:
+            return "Telegram not ready. Please login first."
+
+        try:
+            api_id = int(getattr(w, "api_id", 0) or 0)
+        except Exception:
+            api_id = 0
+        try:
+            api_hash = str(getattr(w, "api_hash", "") or "").strip()
+        except Exception:
+            api_hash = ""
+        if api_id <= 0 or not api_hash:
+            return "Telegram not ready. Please login first."
+
+        client = getattr(w, "client", None)
+        loop = getattr(w, "loop", None)
+        if client is None or loop is None:
+            return "Telegram not ready. Please login first."
+
+        async def _is_authed() -> bool:
+            try:
+                if not client.is_connected():
+                    await client.connect()
+                return bool(await client.is_user_authorized())
+            except Exception:
+                return False
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_is_authed(), loop)
+            ok = bool(fut.result(timeout=3))
+        except Exception:
+            ok = False
+
+        if not ok:
+            return "Please login to Telegram in the app (send code + enter code), then try registration again."
+
+        return "Could not generate Telegram verification proof. Please retry (or re-login)."
+
+    def run(self) -> None:
+        try:
+            register_timeout = max(float(self.timeout or DEFAULT_HTTP_TIMEOUT), float(REGISTER_HTTP_TIMEOUT or 20.0))
+
+            # Best-effort: reuse a single TCP connection for the whole registration flow.
+            # This reduces latency and increases the chance the backend routes challenge+verify
+            # to the same warm instance (important because Telegram login tokens expire fast).
+            conn = None
+            base_path = ""
+            try:
+                import http.client
+                import ssl
+                from urllib.parse import urlparse
+
+                u = urlparse(str(self.backend_url or ""))
+                host = u.hostname
+                scheme = (u.scheme or "").lower()
+                if host and scheme in {"https", "http"}:
+                    port = int(u.port or (443 if scheme == "https" else 80))
+                    base_path = str(u.path or "").rstrip("/")
+                    if scheme == "https":
+                        ctx = ssl.create_default_context()
+                        conn = http.client.HTTPSConnection(host, port=port, timeout=float(register_timeout), context=ctx)
+                    else:
+                        conn = http.client.HTTPConnection(host, port=port, timeout=float(register_timeout))
+            except Exception:
+                conn = None
+                base_path = ""
+
+            def _post_json_keepalive(path: str, payload: dict) -> Optional[dict]:
+                nonlocal conn, base_path
+                if conn is None:
+                    return None
+                try:
+                    p = (base_path + "/" + str(path or "").lstrip("/")).replace("//", "/")
+                    body = json.dumps(payload or {}).encode("utf-8")
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "Connection": "keep-alive",
+                    }
+                    conn.request("POST", p, body=body, headers=headers)
+                    resp = conn.getresponse()
+                    data = resp.read() or b""
+                    try:
+                        decoded = data.decode("utf-8")
+                    except Exception:
+                        return {"status": "BAD_RESPONSE", "message": "Backend returned non-text response"}
+                    try:
+                        obj = json.loads(decoded)
+                    except Exception:
+                        return {"status": "BAD_JSON", "message": "Backend returned invalid JSON"}
+                    return obj if isinstance(obj, dict) else {"status": "BAD_JSON", "message": "Backend returned non-object JSON"}
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                    return None
+            def _get_challenge_once() -> Tuple[Optional[str], str, int, str, bool]:
+                payload = {"telegram_id": self.context.get("telegram_id")}
+                ch = _post_json_keepalive("register/challenge", payload)
+                if ch is None:
+                    ch = post_backend_json(self.backend_url, "register/challenge", payload, timeout=register_timeout)
+                try:
+                    status_u = str((ch or {}).get("status") or "").upper()
+                except Exception:
+                    status_u = ""
+                if not isinstance(ch, dict) or status_u != "OK":
+                    msg = "Registration challenge failed"
+                    try:
+                        msg = str((ch or {}).get("message") or msg)
+                    except Exception:
+                        pass
+                    # Network errors are retryable; do not flip the UI into a failure state.
+                    retryable = bool(status_u == "NET_ERROR") or ("network error" in str(msg or "").lower())
+                    return None, msg, 0, "", retryable
+                nonce_val = str(ch.get("nonce") or "").strip()
+                if not nonce_val:
+                    return None, "Registration challenge missing nonce", 0, "", False
+                bot_url = str(ch.get("bot_start_url") or "").strip()
+                try:
+                    exp = int(ch.get("expires_in_sec") or 0)
+                except Exception:
+                    exp = 0
+                return nonce_val, "", exp, bot_url, False
+
+            # IMPORTANT UX:
+            # - Do not open Telegram automatically.
+            # - While waiting for the user to click, auto-regenerate a fresh link every TTL.
+            ev = getattr(self, "user_start_event", None)
+            cancel_ev = getattr(self, "cancel_event", None)
+
+            def _cancelled() -> bool:
+                try:
+                    return bool(isinstance(cancel_ev, threading.Event) and cancel_ev.is_set())
+                except Exception:
+                    return False
+
+            def _sleep_with_cancel(seconds: float) -> None:
+                try:
+                    total = float(seconds or 0.0)
+                except Exception:
+                    total = 0.0
+                if total <= 0:
+                    return
+                end_m = time.monotonic() + total
+                while time.monotonic() < end_m:
+                    if _cancelled():
+                        return
+                    try:
+                        time.sleep(min(0.5, max(0.0, end_m - time.monotonic())))
+                    except Exception:
+                        return
+
+            def _wait_for_user_click(timeout_sec: float) -> bool:
+                """Wait for user click, but remain responsive to cancel_event."""
+                try:
+                    t = float(timeout_sec or 0.0)
+                except Exception:
+                    t = 0.0
+                if t <= 0:
+                    try:
+                        return bool(isinstance(ev, threading.Event) and ev.is_set())
+                    except Exception:
+                        return False
+
+                deadline_m = time.monotonic() + t
+                while True:
+                    if _cancelled():
+                        return False
+                    remaining = deadline_m - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    if isinstance(ev, threading.Event) and ev.wait(timeout=min(1.0, remaining)):
+                        return True
+
+            nonce = ""
+            bot_start_url = ""
+            expires_in_sec = 0
+
+            if isinstance(ev, threading.Event):
+                while True:
+                    if _cancelled():
+                        return
+
+                    # If the user clicked at the edge of a previous TTL, do NOT generate a new nonce.
+                    try:
+                        if nonce and ev.is_set():
+                            break
+                    except Exception:
+                        pass
+
+                    nonce, nonce_err, expires_in_sec, bot_start_url, retryable = _get_challenge_once()
+                    if not nonce:
+                        if bool(retryable):
+                            _sleep_with_cancel(2.0)
+                            continue
+                        self.signals.error.emit(self.seq, dict(self.context), str(nonce_err or "Registration challenge failed"))
+                        return
+
+                    # Update shared state so the UI click can always open the latest URL.
+                    try:
+                        st = getattr(self, "_challenge_state", None)
+                        lk = getattr(self, "_challenge_state_lock", None)
+                        if isinstance(st, dict) and lk is not None:
+                            try:
+                                with lk:
+                                    st["nonce"] = str(nonce)
+                                    st["bot_start_url"] = str(bot_start_url or "").strip()
+                                    st["expires_in_sec"] = int(expires_in_sec or 0)
+                                    st["seq"] = int(getattr(self, "seq", 0) or 0)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    # Inform UI about the current verification link.
+                    try:
+                        self.signals.challenge.emit(
+                            self.seq,
+                            dict(self.context),
+                            {
+                                "nonce": str(nonce),
+                                "bot_start_url": str(bot_start_url or "").strip(),
+                                "expires_in_sec": int(expires_in_sec or 0),
+                            },
+                        )
+                    except Exception:
+                        pass
+
+                    max_wait = int(expires_in_sec) if int(expires_in_sec or 0) > 0 else 300
+                    if max_wait > 300:
+                        max_wait = 300
+
+                    # Wait for user click; if it times out, we regenerate a new link.
+                    if _wait_for_user_click(timeout_sec=max(1.0, float(max_wait))):
+                        break
+                    if _cancelled():
+                        return
+                    # Edge case: click happens right after wait() timed out.
+                    try:
+                        if ev.is_set():
+                            break
+                    except Exception:
+                        pass
+                    # Otherwise: link expired without user action; loop regenerates a new one.
+            else:
+                # No event means no way to proceed safely.
+                self.signals.error.emit(self.seq, dict(self.context), "Telegram verification is not ready. Please retry.")
+                return
+
+            def _do_verify_once(*, nonce_value: str) -> dict:
+                # NOTE:
+                # - platform="all" issues MT4+MT5 in one go (more DB work, slower)
+                # - platform="mt4" or "mt5" issues only one platform (faster)
+                try:
+                    platform_req = str(self.context.get("platform") or "").strip().lower()
+                except Exception:
+                    platform_req = ""
+                if platform_req not in {"mt4", "mt5"}:
+                    platform_req = "mt5"
+                if bool(getattr(self, "verify_all_platforms", True)):
+                    platform_req = "all"
+                payload = {
+                    "telegram_id": self.context.get("telegram_id"),
+                    "platform": platform_req,
+                    "account_type": self.context.get("account_type"),
+                    "nonce": nonce_value,
+                }
+                resp = _post_json_keepalive("register/verify", payload)
+                if resp is None:
+                    resp = post_backend_json(self.backend_url, "register/verify", payload, timeout=register_timeout)
+                return resp if isinstance(resp, dict) else {"status": "ERROR", "message": "No response"}
+
+            # 2) Poll verification until OK or timeout.
+            # Timeout is measured from user click, not from challenge TTL.
+            deadline = time.time() + 300
+            last_resp: dict = {"status": "PENDING", "message": "Waiting for Telegram bot verification"}
+
+            while time.time() < deadline:
+                if _cancelled():
+                    return
+                resp = _do_verify_once(nonce_value=str(nonce))
+                if not isinstance(resp, dict):
+                    resp = {"status": "ERROR", "message": "No response"}
+                last_resp = dict(resp)
+                try:
+                    status = str(resp.get("status") or "").upper()
+                except Exception:
+                    status = ""
+
+                if status == "OK":
+                    self.signals.finished.emit(self.seq, dict(self.context), resp)
+                    break
+
+                if status in {"PENDING", "NET_ERROR"}:
+                    try:
+                        ra_ms = int(resp.get("retry_after_ms") or 2500)
+                    except Exception:
+                        ra_ms = 2500
+                    try:
+                        sleep_total = max(0.9, min(6.0, float(ra_ms) / 1000.0))
+                        end_m = time.monotonic() + float(sleep_total)
+                        while time.monotonic() < end_m:
+                            if _cancelled():
+                                return
+                            time.sleep(min(0.5, max(0.0, end_m - time.monotonic())))
+                    except Exception:
+                        pass
+                    continue
+
+                # Hard error
+                self.signals.finished.emit(self.seq, dict(self.context), resp)
+                break
+            else:
+                self.signals.error.emit(
+                    self.seq,
+                    dict(self.context),
+                    "Telegram verification timed out. Open Telegram and press Start in the bot chat, then retry.",
+                )
+
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+        except Exception as e:
+            self.signals.error.emit(self.seq, dict(self.context), f"{e.__class__.__name__}: {e}")
+
+
+class _BackendRefreshSymbolsSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, dict, dict)  # seq, auth_params, responses
+    error = QtCore.pyqtSignal(int, dict, str)      # seq, auth_params, message
+
+
+class _BackendRefreshSymbolsTask(QtCore.QRunnable):
+    """Manual fast-path: request EA symbol re-push and then re-fetch lists."""
+
+    def __init__(
+        self,
+        seq: int,
+        backend_url: str,
+        auth_params: dict,
+        *,
+        wait_ms: int = 500,
+        timeout: float = DEFAULT_HTTP_TIMEOUT,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self.seq = seq
+        self.backend_url = backend_url
+        self.auth_params = dict(auth_params or {})
+        self.wait_ms = int(wait_ms)
+        self.timeout = timeout
+        self.signals = _BackendRefreshSymbolsSignals()
+
+    def run(self) -> None:
+        try:
+            responses: Dict[str, Any] = {}
+
+            # 1) Request refresh (backend must return immediately)
+            responses["refresh_symbols"] = post_backend_json(
+                self.backend_url,
+                "refresh_symbols",
+                self.auth_params,
+                timeout=self.timeout,
+            )
+
+            # 2) Give EA a short head start to receive the command + push symbols
+            try:
+                time.sleep(max(0.0, float(self.wait_ms) / 1000.0))
+            except Exception:
+                pass
+
+            # 3) Immediately re-fetch the same resources the UI normally polls.
+            # Retry briefly because EA push timing can vary.
+            sym_resp: Optional[dict] = None
+            for _attempt in range(6):
+                sym_resp = post_backend_json(self.backend_url, "get_symbol_settings", self.auth_params, timeout=self.timeout)
+                responses["get_symbol_settings"] = sym_resp
+                try:
+                    if isinstance(sym_resp, dict) and sym_resp.get("status") == "OK":
+                        available = (
+                            sym_resp.get("available_symbols")
+                            or sym_resp.get("symbols_available")
+                            or sym_resp.get("symbols")
+                            or sym_resp.get("symbols_all")
+                            or []
+                        )
+                        if isinstance(available, list) and len(available) > 0:
+                            break
+                except Exception:
+                    pass
+                try:
+                    time.sleep(0.5)
+                except Exception:
+                    break
+
+            responses["get_psl_settings"] = post_backend_json(self.backend_url, "get_psl_settings", self.auth_params, timeout=self.timeout)
+
+            self.signals.finished.emit(self.seq, self.auth_params, responses)
+        except Exception as e:
+            self.signals.error.emit(self.seq, self.auth_params, str(e))
+
+
+def is_windows_dark_mode() -> bool:
+    """Return True if Windows is using dark app mode."""
+    if winreg is None:
+        return False
+
+    try:
+        registry = winreg.ConnectRegistry(None, winreg.HKEY_CURRENT_USER)
+        key = winreg.OpenKey(
+            registry,
+            r"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        )
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        return value == 0  # 0 = dark, 1 = light
+    except Exception:
+        return False
+
+
+def set_windows_native_titlebar_dark(widget: QtWidgets.QWidget, enabled: bool) -> None:
+    """Attempt to make the native Windows title bar match dark mode.
+
+    This affects the non-client area (Windows-drawn title bar). It is a best-effort
+    call that is ignored on unsupported Windows versions or if DWM APIs are missing.
+    """
+    if sys.platform != "win32":
+        return
+    if not hasattr(ctypes, "windll"):
+        return
+    if widget is None:
+        return
+
+    try:
+        hwnd = wintypes.HWND(int(widget.winId()))
+    except Exception:
+        return
+
+    try:
+        dwmapi = ctypes.windll.dwmapi
+    except Exception:
+        return
+
+    on = ctypes.c_int(1 if enabled else 0)
+
+    # Windows 10/11 immersive dark mode attribute. The ID varies by build.
+    for attr in (20, 19):
+        try:
+            dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                wintypes.DWORD(attr),
+                ctypes.byref(on),
+                wintypes.DWORD(ctypes.sizeof(on)),
+            )
+        except Exception:
+            pass
+
+    # Windows 11+ optional caption color (best effort). COLORREF is 0x00BBGGRR.
+    if enabled:
+        try:
+            caption_color = wintypes.DWORD(0x00151010)  # approx #101015
+            dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                wintypes.DWORD(35),
+                ctypes.byref(caption_color),
+                wintypes.DWORD(ctypes.sizeof(caption_color)),
+            )
+        except Exception:
+            pass
+
+    # Force Windows to refresh the non-client area (title bar) immediately.
+    # Without this, the change can be delayed until the next resize/focus event.
+    try:
+        user32 = ctypes.windll.user32
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_NOOWNERZORDER = 0x0200
+        SWP_NOACTIVATE = 0x0010
+        SWP_FRAMECHANGED = 0x0020
+        user32.SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE
+            | SWP_NOSIZE
+            | SWP_NOZORDER
+            | SWP_NOOWNERZORDER
+            | SWP_NOACTIVATE
+            | SWP_FRAMECHANGED,
+        )
+    except Exception:
+        pass
+
+
+DARK_STYLE = f"""
+    QWidget {{
+        background-color: #101015;
+        color: #f5f5f5;
+        font-size: 14px;
+    }}
+    QFrame#card {{
+        background-color: #16161d;
+        border-radius: 18px;
+        border: 1px solid #2b2b36;
+    }}
+    QFrame#sidebar {{
+        background-color: #14141b;
+        border-right: 1px solid #23232e;
+    }}
+    QFrame#message_panel {{
+        background-color: #101015;
+    }}
+    QLabel#title {{
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: 0.2px;
+    }}
+    /* Telegram-like chat header (smaller than global titles) */
+    QLabel#chat_title {{
+        font-size: 18px;
+        font-weight: 700;
+        letter-spacing: 0.0px;
+    }}
+    QLabel#chat_subtitle {{
+        font-size: 12px;
+        color: #c0c0c0;
+    }}
+    QLabel#subtitle, QLabel#muted {{
+        font-size: 13px;
+        color: #c0c0c0;
+    }}
+    QLineEdit, QPlainTextEdit, QTextEdit, QListWidget {{
+        background-color: #1f1f29;
+        color: #f5f5f5;
+        border-radius: 8px;
+        border: 1px solid #2f2f3a;
+        padding: 6px 8px;
+    }}
+    QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QListWidget:focus, QComboBox:focus {{
+        border: 1px solid rgba(255, 122, 47, 0.95);
+    }}
+    QComboBox {{
+        background-color: #1f1f29;
+        color: #f5f5f5;
+        border-radius: 8px;
+        border: 1px solid #2f2f3a;
+        padding: 4px 8px;
+    }}
+    QComboBox QAbstractItemView {{
+        background-color: #1f1f29;
+        color: #f5f5f5;
+        selection-background-color: #2f2f3a;
+    }}
+    QPushButton, QToolButton {{
+        background-color: #2b2b36;
+        color: #f5f5f5;
+        border-radius: 8px;
+        padding: 6px 12px;
+        border: none;
+    }}
+    QToolButton#listen_toggle {{
+        background: transparent;
+        font-size: 22px;
+        padding: 6px 6px;
+        color: #7a7a7a;
+    }}
+    QToolButton#listen_toggle:checked {{
+        color: #ff7a2f;
+    }}
+    QPushButton:hover, QToolButton:hover {{
+        background-color: #343444;
+    }}
+    QPushButton:pressed, QToolButton:pressed {{
+        background-color: #222231;
+    }}
+    QPushButton#primary {{
+        background-color: #ff7a2f;
+        color: #ffffff;
+        font-weight: 600;
+    }}
+    QPushButton#primary:disabled {{
+        background-color: #554030;
+        color: #b0b0b0;
+    }}
+    QPushButton#primary:hover:!disabled {{
+        background-color: #ff934f;
+    }}
+    QListWidget#message_list {{
+        background-color: #0f0f16;
+        border: 1px solid #20202a;
+        border-radius: 12px;
+        padding: 8px;
+    }}
+    QListWidget#group_list {{
+        background-color: #14141b;
+        border: 1px solid #23232e;
+        border-radius: 10px;
+    }}
+    QFrame#group_row {{
+        background: transparent;
+        border: none;
+        border-radius: 10px;
+    }}
+    QFrame#group_row[hover="true"] {{
+        background-color: #1f1f29;
+        border: none;
+    }}
+    QFrame#group_row[selected="true"] {{
+        background-color: rgba(64, 145, 255, 0.22);
+        border: none;
+    }}
+    QScrollBar:vertical {{
+        width: 8px;
+        background: transparent;
+    }}
+    QScrollBar::handle:vertical {{
+        background: #303040;
+        border-radius: 4px;
+    }}
+    QFrame#bubble_in {{
+        background-color: #1f2a33;
+        border: 1px solid #2a2a32;
+        border-radius: 14px;
+        color: #f5f5f5;
+    }}
+    QFrame#bubble_out {{
+        background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff8c3a, stop:1 #ff6a00);
+        border-radius: 14px;
+        color: #ffffff;
+    }}
+    QLabel#field_label {{
+        color: #c0c0c0;
+        font-size: 13px;
+        font-weight: 600;
+    }}
+    QPushButton#country_selector {{
+        background-color: #1f1f29;
+        color: #f5f5f5;
+        border-radius: 8px;
+        border: 1px solid #2f2f3a;
+        padding: 6px 8px;
+        text-align: left;
+    }}
+    QPushButton#country_selector:hover {{
+        border: 1px solid #2f2f3a;
+    }}
+    QLineEdit#phone_input {{
+        background-color: #1f1f29;
+        color: #f5f5f5;
+        border-radius: 8px;
+        border: 1px solid #2f2f3a;
+        padding: 6px 8px;
+        font-size: 14px;
+    }}
+    QLineEdit#phone_input:focus {{
+        border: 1px solid #2f2f3a;
+    }}
+"""
+
+LIGHT_STYLE = """
+    QWidget {
+        background-color: #f4f5f8;
+        color: #111827;
+        font-size: 14px;
+    }
+
+    QLabel#title {
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: 0.2px;
+        color: #111827;
+    }
+    /* Telegram-like chat header (smaller than global titles) */
+    QLabel#chat_title {
+        font-size: 18px;
+        font-weight: 700;
+        letter-spacing: 0.0px;
+        color: #111827;
+    }
+    QLabel#chat_subtitle {
+        font-size: 12px;
+        color: #6b7280;
+    }
+    QLabel#subtitle, QLabel#muted {
+        font-size: 13px;
+        color: #6b7280;
+    }
+
+    QFrame#card {
+        background-color: #ffffff;
+        border-radius: 18px;
+        border: 1px solid rgba(17, 24, 39, 0.10);
+    }
+    QFrame#sidebar {
+        background-color: #f8fafc;
+        border-right: 1px solid rgba(17, 24, 39, 0.08);
+    }
+    QFrame#message_panel {
+        background-color: #f4f5f8;
+    }
+
+    QLineEdit, QPlainTextEdit, QTextEdit, QListWidget {
+        background-color: #ffffff;
+        color: #111827;
+        border-radius: 10px;
+        border: 1px solid rgba(17, 24, 39, 0.12);
+        padding: 8px 10px;
+        selection-background-color: rgba(255, 122, 47, 0.25);
+    }
+    QComboBox {
+        background-color: #ffffff;
+        color: #111827;
+        border-radius: 10px;
+        border: 1px solid rgba(17, 24, 39, 0.12);
+        padding: 6px 10px;
+    }
+    QComboBox QAbstractItemView {
+        background-color: #ffffff;
+        color: #111827;
+        selection-background-color: rgba(255, 122, 47, 0.18);
+    }
+    QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QListWidget:focus, QComboBox:focus {
+        border: 2px solid rgba(255, 122, 47, 0.60);
+    }
+
+    QPushButton, QToolButton {
+        background-color: #e9eef6;
+        color: #111827;
+        border-radius: 10px;
+        padding: 8px 12px;
+        border: none;
+    }
+    QPushButton:hover, QToolButton:hover {
+        background-color: #dfe6f2;
+    }
+    QPushButton:pressed, QToolButton:pressed {
+        background-color: #d3dceb;
+    }
+    QPushButton#primary {
+        background-color: #ff7a2f;
+        color: #ffffff;
+        font-weight: 700;
+    }
+    QPushButton#primary:disabled {
+        background-color: #ffd0b0;
+        color: #8a8a8a;
+    }
+    QPushButton#primary:hover:!disabled {
+        background-color: #ff934f;
+    }
+
+    QToolButton#listen_toggle {
+        background: transparent;
+        font-size: 22px;
+        padding: 6px 6px;
+        color: #6b7280;
+    }
+    QToolButton#listen_toggle:checked {
+        color: #ff7a2f;
+    }
+
+    QListWidget#message_list {
+        background-color: #ffffff;
+        border: 1px solid rgba(17, 24, 39, 0.12);
+        border-radius: 12px;
+        padding: 8px;
+    }
+    QListWidget#group_list {
+        background-color: #f8fafc;
+        border: 1px solid rgba(17, 24, 39, 0.10);
+        border-radius: 12px;
+    }
+
+    QFrame#group_row {
+        background: transparent;
+        border: none;
+        border-radius: 12px;
+    }
+    QFrame#group_row[hover="true"] {
+        background-color: #ffffff;
+        border: none;
+    }
+    QFrame#group_row[selected="true"] {
+        background-color: rgba(64, 145, 255, 0.14);
+        border: none;
+    }
+
+    QFrame#bubble_in {
+        background-color: #ffffff;
+        border: 1px solid rgba(17, 24, 39, 0.10);
+        border-radius: 14px;
+        color: #111827;
+    }
+    QFrame#bubble_out {
+        background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff8c3a, stop:1 #ff6a00);
+        border-radius: 14px;
+        color: #ffffff;
+    }
+
+    QLabel#field_label {
+        color: #6b7280;
+        font-size: 13px;
+        font-weight: 700;
+    }
+    QPushButton#country_selector {
+        background-color: #ffffff;
+        color: #111827;
+        border-radius: 12px;
+        border: 1px solid rgba(17, 24, 39, 0.12);
+        padding: 10px 12px;
+        text-align: left;
+    }
+    QPushButton#country_selector:hover {
+        border: 1px solid rgba(17, 24, 39, 0.18);
+    }
+    QLineEdit#phone_input {
+        background-color: #ffffff;
+        color: #111827;
+        border-radius: 12px;
+        border: 1px solid rgba(17, 24, 39, 0.12);
+        padding: 10px 12px;
+        font-size: 14px;
+    }
+    QLineEdit#phone_input:focus {
+        border: 2px solid rgba(255, 122, 47, 0.60);
+    }
+"""
+
+
+def apply_system_theme(app: QtWidgets.QApplication) -> None:
+    """Apply light/dark style sheet to the application based on Windows settings."""
+    app.setStyleSheet(DARK_STYLE if is_windows_dark_mode() else LIGHT_STYLE)
+
+
+COUNTRY_FILE_NAME = "country.json"
+
+
+def resolve_country_file() -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / COUNTRY_FILE_NAME
+
+
+def resolve_resource_path(name: str) -> str:
+    """Resolve a bundled resource path (PyInstaller) or local file path.
+
+    Returns the original name if no existing file is found.
+    """
+    if not name:
+        return name
+    candidates = []
+    try:
+        candidates.append(Path(getattr(sys, "_MEIPASS")))  # type: ignore[arg-type]
+    except Exception:
+        pass
+    try:
+        candidates.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
+    try:
+        candidates.append(Path.cwd())
+    except Exception:
+        pass
+
+    for base in candidates:
+        if not base:
+            continue
+        try:
+            candidate = base / name
+            if candidate.exists():
+                return str(candidate)
+        except Exception:
+            continue
+    return name
+
+
+def load_countries() -> List[dict]:
+    path = resolve_country_file()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return []
+
+    countries: List[dict] = []
+    for entry in payload or []:
+        name = str(entry.get("name", "")).strip()
+        iso = str(entry.get("iso") or entry.get("code") or "").strip().upper()
+        dial_code = str(entry.get("dial_code", "")).strip()
+        flag = str(entry.get("flag", "")).strip()
+        if not name or not dial_code:
+            continue
+        if not dial_code.startswith("+"):
+            dial_code = "+" + dial_code.lstrip("+")
+        countries.append(
+            {
+                "name": name,
+                "iso": iso,
+                "dial_code": dial_code,
+                "flag": flag,
+            }
+        )
+    return countries
+
+
+class CountrySelectDialog(QtWidgets.QDialog):
+    def __init__(self, countries: List[dict], parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select Country")
+        try:
+            enabled = bool(getattr(parent, "dark_mode", is_windows_dark_mode()))
+        except Exception:
+            enabled = is_windows_dark_mode()
+        set_windows_native_titlebar_dark(self, enabled)
+        self.setModal(True)
+        self.resize(420, 520)
+        self._all_countries = list(countries or [])
+        self._filtered = list(self._all_countries)
+        self._selected: Optional[dict] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.setPlaceholderText("Search by country or code")
+        layout.addWidget(self.search_input)
+
+        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setUniformItemSizes(True)
+        self.list_widget.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        layout.addWidget(self.list_widget, 1)
+
+        self._populate_list(self._filtered)
+        self.search_input.textChanged.connect(self._on_search)
+        self.list_widget.itemPressed.connect(self._select_current)
+        self.list_widget.itemActivated.connect(self._select_current)
+        self.list_widget.itemDoubleClicked.connect(self._select_current)
+
+    def selected_country(self) -> Optional[dict]:
+        return self._selected
+
+    def _populate_list(self, countries: List[dict]) -> None:
+        self.list_widget.clear()
+        for country in countries:
+            item = QtWidgets.QListWidgetItem()
+            item.setData(QtCore.Qt.UserRole, country)
+            widget = QtWidgets.QWidget()
+            widget.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+            row = QtWidgets.QHBoxLayout(widget)
+            row.setContentsMargins(8, 6, 8, 6)
+            row.setSpacing(10)
+            flag = QtWidgets.QLabel(country.get("flag", ""))
+            flag.setMinimumWidth(24)
+            name = QtWidgets.QLabel(country.get("name", ""))
+            name.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            code = QtWidgets.QLabel(country.get("dial_code", ""))
+            code.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            code.setObjectName("muted")
+            row.addWidget(flag)
+            row.addWidget(name, 1)
+            row.addWidget(code)
+            item.setSizeHint(widget.sizeHint())
+            self.list_widget.addItem(item)
+            self.list_widget.setItemWidget(item, widget)
+
+    def _on_search(self, text: str) -> None:
+        query = (text or "").strip().lower()
+        if not query:
+            self._filtered = list(self._all_countries)
+            self._populate_list(self._filtered)
+            return
+
+        digits = re.sub(r"\D", "", query)
+        filtered: List[dict] = []
+        for country in self._all_countries:
+            name = str(country.get("name", "")).lower()
+            iso = str(country.get("iso", "")).lower()
+            dial = str(country.get("dial_code", ""))
+            dial_digits = re.sub(r"\D", "", dial)
+            if query in name or (iso and query in iso):
+                filtered.append(country)
+                continue
+            if digits and dial_digits.startswith(digits):
+                filtered.append(country)
+                continue
+        self._filtered = filtered
+        self._populate_list(self._filtered)
+
+    def _select_current(self) -> None:
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        self._selected = item.data(QtCore.Qt.UserRole)
+        self.accept()
+
+
+class BlockingTelegramVerificationDialog(QtWidgets.QDialog):
+    """Application-modal verification overlay.
+
+    Blocks all interaction with the app until verification is complete.
+    """
+
+    openTelegramClicked = QtCore.pyqtSignal()
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._allow_close = False
+        self._bot_url = ""
+        self._needs_new_link = False
+        self._challenge_expires_at_monotonic = 0.0
+        self._cooldown_until_monotonic = 0.0
+        self._cooldown_timer: Optional[QtCore.QTimer] = None
+
+        self.setWindowTitle("Telegram Verification")
+        try:
+            enabled = bool(getattr(parent, "dark_mode", is_windows_dark_mode()))
+        except Exception:
+            enabled = is_windows_dark_mode()
+        set_windows_native_titlebar_dark(self, enabled)
+
+        # Non-modal so the main window's minimize/maximize buttons remain clickable.
+        # We block app interaction by disabling the content widget instead.
+        try:
+            self.setModal(False)
+        except Exception:
+            pass
+        try:
+            self.setWindowModality(QtCore.Qt.NonModal)
+        except Exception:
+            pass
+        self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
+        try:
+            self.setWindowFlag(QtCore.Qt.WindowCloseButtonHint, False)
+        except Exception:
+            pass
+
+        # Ensure the dialog always has a usable minimum size.
+        try:
+            self.setMinimumSize(540, 260)
+        except Exception:
+            self.setMinimumWidth(540)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(12)
+
+        title = QtWidgets.QLabel("Verify your Telegram account")
+        title.setStyleSheet("font-size: 18px; font-weight: 800;")
+        layout.addWidget(title)
+
+        self.status_label = QtWidgets.QLabel("Generating verification link…")
+        self.status_label.setWordWrap(True)
+        self.status_label.setObjectName("muted")
+        layout.addWidget(self.status_label)
+
+        steps = QtWidgets.QLabel(
+            "1) Click ‘Verify in Telegram’\n"
+            "2) Press Start in the bot chat\n"
+            "3) This screen will close automatically"
+        )
+        steps.setWordWrap(True)
+        layout.addWidget(steps)
+
+        # Do not display the deep-link. It must only be used via the button.
+        self.link_label = QtWidgets.QLabel("")
+        self.link_label.hide()
+
+        # Action area: long loading bar + small centered button (separate).
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 0)
+        try:
+            self.progress.setTextVisible(False)
+        except Exception:
+            pass
+        try:
+            self.progress.setFixedHeight(28)
+        except Exception:
+            pass
+        try:
+            self.progress.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        except Exception:
+            pass
+        layout.addWidget(self.progress)
+
+        self.open_btn = QtWidgets.QPushButton("Verify in Telegram")
+        self.open_btn.setObjectName("primary")
+        self.open_btn.setEnabled(False)
+        try:
+            self.open_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+            self.open_btn.setMinimumHeight(32)
+            self.open_btn.setMinimumWidth(220)
+        except Exception:
+            pass
+        layout.addWidget(self.open_btn, 0, QtCore.Qt.AlignHCenter)
+
+        self.open_btn.clicked.connect(lambda: self.openTelegramClicked.emit())
+
+    def _format_mmss(self, sec: int) -> str:
+        s = max(0, int(sec))
+        m = s // 60
+        r = s % 60
+        return f"{m:02d}:{r:02d}"
+
+    def cooldown_remaining_sec(self) -> int:
+        try:
+            rem = int(round(float(self._cooldown_until_monotonic) - time.monotonic()))
+        except Exception:
+            rem = 0
+        return max(0, rem)
+
+    def in_cooldown(self) -> bool:
+        return self.cooldown_remaining_sec() > 0
+
+    def begin_cooldown(self, seconds: int = 300) -> None:
+        try:
+            secs = int(seconds or 0)
+        except Exception:
+            secs = 0
+        if secs <= 0:
+            return
+
+        try:
+            self._cooldown_until_monotonic = float(time.monotonic()) + float(secs)
+        except Exception:
+            self._cooldown_until_monotonic = 0.0
+            return
+
+        if self._cooldown_timer is None:
+            self._cooldown_timer = QtCore.QTimer(self)
+            self._cooldown_timer.setInterval(650)
+            self._cooldown_timer.timeout.connect(self._tick_cooldown)
+
+        try:
+            self._cooldown_timer.start()
+        except Exception:
+            pass
+
+        self._tick_cooldown()
+
+    def _tick_cooldown(self) -> None:
+        rem = self.cooldown_remaining_sec()
+        if rem <= 0:
+            try:
+                if self._cooldown_timer is not None:
+                    self._cooldown_timer.stop()
+            except Exception:
+                pass
+            # Restore default state.
+            try:
+                self.open_btn.setText("Verify in Telegram")
+            except Exception:
+                pass
+
+            # If the last issued challenge is expired by now, never reuse the old link.
+            try:
+                exp_at = float(getattr(self, "_challenge_expires_at_monotonic", 0.0) or 0.0)
+            except Exception:
+                exp_at = 0.0
+            try:
+                if exp_at > 0.0 and float(time.monotonic()) >= exp_at:
+                    self._bot_url = ""
+                    self._needs_new_link = True
+            except Exception:
+                pass
+
+            try:
+                self.open_btn.setEnabled(bool(self._bot_url) or bool(getattr(self, "_needs_new_link", False)))
+            except Exception:
+                pass
+            # If the user needs a fresh link, allow clicking the button to start a new attempt.
+            try:
+                if bool(getattr(self, "_needs_new_link", False)):
+                    self.open_btn.setEnabled(True)
+            except Exception:
+                pass
+            return
+
+        # While cooling down, block repeated clicks.
+        try:
+            self.open_btn.setEnabled(False)
+            self.open_btn.setText(f"Try again in {self._format_mmss(rem)}")
+        except Exception:
+            pass
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if not bool(getattr(self, "_allow_close", False)):
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def set_allow_close(self, allow: bool) -> None:
+        self._allow_close = bool(allow)
+
+    def set_pending(self, msg: str = "Waiting for Telegram verification…") -> None:
+        self.progress.setVisible(True)
+        self._needs_new_link = False
+        self.status_label.setText(str(msg or "Waiting for Telegram verification…"))
+
+    def set_challenge(self, bot_url: str, expires_in_sec: int) -> None:
+        self._bot_url = str(bot_url or "").strip()
+        self._needs_new_link = False
+        try:
+            ttl = int(expires_in_sec or 0)
+        except Exception:
+            ttl = 0
+        try:
+            self._challenge_expires_at_monotonic = float(time.monotonic()) + float(ttl) if ttl > 0 else 0.0
+        except Exception:
+            self._challenge_expires_at_monotonic = 0.0
+        self.open_btn.setEnabled(bool(self._bot_url) and (not self.in_cooldown()))
+        # Do not show TTL in UI; we refresh links pre-click in the background.
+        self.status_label.setText("Waiting for Telegram verification…")
+
+    def bot_url(self) -> str:
+        return str(getattr(self, "_bot_url", "") or "")
+
+    def set_expired(self, msg: str = "❌ Couldn't connect via Telegram. Wait and try again.") -> None:
+        self.progress.setVisible(False)
+        self._needs_new_link = True
+        # Never keep an expired link around.
+        self._bot_url = ""
+        try:
+            self._challenge_expires_at_monotonic = 0.0
+        except Exception:
+            pass
+        # During cooldown the button shows countdown; otherwise it becomes enabled to retry.
+        self.open_btn.setEnabled((not self.in_cooldown()))
+        self.status_label.setText(str(msg or "❌ Couldn't connect via Telegram. Wait and try again."))
+
+        # If cooldown is active, keep retry disabled and show countdown on primary button.
+        try:
+            if self.in_cooldown():
+                self._tick_cooldown()
+        except Exception:
+            pass
+
+    def set_error_retryable(self, msg: str) -> None:
+        self.progress.setVisible(False)
+        self._needs_new_link = True
+        # Do not reuse potentially-stale links after an error.
+        self._bot_url = ""
+        try:
+            self._challenge_expires_at_monotonic = 0.0
+        except Exception:
+            pass
+        self.open_btn.setEnabled((not self.in_cooldown()))
+        self.status_label.setText(str(msg or "❌ Couldn't connect via Telegram. Wait and try again."))
+
+        # If cooldown is active, enforce it in the UI.
+        try:
+            if self.in_cooldown():
+                self._tick_cooldown()
+        except Exception:
+            pass
+
+    def needs_new_link(self) -> bool:
+        return bool(getattr(self, "_needs_new_link", False))
+
+
+class CountrySelectorButton(QtWidgets.QPushButton):
+    def __init__(self, text: str = "", parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(text, parent)
+        self._arrow = "›"
+        self._arrow_padding = 14
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(self.palette().color(QtGui.QPalette.ButtonText))
+        rect = self.rect().adjusted(0, 0, -self._arrow_padding, 0)
+        painter.drawText(
+            rect,
+            QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight,
+            self._arrow,
+        )
+
+
+@dataclass
+class GroupState:
+    name: str
+    gid: int
+    icon_path: Optional[str]
+    # Public handle for channels/groups (e.g. "profit_hacker"). Empty for private chats.
+    username: str = ""
+    listening: bool = False
+    unread: int = 0
+    # Messages are stored as (sender, text, hhmm, outgoing, date_key).
+    messages: Deque[Tuple[str, str, str, bool, str]] = field(default_factory=deque)
+    # Distance from bottom of the scroll area; 0 means at bottom.
+    scroll_anchor: int = 0
+
+
+class ElidedLabel(QtWidgets.QLabel):
+    """A QLabel that always renders a single line with right-side ellipsis."""
+
+    def __init__(self, text: str = "", parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__("", parent)
+        self._full_text = ""
+        try:
+            self.setWordWrap(False)
+        except Exception:
+            pass
+        try:
+            self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        except Exception:
+            pass
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        try:
+            self._full_text = str(text or "")
+        except Exception:
+            self._full_text = ""
+        # Prevent QLabel from doing its own layout/wrapping; we paint ourselves.
+        try:
+            super().setText("")
+        except Exception:
+            pass
+        try:
+            self.update()
+        except Exception:
+            pass
+
+    def text(self) -> str:  # noqa: A003
+        return self._full_text
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802
+        fm = QtGui.QFontMetrics(self.font())
+        h = fm.height() + 2
+        return QtCore.QSize(120, h)
+
+    def minimumSizeHint(self) -> QtCore.QSize:  # noqa: N802
+        fm = QtGui.QFontMetrics(self.font())
+        h = fm.height() + 2
+        return QtCore.QSize(20, h)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        painter = QtGui.QPainter(self)
+        try:
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+        except Exception:
+            pass
+
+        rect = self.contentsRect()
+        fm = QtGui.QFontMetrics(self.font())
+        try:
+            elided = fm.elidedText(self._full_text, QtCore.Qt.ElideRight, rect.width())
+        except Exception:
+            elided = self._full_text
+
+        try:
+            painter.setPen(self.palette().color(self.foregroundRole()))
+        except Exception:
+            pass
+        painter.drawText(rect, int(self.alignment() | QtCore.Qt.TextSingleLine), elided)
+        painter.end()
+
+
+class WrapLabel(QtWidgets.QLabel):
+    """QLabel that reports correct height for word-wrapped text.
+
+    Qt's default QLabel sizeHint can underestimate height for wrapped text until
+    a final width is known, which can lead to bubbles clipping multi-line wraps.
+    """
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        try:
+            return bool(self.wordWrap())
+        except Exception:
+            return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        try:
+            w = max(1, int(width))
+        except Exception:
+            w = 1
+
+        try:
+            text = str(self.text() or "")
+        except Exception:
+            text = ""
+
+        try:
+            margins = self.contentsMargins()
+            w = max(1, w - int(margins.left()) - int(margins.right()))
+        except Exception:
+            pass
+
+        flags = int(self.alignment()) | int(QtCore.Qt.TextWordWrap)
+        try:
+            rect = QtGui.QFontMetrics(self.font()).boundingRect(0, 0, int(w), 10_000, flags, text)
+            h = int(rect.height())
+        except Exception:
+            try:
+                h = int(QtGui.QFontMetrics(self.font()).height())
+            except Exception:
+                h = 16
+
+        try:
+            margins = self.contentsMargins()
+            h = int(h + int(margins.top()) + int(margins.bottom()))
+        except Exception:
+            pass
+        return max(1, h)
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802
+        try:
+            w = max(1, self.width())
+        except Exception:
+            w = 1
+        try:
+            return QtCore.QSize(int(w), int(self.heightForWidth(int(w))))
+        except Exception:
+            return super().sizeHint()
+
+    def minimumSizeHint(self) -> QtCore.QSize:  # noqa: N802
+        try:
+            fm = QtGui.QFontMetrics(self.font())
+            h = int(fm.height())
+        except Exception:
+            h = 16
+        return QtCore.QSize(1, max(1, h))
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        super().setText(text)
+        # Text changes should invalidate size calculations.
+        try:
+            self.updateGeometry()
+        except Exception:
+            pass
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # Width changes affect height for wrapped text.
+        try:
+            self.updateGeometry()
+        except Exception:
+            pass
+
+
+class MessageBubble(QtWidgets.QFrame):
+    def __init__(
+        self,
+        group_name: str,
+        message: str,
+        timestamp: str,
+        accent: QtGui.QColor,
+        *,
+        outgoing: bool = False,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("message_bubble")
+        # IMPORTANT: do not use a Fixed vertical policy.
+        # Word-wrapped QLabel height depends on the final width; a Fixed bubble can
+        # end up with a stale height and clip the next/short messages.
+        self.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
+        self.setMaximumWidth(640)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 10)
+        layout.setSpacing(6)
+
+        name_label = QtWidgets.QLabel(group_name, self)
+        name_label.setObjectName("bubble_name")
+        try:
+            name_label.setTextFormat(QtCore.Qt.PlainText)
+        except Exception:
+            pass
+        name_label.setStyleSheet(f"font-weight: 700; color: {accent.name()};")
+        # Show the chat title above each message (Telegram-like for channels).
+        try:
+            name_label.setVisible(bool(str(group_name or "").strip()))
+        except Exception:
+            pass
+
+        message_label = WrapLabel(message, self)
+        message_label.setObjectName("bubble_message")
+        # Force plain text to preserve newlines and avoid accidental rich-text parsing.
+        try:
+            message_label.setTextFormat(QtCore.Qt.PlainText)
+        except Exception:
+            pass
+        message_label.setWordWrap(True)
+        # Qt layout quirk: a word-wrapped QLabel in a layout often needs a tiny
+        # minimum width to allow height-for-width calculations to kick in.
+        try:
+            message_label.setMinimumWidth(1)
+            message_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        except Exception:
+            pass
+
+        # Keep a direct handle so we can force correct wrap height.
+        self._message_label = message_label
+
+        time_label = QtWidgets.QLabel(timestamp, self)
+        time_label.setObjectName("bubble_time")
+        try:
+            time_label.setTextFormat(QtCore.Qt.PlainText)
+        except Exception:
+            pass
+        time_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom)
+
+        layout.addWidget(name_label)
+        layout.addWidget(message_label)
+        layout.addWidget(time_label)
+
+        # First-pass sync (final width may settle later; we also sync on show/resize).
+        try:
+            self._sync_message_wrap_height()
+        except Exception:
+            pass
+
+    def _sync_message_wrap_height(self) -> None:
+        lbl = getattr(self, "_message_label", None)
+        if lbl is None:
+            return
+
+        # Compute available width for the label.
+        try:
+            w = int(lbl.width())
+        except Exception:
+            w = 0
+        if w <= 1:
+            try:
+                lay = self.layout()
+                if lay is not None:
+                    m = lay.contentsMargins()
+                    w = int(max(1, int(self.width()) - int(m.left()) - int(m.right())))
+            except Exception:
+                w = max(1, int(self.width()))
+
+        try:
+            h = int(lbl.heightForWidth(int(w)))
+        except Exception:
+            try:
+                h = int(lbl.sizeHint().height())
+            except Exception:
+                h = 16
+
+        # Lock the label height to the computed wrapped height.
+        try:
+            lbl.setMinimumHeight(int(h))
+            lbl.setMaximumHeight(int(h))
+        except Exception:
+            pass
+
+        # Ask Qt to recompute bubble size.
+        try:
+            self.updateGeometry()
+            self.adjustSize()
+        except Exception:
+            pass
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
+        super().showEvent(event)
+        try:
+            self._sync_message_wrap_height()
+        except Exception:
+            pass
+
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        try:
+            self._sync_message_wrap_height()
+        except Exception:
+            pass
+
+
+class MessageLogWidget(QtWidgets.QScrollArea):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("message_log")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        self._dark_mode = True
+        self.set_theme(True)
+
+        self._content = QtWidgets.QWidget(self)
+        self._content.setObjectName("message_log_content")
+        self._layout = QtWidgets.QVBoxLayout(self._content)
+        self._layout.setContentsMargins(4, 4, 8, 4)
+        self._layout.setSpacing(10)
+        self._layout.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self._layout.addStretch(1)
+        self.setWidget(self._content)
+
+        # Prevent unbounded widget growth (long-running sessions).
+        try:
+            self._max_bubbles = int(os.environ.get("FLAMEBOT_UI_LOG_MAX_BUBBLES", "500"))
+        except Exception:
+            self._max_bubbles = 500
+
+        # Track last rendered date for Telegram-style day separators.
+        self._last_date_key: Optional[str] = None
+
+        # Telegram-like: show a scroll-to-bottom button when user scrolls up.
+        self._user_near_bottom = True
+        self._scroll_btn = QtWidgets.QToolButton(self)
+        self._scroll_btn.setObjectName("scroll_down_btn")
+        self._scroll_btn.setText("⌄")
+        self._scroll_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._scroll_btn.setAutoRaise(True)
+        self._scroll_btn.setFixedSize(36, 36)
+        self._scroll_btn.hide()
+        self._scroll_btn.clicked.connect(lambda: self.scroll_to_bottom(force=True))
+        try:
+            sb = self.verticalScrollBar()
+            sb.valueChanged.connect(self._on_scroll_changed)
+            sb.rangeChanged.connect(lambda _min, _max: self._on_scroll_changed())
+        except Exception:
+            pass
+
+    def _trim_old_bubbles(self) -> None:
+        # Layout contains a trailing stretch item.
+        try:
+            limit = int(getattr(self, "_max_bubbles", 500) or 0)
+        except Exception:
+            limit = 500
+        if limit <= 0:
+            return
+
+        try:
+            while self._layout.count() > (limit + 1):
+                item = self._layout.takeAt(0)
+                w = item.widget() if item else None
+                if w is not None:
+                    w.deleteLater()
+        except Exception:
+            pass
+
+    def set_theme(self, dark_mode: bool) -> None:
+        self._dark_mode = bool(dark_mode)
+        if self._dark_mode:
+            bg = "rgba(20, 20, 28, 0.65)"
+            border = "rgba(120, 160, 255, 0.10)"
+        else:
+            bg = "rgba(255, 255, 255, 0.92)"
+            border = "rgba(17, 24, 39, 0.10)"
+
+        self.setStyleSheet(
+            "QScrollArea#message_log {"
+            f"background-color: {bg};"
+            "border-radius: 20px;"
+            f"border: 1px solid {border};"
+            "}"
+            "QScrollArea#message_log > QWidget {"
+            "background: transparent;"
+            "}"
+            "QScrollArea#message_log > QWidget > QWidget {"
+            "background: transparent;"
+            "}"
+        )
+        try:
+            self._apply_scroll_btn_style()
+        except Exception:
+            pass
+        try:
+            self._position_scroll_button()
+        except Exception:
+            pass
+
+    def clear(self) -> None:  # noqa: A003 - Qt API compatibility
+        while self._layout.count() > 1:
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        try:
+            self._last_date_key = None
+        except Exception:
+            pass
+        try:
+            self._user_near_bottom = True
+            self._scroll_btn.hide()
+        except Exception:
+            pass
+
+    def appendPlainText(self, text: str) -> None:  # noqa: N802 - match QPlainTextEdit API
+        timestamp, remainder = self._extract_timestamp(text)
+        group_name, message = self._extract_group_and_message(remainder)
+        self.appendMessage(group_name, message, timestamp, outgoing=False, date_key="")
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        try:
+            self._position_scroll_button()
+        except Exception:
+            pass
+        # When the scroll area width changes, word-wrapped labels need a relayout.
+        # This avoids stale heights that can make later bubbles look clipped.
+        try:
+            content = getattr(self, "_content", None)
+            if content is not None:
+                content.updateGeometry()
+                content.adjustSize()
+        except Exception:
+            pass
+
+    def _position_scroll_button(self) -> None:
+        btn = getattr(self, "_scroll_btn", None)
+        if btn is None:
+            return
+        margin = 18
+        x = max(margin, self.width() - btn.width() - margin)
+        y = max(margin, self.height() - btn.height() - margin)
+        btn.move(int(x), int(y))
+
+    def _is_near_bottom(self, threshold: int = 36) -> bool:
+        try:
+            sb = self.verticalScrollBar()
+            return int(sb.maximum() - sb.value()) <= int(threshold)
+        except Exception:
+            return True
+
+    def _apply_scroll_btn_style(self) -> None:
+        btn = getattr(self, "_scroll_btn", None)
+        if btn is None:
+            return
+        is_dark = bool(getattr(self, "_dark_mode", True))
+        base = QtGui.QColor(20, 20, 28) if is_dark else QtGui.QColor(255, 255, 255)
+        bg = QtGui.QColor(base).lighter(118 if is_dark else 96)
+        fg = "rgba(235, 235, 245, 0.70)" if is_dark else "rgba(30, 30, 30, 0.65)"
+        btn.setStyleSheet(
+            "QToolButton#scroll_down_btn {"
+            f"background-color: {bg.name()};"
+            f"color: {fg};"
+            "border: none;"
+            "border-radius: 18px;"
+            "font-size: 18px;"
+            "padding-bottom: 2px;"
+            "}"
+            "QToolButton#scroll_down_btn:hover {"
+            f"background-color: {bg.lighter(110).name()};"
+            "}"
+        )
+
+    def _on_scroll_changed(self) -> None:
+        near = self._is_near_bottom()
+        try:
+            self._user_near_bottom = bool(near)
+        except Exception:
+            pass
+        try:
+            self._scroll_btn.setVisible(not near)
+            self._position_scroll_button()
+        except Exception:
+            pass
+
+    def scroll_to_bottom(self, *, force: bool = False) -> None:
+        try:
+            sb = self.verticalScrollBar()
+            sb.setValue(int(sb.maximum()))
+        except Exception:
+            return
+        try:
+            self._user_near_bottom = True
+            if force:
+                self._scroll_btn.hide()
+        except Exception:
+            pass
+
+    def _format_date_label(self, date_key: str) -> str:
+        try:
+            d = datetime.strptime(str(date_key or ""), "%Y-%m-%d").date()
+        except Exception:
+            return str(date_key or "").strip()
+
+        try:
+            today = datetime.now().date()
+        except Exception:
+            today = d
+        try:
+            if d == today:
+                return "Today"
+            if d == (today - timedelta(days=1)):
+                return "Yesterday"
+        except Exception:
+            pass
+
+        try:
+            return f"{d.day} {d.strftime('%B %Y')}"
+        except Exception:
+            return str(date_key or "").strip()
+
+    def _append_date_divider(self, date_key: str) -> None:
+        key = str(date_key or "").strip()
+        if not key:
+            return
+
+        label_text = self._format_date_label(key)
+
+        container = QtWidgets.QFrame(self._content)
+        container.setObjectName("date_divider")
+        lay = QtWidgets.QHBoxLayout(container)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        pill = QtWidgets.QLabel(label_text, container)
+        pill.setObjectName("date_divider_label")
+        pill.setAlignment(QtCore.Qt.AlignCenter)
+        pill.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+
+        is_dark = bool(getattr(self, "_dark_mode", True))
+        base = QtGui.QColor(20, 20, 28) if is_dark else QtGui.QColor(255, 255, 255)
+        pill_bg = QtGui.QColor(base).lighter(128 if is_dark else 96)
+        text_color = "rgba(235, 235, 245, 0.55)" if is_dark else "rgba(30, 30, 30, 0.55)"
+        pill.setStyleSheet(
+            "QLabel#date_divider_label {"
+            f"background-color: {pill_bg.name()};"
+            f"color: {text_color};"
+            "padding: 5px 12px;"
+            "border-radius: 12px;"
+            "font-size: 11px;"
+            "font-weight: 600;"
+            "}"
+        )
+
+        lay.addStretch(1)
+        lay.addWidget(pill)
+        lay.addStretch(1)
+
+        self._layout.insertWidget(self._layout.count() - 1, container, 0)
+        try:
+            self._last_date_key = key
+        except Exception:
+            pass
+
+    def appendMessage(
+        self,
+        sender: str,
+        message: str,
+        timestamp: str,
+        outgoing: bool = False,
+        *,
+        date_key: str = "",
+    ) -> None:  # noqa: N802
+        name = str(sender or "Unknown")
+        msg = str(message or "")
+        ts = self._format_timestamp(str(timestamp or ""))
+        try:
+            outgoing_b = bool(outgoing)
+        except Exception:
+            outgoing_b = False
+
+        # Auto-scroll only if user was already at the bottom.
+        try:
+            near_bottom_before = bool(getattr(self, "_user_near_bottom", True))
+        except Exception:
+            near_bottom_before = True
+        try:
+            dk = str(date_key or "").strip()
+        except Exception:
+            dk = ""
+        if dk:
+            try:
+                if str(getattr(self, "_last_date_key", None) or "") != dk:
+                    self._append_date_divider(dk)
+            except Exception:
+                pass
+
+        accent = self._accent_color(name)
+        bubble = MessageBubble(name, msg, ts, accent, outgoing=outgoing_b, parent=self._content)
+        bubble.setStyleSheet(self._bubble_style(accent, outgoing=outgoing_b))
+        align = QtCore.Qt.AlignLeft
+        self._layout.insertWidget(self._layout.count() - 1, bubble, 0, align)
+
+        def _relayout_after_insert() -> None:
+            # Activate layouts after Qt assigns final widths.
+            try:
+                lay = bubble.layout()
+                if lay is not None:
+                    lay.activate()
+            except Exception:
+                pass
+            try:
+                bubble.updateGeometry()
+                bubble.adjustSize()
+            except Exception:
+                pass
+            try:
+                if hasattr(bubble, "_sync_message_wrap_height"):
+                    bubble._sync_message_wrap_height()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                content_lay = self._content.layout()
+                if content_lay is not None:
+                    content_lay.activate()
+            except Exception:
+                pass
+            try:
+                self._content.updateGeometry()
+                self._content.adjustSize()
+            except Exception:
+                pass
+
+        # Run relayout right away and again next tick (after widths settle).
+        try:
+            _relayout_after_insert()
+        except Exception:
+            pass
+        try:
+            QtCore.QTimer.singleShot(0, _relayout_after_insert)
+        except Exception:
+            pass
+        self._trim_old_bubbles()
+        if near_bottom_before:
+            QtCore.QTimer.singleShot(0, lambda: self.scroll_to_bottom(force=False))
+        else:
+            QtCore.QTimer.singleShot(0, self._on_scroll_changed)
+
+    def _scroll_to_bottom(self) -> None:
+        # Backwards compatible: existing callers use this name.
+        self.scroll_to_bottom(force=True)
+
+    def _extract_timestamp(self, text: str) -> Tuple[str, str]:
+        raw = (text or "").strip()
+        if raw.startswith("["):
+            close = raw.find("]")
+            if close > 0:
+                ts = raw[1:close].strip()
+                remainder = raw[close + 1 :].strip()
+                return self._format_timestamp(ts), remainder
+
+        # Preferred format used by TelegramWorker logs:
+        #   "📩TS=HH:MM:SS [name] message"
+        # This must preserve Telegram's send-time across reconnect/catch-up
+        # (do not replace with local arrival time).
+        try:
+            # IMPORTANT: messages can be multi-line; use DOTALL so the remainder
+            # captures newlines too. Otherwise we fail to parse and fall back to
+            # PC time (datetime.now), which is wrong for Telegram timestamps.
+            m = re.match(
+                r"^📩TS=([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)\s*(.*)$",
+                raw,
+                flags=re.DOTALL,
+            )
+            if m:
+                ts = (m.group(1) or "").strip()
+                remainder = (m.group(2) or "").strip()
+                return self._format_timestamp(ts), remainder
+        except Exception:
+            pass
+
+        return self._format_timestamp(datetime.now().strftime("%H:%M")), raw
+
+    def _format_timestamp(self, raw: str) -> str:
+        try:
+            if len(raw) >= 5:
+                return raw[:5]
+        except Exception:
+            pass
+        return raw
+
+    def _extract_group_and_message(self, text: str) -> Tuple[str, str]:
+        raw = (text or "").strip()
+        # Expected format: "📩 [name] message"
+        match = re.search(r"\[(.*?)\]", raw)
+        if match:
+            name = match.group(1).strip()
+            cleaned = re.sub(r"^.*?\]\s*", "", raw).strip()
+            return name.upper(), cleaned
+        return "MESSAGE", raw
+
+    def _accent_color(self, key: str) -> QtGui.QColor:
+        digest = QtCore.QCryptographicHash.hash(
+            (key or "").encode("utf-8"),
+            QtCore.QCryptographicHash.Sha1,
+        )
+        value = int.from_bytes(digest[:2], "big")
+        hue = value % 360
+        return QtGui.QColor.fromHsv(hue, 165, 220)
+
+    def _bubble_style(self, accent: QtGui.QColor, *, outgoing: bool = False) -> str:
+        # IMPORTANT: do not rely on the palette here. In styled Qt widgets,
+        # palette colors often remain at the OS default, which can produce
+        # white bubbles in dark mode. Use the widget theme flag instead.
+        is_dark = bool(getattr(self, "_dark_mode", True))
+        base = QtGui.QColor(20, 20, 28) if is_dark else QtGui.QColor(255, 255, 255)
+        # Match Image 2: outgoing is NOT blue; both directions share the same look.
+        bubble_bg = QtGui.QColor(base).lighter(112 if is_dark else 102)
+        text_color = "#e7e7ef" if is_dark else "#151515"
+        time_color = "rgba(235, 235, 245, 0.55)" if is_dark else "rgba(30, 30, 30, 0.55)"
+        return (
+            "QFrame#message_bubble {"
+            f"background-color: {bubble_bg.name()};"
+            "border-radius: 18px;"
+            "border: none;"
+            "}"
+            "QLabel#bubble_name, QLabel#bubble_message, QLabel#bubble_time {"
+            "background: transparent;"
+            "}"
+            "QLabel#bubble_message {"
+            f"color: {text_color};"
+            "}"
+            "QLabel#bubble_time {"
+            f"color: {time_color};"
+            "font-size: 11px;"
+            "}"
+        )
+
+
+class FlameSplash(QtWidgets.QWidget):
+    def __init__(self, image_path: str) -> None:
+        super().__init__()
+        # Treat this as a real splash/tool window:
+        # - Tool windows typically do not create a separate taskbar button
+        #   (avoids the extra "python" thumbnail on Windows).
+        # - Keep it on top during boot so the user sees progress.
+        try:
+            self.setWindowFlags(
+                QtCore.Qt.FramelessWindowHint
+                | QtCore.Qt.Tool
+                | QtCore.Qt.WindowStaysOnTopHint
+            )
+        except Exception:
+            self.setWindowFlags(QtCore.Qt.FramelessWindowHint)
+        try:
+            self.setWindowTitle("FlameBot")
+        except Exception:
+            pass
+        try:
+            self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        except Exception:
+            pass
+        self.resize(900, 600)
+        self.setWindowIcon(QtGui.QIcon(resolve_resource_path("icon.ico")))
+        screen = QtWidgets.QApplication.primaryScreen().geometry()
+        self.move(
+            (screen.width() - self.width()) // 2,
+            (screen.height() - self.height()) // 2,
+        )
+        self.setStyleSheet("background-color: #0A0A0A;")
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        controls = QtWidgets.QWidget()
+        controls_layout = QtWidgets.QHBoxLayout(controls)
+        controls_layout.setContentsMargins(12, 8, 12, 0)
+        controls_layout.setSpacing(14)
+        controls_layout.setAlignment(QtCore.Qt.AlignRight)
+        button_style = """
+            QPushButton {
+                color: #E8E8E8;
+                background: transparent;
+                border: none;
+                font-size: 16px;
+                padding: 4px 6px;
+            }
+            QPushButton:hover {
+                color: white;
+                background: rgba(255, 255, 255, 0.06);
+            }
+            QPushButton:pressed {
+                background: rgba(255, 255, 255, 0.12);
+            }
+        """
+        self.min_button = QtWidgets.QPushButton("▬")
+        self.min_button.setStyleSheet(button_style)
+        self.min_button.clicked.connect(self.showMinimized)
+        self.max_button = QtWidgets.QPushButton("□")
+        self.max_button.setStyleSheet(button_style)
+        self.max_button.clicked.connect(self.toggle_max_restore)
+        self.close_button = QtWidgets.QPushButton("✕")
+        self.close_button.setStyleSheet(button_style)
+        self.close_button.clicked.connect(self.close)
+        controls_layout.addWidget(self.min_button)
+        controls_layout.addWidget(self.max_button)
+        controls_layout.addWidget(self.close_button)
+        layout.addWidget(controls)
+        pixmap = QtGui.QPixmap(resolve_resource_path(image_path))
+        self.logo = QtWidgets.QLabel()
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(320, 320, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            self.logo.setPixmap(scaled)
+        else:
+            self.logo.setText("FlameBot")
+            self.logo.setStyleSheet("color: #ffffff; font-size: 28px; font-weight: 700;")
+        self.logo.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addStretch()
+        layout.addWidget(self.logo)
+        layout.addStretch()
+        self.branding = QtWidgets.QWidget()
+        branding_layout = QtWidgets.QVBoxLayout(self.branding)
+        branding_layout.setContentsMargins(0, 0, 0, 24)
+        branding_layout.setSpacing(6)
+        branding_layout.setAlignment(QtCore.Qt.AlignCenter)
+        self.title_label = QtWidgets.QLabel("FLAMEBOT — by FlameTech")
+        self.title_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.title_label.setStyleSheet(
+            "color: white; font-size: 32px; font-weight: 700; letter-spacing: 1.4px;"
+        )
+        self.title_label.setVisible(False)
+        self.tagline_label = QtWidgets.QLabel("Premium Telegram Signal Copier")
+        self.tagline_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.tagline_label.setStyleSheet(
+            "color: #FF8C42; font-size: 20px; font-style: italic; letter-spacing: 1px;"
+        )
+        self.tagline_label.setVisible(False)
+        branding_layout.addWidget(self.title_label)
+        branding_layout.addWidget(self.tagline_label)
+        layout.addWidget(self.branding)
+        self.title_opacity = QtWidgets.QGraphicsOpacityEffect()
+        self.title_opacity.setOpacity(0)
+        self.title_label.setGraphicsEffect(self.title_opacity)
+        self.tagline_opacity = QtWidgets.QGraphicsOpacityEffect()
+        self.tagline_opacity.setOpacity(0)
+        self.tagline_label.setGraphicsEffect(self.tagline_opacity)
+        self.title_fade_animation = QtCore.QPropertyAnimation(self.title_opacity, b"opacity")
+        self.tagline_fade_animation = QtCore.QPropertyAnimation(
+            self.tagline_opacity, b"opacity"
+        )
+        glow = QtWidgets.QGraphicsDropShadowEffect()
+        glow.setColor(QtGui.QColor(255, 110, 10))
+        glow.setBlurRadius(0)
+        glow.setOffset(0)
+        self.logo.setGraphicsEffect(glow)
+        self.glow_animation = QtCore.QPropertyAnimation(glow, b"blurRadius")
+        self.glow_animation.setStartValue(0)
+        self.glow_animation.setEndValue(45)
+        self.glow_animation.setDuration(10000)
+        self.glow_animation.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+        self._sequence_started = False
+        QtCore.QTimer.singleShot(5000, self.start_transition)
+
+    def toggle_max_restore(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def start_transition(self) -> None:
+        if self._sequence_started:
+            return
+        self._sequence_started = True
+        self.glow_animation.start()
+        self.title_label.setVisible(True)
+        self.tagline_label.setVisible(True)
+        self.title_fade_animation.setStartValue(0)
+        self.title_fade_animation.setEndValue(1)
+        self.title_fade_animation.setDuration(1800)
+        self.tagline_fade_animation.setStartValue(0)
+        self.tagline_fade_animation.setEndValue(1)
+        self.tagline_fade_animation.setDuration(1800)
+        self.title_fade_animation.start()
+        QtCore.QTimer.singleShot(700, self.tagline_fade_animation.start)
+
+
+def normalize_phone(raw_phone: str) -> str:
+    text = str(raw_phone or "").strip()
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        raise ValueError("Phone number is empty")
+    # Accept common international prefix "00" (e.g., 0044...) and normalize it.
+    if digits.startswith("00"):
+        digits = digits[2:]
+    # IMPORTANT: Do not guess a country code here.
+    # The UI owns country selection and should supply a full international number.
+    return "+" + digits
+
+
+def mask_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if not digits:
+        return ""
+    prefix = "+" if str(phone or "").strip().startswith("+") else ""
+    if len(digits) <= 4:
+        return f"{prefix}•••{digits}"
+    head = digits[: min(3, len(digits) - 4)]
+    last4 = digits[-4:]
+    return f"{prefix}{head}•••{last4}"
+
+
+def _normalize_search_text(text: str) -> str:
+    """Normalize user-visible text for substring search.
+
+    Handles odd Unicode casing, extra whitespace, and invisible formatting
+    characters that can make an on-screen group title not match a typed query.
+    """
+    try:
+        s = str(text or "")
+    except Exception:
+        return ""
+    if not s:
+        return ""
+    try:
+        # Normalize compatibility forms (full-width chars, etc.).
+        s = unicodedata.normalize("NFKC", s)
+    except Exception:
+        pass
+    try:
+        # Remove common zero-width and bidi formatting characters.
+        s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", s)
+    except Exception:
+        pass
+    try:
+        # Treat common separators like Telegram does.
+        s = s.replace("_", " ").replace("-", " ")
+    except Exception:
+        pass
+    try:
+        s = re.sub(r"\s+", " ", s)
+    except Exception:
+        s = " ".join(s.split())
+    try:
+        s = s.strip().casefold()
+    except Exception:
+        s = s.strip().lower()
+
+    # Best-effort diacritic folding (so "Prófït" matches "profit").
+    try:
+        s = "".join(
+            ch
+            for ch in unicodedata.normalize("NFKD", s)
+            if unicodedata.category(ch) != "Mn"
+        )
+    except Exception:
+        pass
+    return s
+
+
+def _generic_login_failed_message() -> str:
+    # Strict UX rule: never leak Telegram/Telethon details.
+    return "Login failed. Please try again."
+
+
+def _generic_2fa_required_message() -> str:
+    # Strict UX rule: never leak Telegram/Telethon details.
+    return "Additional verification required."
+
+
+
+class TelegramWorker(QtCore.QThread):
+    log_message = QtCore.pyqtSignal(str)
+    code_sent = QtCore.pyqtSignal()
+    login_success = QtCore.pyqtSignal()
+    # Global login contract: emits dict(success: bool, status: str, message: str)
+    login_result = QtCore.pyqtSignal(object)
+    # Used only for startup boot gating: emits True if a prior session is valid.
+    auto_login_resolved = QtCore.pyqtSignal(bool)
+    error = QtCore.pyqtSignal(str)
+    groups_ready = QtCore.pyqtSignal(list)
+    message_received = QtCore.pyqtSignal(int, str, str, str, bool)
+    icon_ready = QtCore.pyqtSignal(int, str)
+    password_required = QtCore.pyqtSignal()
+    # emit: (display_name, phone, telegram_id)
+    user_ready = QtCore.pyqtSignal(str, str, str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._debug_enabled = os.environ.get("FLAMEBOT_DEBUG", "0") == "1"
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.client: Optional[TelegramClient] = None
+        self.api_id: Optional[int] = None
+        self.api_hash: Optional[str] = None
+        self.phone: Optional[str] = None
+        self.telegram_id: Optional[str] = None
+        self.platform: str = "mt5"  # MT4 or MT5 - set by MainWindow
+        self._stopped = False
+        self._message_handlers: Dict[int, object] = {}
+        self._edit_handlers: Dict[int, object] = {}
+        self._auto_reconnect_started = False
+        self._auto_reconnect_enabled = False
+        # NOTE: We intentionally schedule the auto-reconnect loop via
+        # run_coroutine_threadsafe (like tg_copier_pro.py) so it cannot be
+        # accidentally cancelled when the Telethon client is destroyed.
+        self._auto_reconnect_future = None
+        self._loop_ready = threading.Event()
+        self._last_message_ids: Dict[int, int] = {}
+        # Track last-seen message text per (chat_id, message_id). This allows
+        # us to ignore edit events caused by reactions (text unchanged).
+        self._last_message_text: Dict[str, str] = {}
+        self._listening_chats: set[int] = set()
+        # Reconnect/watchdog state (created inside the worker's asyncio loop)
+        self._reconnect_lock = None
+        self._last_healthcheck_monotonic: float = 0.0
+        self._healthcheck_interval_sec: float = float(os.environ.get("FLAMEBOT_TG_HEALTHCHECK_SEC", "5"))
+        # Track in-flight run_coroutine_threadsafe futures so UI can cancel them
+        # immediately when connectivity drops.
+        self._pending_futures: List[asyncio.Future] = []
+        self._pending_futures_lock = threading.Lock()
+        # Track background tasks created in the worker loop (e.g., icon downloads).
+        self._background_tasks: set[asyncio.Task] = set()
+        # Subset of background tasks that should be cancelled when the Telethon
+        # client is destroyed/recreated.
+        self._client_bound_tasks: set[asyncio.Task] = set()
+        self._shutdown_requested = False
+
+        # Per-chat Telethon event handlers. If the client is destroyed/recreated
+        # (e.g., offline recovery), we must re-attach these to the new client.
+        self._album_handlers: Dict[int, Any] = {}
+
+        # Backend forwarding must not block the Telethon event loop.
+        # Use a background queue + worker with retries.
+        self._backend_post_queue: Optional[asyncio.Queue] = None
+        self._backend_post_task: Optional[asyncio.Task] = None
+        self._backend_post_retries: int = max(3, int(os.environ.get("FLAMEBOT_BACKEND_RETRIES", "3")))
+        self._backend_post_timeout: float = float(os.environ.get("FLAMEBOT_BACKEND_TIMEOUT", str(DEFAULT_HTTP_TIMEOUT)))
+
+        # Durable backend outbox: if the backend is down, keep posts queued
+        # and retry with backoff until delivered (including across restarts).
+        self._backend_outbox: Dict[str, dict] = {}
+        self._backend_outbox_save_handle = None
+        self._backend_outbox_enqueued = False
+        try:
+            self._backend_outbox_max_items: int = int(os.environ.get("FLAMEBOT_BACKEND_OUTBOX_MAX", "5000") or 5000)
+        except Exception:
+            self._backend_outbox_max_items = 5000
+        self._load_backend_outbox()
+
+        # Per-user ingest secret (issued by backend on /register). This is the only
+        # secret used to sign Telethon ingest in the per-user-secret model.
+        self.telegram_ingest_secrets_by_platform: Dict[str, str] = {"mt4": "", "mt5": ""}
+        self.telegram_ingest_secret: str = ""
+
+        # Prevent duplicate group fetches (can cause UI flicker).
+        self._fetch_groups_inflight: bool = False
+
+        # Serialize local message persistence to avoid lost updates when multiple
+        # message callbacks arrive in quick succession.
+        self._signals_file_lock = threading.Lock()
+
+        # Persist per-chat cursors so app restarts don't skip messages.
+        self._persisted_last_ids: Dict[str, int] = {}
+        self._cursor_save_handle = None
+        self._load_persisted_cursors()
+
+    def _backend_outbox_key(self, endpoint: str, payload: dict) -> str:
+        try:
+            cid = str(payload.get("correlation_id") or "").strip()
+        except Exception:
+            cid = ""
+        if cid:
+            return cid
+        try:
+            chat_id = str(payload.get("chat_id") or payload.get("tg_chat_id") or "")
+        except Exception:
+            chat_id = ""
+        try:
+            message_id = str(payload.get("message_id") or payload.get("tg_message_id") or "")
+        except Exception:
+            message_id = ""
+        base = f"{chat_id}:{message_id}" if (chat_id or message_id) else ""
+        return f"{str(endpoint or '').strip()}:{base}".strip(":") or f"{str(endpoint or 'post')}:{int(time.time())}"
+
+    def _load_backend_outbox(self) -> None:
+        try:
+            obj = _safe_read_json_dict(Path(BACKEND_OUTBOX_FILE))
+        except Exception:
+            obj = None
+        if not isinstance(obj, dict):
+            return
+        items = obj.get("items")
+        if not isinstance(items, dict):
+            return
+        cleaned: Dict[str, dict] = {}
+        for k, v in items.items():
+            if not isinstance(k, str) or not k.strip():
+                continue
+            if not isinstance(v, dict):
+                continue
+            ep = v.get("endpoint")
+            payload = v.get("payload")
+            if not isinstance(ep, str) or not ep.strip():
+                continue
+            if not isinstance(payload, dict):
+                continue
+            cleaned[k.strip()] = v
+        self._backend_outbox = cleaned
+
+    def _schedule_backend_outbox_persist(self) -> None:
+        loop = getattr(self, "loop", None)
+        if loop is None:
+            return
+        try:
+            if hasattr(loop, "is_running") and (not loop.is_running()):
+                return
+        except Exception:
+            pass
+        try:
+            h = getattr(self, "_backend_outbox_save_handle", None)
+            if h is not None:
+                return
+        except Exception:
+            pass
+
+        def _kick() -> None:
+            try:
+                self._backend_outbox_save_handle = None
+            except Exception:
+                pass
+            try:
+                asyncio.create_task(self._flush_backend_outbox_to_disk())
+            except Exception:
+                pass
+
+        try:
+            self._backend_outbox_save_handle = loop.call_later(1.25, _kick)
+        except Exception:
+            pass
+
+    async def _flush_backend_outbox_to_disk(self) -> None:
+        payload = {
+            "version": 1,
+            "updated_at": int(time.time()),
+            "items": dict(self._backend_outbox or {}),
+        }
+
+        def _write() -> None:
+            try:
+                p = Path(BACKEND_OUTBOX_FILE)
+            except Exception:
+                return
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            try:
+                _atomic_write_json(p, payload)
+            except Exception:
+                pass
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception:
+            pass
+
+    def _note_backend_outbox_item(
+        self,
+        endpoint: str,
+        payload: dict,
+        *,
+        attempts: int,
+        not_before: float,
+        last_error: str = "",
+    ) -> str:
+        key = self._backend_outbox_key(endpoint, payload)
+        try:
+            now = int(time.time())
+        except Exception:
+            now = 0
+
+        try:
+            existing = self._backend_outbox.get(key)
+        except Exception:
+            existing = None
+        created_at = None
+        if isinstance(existing, dict):
+            created_at = existing.get("created_at")
+        if not isinstance(created_at, int) or created_at <= 0:
+            created_at = now
+
+        self._backend_outbox[key] = {
+            "endpoint": str(endpoint or ""),
+            "payload": dict(payload or {}),
+            "attempts": int(max(0, attempts)),
+            "not_before": float(max(0.0, not_before)),
+            "last_error": str(last_error or ""),
+            "created_at": int(created_at),
+            "updated_at": int(now),
+        }
+
+        # Bound growth to avoid unbounded disk usage.
+        try:
+            limit = int(self._backend_outbox_max_items or 0)
+        except Exception:
+            limit = 0
+        if limit > 0:
+            try:
+                if len(self._backend_outbox) > limit:
+                    # Drop oldest by created_at.
+                    ordered = sorted(
+                        self._backend_outbox.items(),
+                        key=lambda kv: int((kv[1] or {}).get("created_at", 0) or 0),
+                    )
+                    for k, _v in ordered[: max(0, len(ordered) - limit)]:
+                        try:
+                            self._backend_outbox.pop(k, None)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        self._schedule_backend_outbox_persist()
+        return key
+
+    def _load_persisted_cursors(self) -> None:
+        try:
+            obj = _safe_read_json_dict(Path(TG_CURSORS_FILE))
+        except Exception:
+            obj = None
+        if not isinstance(obj, dict):
+            return
+        last_ids = obj.get("last_ids")
+        if not isinstance(last_ids, dict):
+            return
+        cleaned: Dict[str, int] = {}
+        for k, v in last_ids.items():
+            try:
+                cid = str(int(k))
+                mid = int(v)
+            except Exception:
+                continue
+            if int(cid) == 0 or mid <= 0:
+                continue
+            cleaned[cid] = mid
+        self._persisted_last_ids = cleaned
+
+    def _get_persisted_last_id(self, chat_id: int) -> int:
+        try:
+            return int((self._persisted_last_ids or {}).get(str(int(chat_id)), 0) or 0)
+        except Exception:
+            return 0
+
+    def _mark_last_id(self, chat_id: int, message_id: int) -> None:
+        """Update in-memory cursor and schedule persistence (debounced)."""
+        try:
+            cid = int(chat_id)
+            mid = int(message_id)
+        except Exception:
+            return
+        if cid == 0 or mid <= 0:
+            return
+
+        try:
+            cur = int(self._last_message_ids.get(cid) or 0)
+        except Exception:
+            cur = 0
+        if mid > cur:
+            try:
+                self._last_message_ids[cid] = mid
+            except Exception:
+                pass
+        try:
+            prev = int((self._persisted_last_ids or {}).get(str(cid), 0) or 0)
+        except Exception:
+            prev = 0
+        if mid > prev:
+            try:
+                self._persisted_last_ids[str(cid)] = mid
+            except Exception:
+                pass
+        self._schedule_cursor_persist()
+
+    def _schedule_cursor_persist(self) -> None:
+        loop = getattr(self, "loop", None)
+        if loop is None:
+            return
+        try:
+            if hasattr(loop, "is_running") and (not loop.is_running()):
+                return
+        except Exception:
+            pass
+        # Coalesce frequent updates.
+        try:
+            h = getattr(self, "_cursor_save_handle", None)
+            if h is not None:
+                # If a handle is already scheduled, keep it.
+                return
+        except Exception:
+            pass
+
+        def _kick() -> None:
+            try:
+                self._cursor_save_handle = None
+            except Exception:
+                pass
+            try:
+                asyncio.create_task(self._flush_cursors_to_disk())
+            except Exception:
+                pass
+
+        try:
+            self._cursor_save_handle = loop.call_later(0.75, _kick)
+        except Exception:
+            pass
+
+    async def _flush_cursors_to_disk(self) -> None:
+        payload = {
+            "version": 1,
+            "updated_at": int(time.time()),
+            "last_ids": dict(self._persisted_last_ids or {}),
+        }
+
+        def _write() -> None:
+            try:
+                p = Path(TG_CURSORS_FILE)
+            except Exception:
+                return
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            try:
+                # IMPORTANT: _atomic_write_json() already acquires its own
+                # cross-process lock. Do NOT double-lock here, otherwise the
+                # write can deadlock/fail and cursors won't persist.
+                _atomic_write_json(p, payload)
+            except Exception:
+                pass
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception:
+            pass
+
+    async def _catch_up_for_chat(self, chat_id: int, base_last_id: int) -> int:
+        """Replay messages with id > base_last_id for a single chat.
+
+        Returns number of replayed messages.
+        """
+        if not self.client:
+            return 0
+        try:
+            base_last = int(base_last_id or 0)
+        except Exception:
+            base_last = 0
+        if base_last <= 0:
+            return 0
+
+        # Optional safety cap (0 = unlimited). Default unlimited.
+        try:
+            max_messages = int(os.environ.get("FLAMEBOT_TG_CATCHUP_MAX", "0") or 0)
+        except Exception:
+            max_messages = 0
+        try:
+            batch_size = int(os.environ.get("FLAMEBOT_TG_CATCHUP_BATCH", "200") or 200)
+        except Exception:
+            batch_size = 200
+        batch_size = max(20, min(500, int(batch_size)))
+
+        processed = 0
+        max_seen_id = base_last
+        emitted_ids: set[int] = set()
+        try:
+            offset_id = 0
+            while True:
+                msgs = await self.client.get_messages(
+                    chat_id,
+                    limit=int(batch_size),
+                    offset_id=int(offset_id or 0),
+                    min_id=int(base_last),
+                )
+                if not msgs:
+                    break
+
+                try:
+                    oldest = msgs[-1]
+                    offset_id = int(getattr(oldest, "id", 0) or 0)
+                except Exception:
+                    offset_id = 0
+
+                for message in reversed(list(msgs)):
+                    try:
+                        message_id = int(getattr(message, "id", 0) or 0)
+                    except Exception:
+                        message_id = 0
+                    if message_id <= int(base_last):
+                        continue
+                    if message_id in emitted_ids:
+                        continue
+                    emitted_ids.add(int(message_id))
+                    if message_id > int(max_seen_id):
+                        max_seen_id = int(message_id)
+
+                    sender = None
+                    try:
+                        sender = await message.get_sender()
+                    except Exception:
+                        sender = None
+                    name = self._display_name(sender)
+                    text = getattr(message, "message", None) or ""
+                    timestamp = _format_telegram_local_time(getattr(message, "date", None))
+                    tg_ts = _telegram_utc_epoch_seconds(getattr(message, "date", None))
+                    outgoing = bool(getattr(message, "out", False))
+                    reply_to_msg_id = getattr(message, "reply_to_msg_id", None)
+
+                    try:
+                        self._save_message(chat_id, name, text, tg_time=timestamp, tg_ts=int(tg_ts or 0), outgoing=outgoing)
+                    except Exception:
+                        pass
+
+                    await self._post_trade_command_to_backend(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        reply_to_msg_id=reply_to_msg_id,
+                        is_edit=False,
+                        tg_message_timestamp=tg_ts,
+                    )
+                    await self._post_signal_to_backend(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        is_edit=False,
+                        reply_to_msg_id=reply_to_msg_id,
+                        message_obj=message,
+                        tg_message_timestamp=tg_ts,
+                    )
+
+                    try:
+                        try:
+                            out_i = 1 if bool(outgoing) else 0
+                        except Exception:
+                            out_i = 0
+                        try:
+                            epoch_i = int(tg_ts or 0)
+                        except Exception:
+                            epoch_i = 0
+                        if timestamp and epoch_i > 0:
+                            self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} TS={timestamp} [{name}] {text}")
+                        elif timestamp:
+                            self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} TS={timestamp} [{name}] {text}")
+                        elif epoch_i > 0:
+                            self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} [{name}] {text}")
+                        else:
+                            self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} [{name}] {text}")
+                    except Exception:
+                        pass
+
+                    try:
+                        self.message_received.emit(chat_id, name, text, timestamp, outgoing)
+                    except Exception:
+                        pass
+
+                    processed += 1
+                    if max_messages > 0 and processed >= max_messages:
+                        break
+                    if processed % 100 == 0:
+                        await asyncio.sleep(0)
+
+                if max_messages > 0 and processed >= max_messages:
+                    break
+                if len(msgs) < int(batch_size):
+                    break
+                if offset_id <= 0:
+                    break
+
+            if processed and int(max_seen_id or 0) > int(base_last or 0):
+                self._mark_last_id(chat_id, int(max_seen_id))
+            return int(processed)
+        except Exception:
+            return int(processed)
+
+    @staticmethod
+    def _rotate_ndjson(path: Path, *, max_bytes: int, backups: int) -> None:
+        try:
+            max_bytes_i = int(max_bytes)
+        except Exception:
+            max_bytes_i = 0
+        if max_bytes_i <= 0:
+            return
+
+        try:
+            sz = int(path.stat().st_size)
+        except Exception:
+            return
+
+        if sz <= max_bytes_i:
+            return
+
+        try:
+            backups_i = int(backups)
+        except Exception:
+            backups_i = 0
+        if backups_i <= 0:
+            try:
+                path.unlink()
+            except Exception:
+                pass
+            return
+
+        # Rotate: file -> .1, .1 -> .2, ...
+        try:
+            for i in range(backups_i, 0, -1):
+                older = Path(str(path) + f".{i}")
+                newer = Path(str(path) + f".{i + 1}")
+                if i == backups_i:
+                    # Drop the oldest.
+                    try:
+                        if older.exists():
+                            older.unlink()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        if older.exists():
+                            os.replace(str(older), str(newer))
+                    except Exception:
+                        pass
+            os.replace(str(path), str(Path(str(path) + ".1")))
+        except Exception:
+            pass
+
+    def _emit_debug_log(self, msg: str) -> None:
+        if not self._debug_enabled:
+            return
+        try:
+            self.log_message.emit(str(msg))
+        except Exception:
+            pass
+
+    def _dev_log_exc(self, context: str, exc: BaseException) -> None:
+        """Developer-only logging for raw exceptions.
+
+        UI must never show raw Telegram/Telethon exceptions.
+        """
+        try:
+            logger = logging.getLogger("flame_ui")
+            logger.debug("%s: %s", str(context or "telegram"), repr(exc), exc_info=True)
+        except Exception:
+            pass
+
+    async def _ensure_backend_post_worker(self) -> None:
+        if self._backend_post_queue is None:
+            # Unbounded queue to avoid blocking Telethon event handlers.
+            self._backend_post_queue = asyncio.Queue()
+        if self._backend_post_task is None or self._backend_post_task.done():
+            self._backend_post_task = asyncio.create_task(self._backend_post_worker_loop())
+            # Backend posting is independent of Telethon client lifetime.
+            self._track_background_task(self._backend_post_task, client_bound=False)
+
+        # After restarts, replay durable outbox entries.
+        try:
+            if not bool(getattr(self, "_backend_outbox_enqueued", False)):
+                self._backend_outbox_enqueued = True
+                for _k, item in dict(self._backend_outbox or {}).items():
+                    try:
+                        ep = str(item.get("endpoint") or "").strip()
+                        payload = item.get("payload")
+                        if not ep or not isinstance(payload, dict):
+                            continue
+                        attempts = int(item.get("attempts", 0) or 0)
+                        not_before = float(item.get("not_before", 0.0) or 0.0)
+                        assert self._backend_post_queue is not None
+                        self._backend_post_queue.put_nowait((ep, dict(payload), attempts, not_before))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    async def _enqueue_backend_post(self, endpoint: str, payload: dict) -> None:
+        if not endpoint:
+            return
+        await self._ensure_backend_post_worker()
+        try:
+            assert self._backend_post_queue is not None
+            # Do not await network here; enqueue and return immediately.
+            now = time.time()
+            ep = str(endpoint)
+            pl = dict(payload)
+            # Persist immediately (debounced) so posts survive restarts.
+            try:
+                self._note_backend_outbox_item(ep, pl, attempts=0, not_before=float(now), last_error="")
+            except Exception:
+                pass
+            self._backend_post_queue.put_nowait((ep, pl, 0, float(now)))
+        except Exception as e:
+            self._dev_log_exc("enqueue_backend_post", e)
+
+    @staticmethod
+    def _post_json_blocking(url: str, payload: dict, timeout_sec: float, secret: str) -> tuple[int, str]:
+        import json as _json
+
+        # SECURITY: sign Telegram ingest requests so telegram_id alone is useless.
+        secret = str(secret or "").strip()
+        ts = int(time.time())
+        # IMPORTANT: Signature must be computed over the exact raw bytes we send.
+        body_bytes = _json.dumps(payload).encode("utf-8")
+
+        headers = {"Content-Type": "application/json"}
+        if secret:
+            try:
+                msg = (str(ts).encode("utf-8") + b"." + body_bytes)
+                sig = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+                # Backend contract (Railway): X-Flamebot-*
+                headers["X-Flamebot-Timestamp"] = str(ts)
+                headers["X-Flamebot-Signature"] = sig
+                # Compatibility aliases requested by user/spec: X-*
+                headers["X-Timestamp"] = str(ts)
+                headers["X-Signature"] = sig
+            except Exception:
+                # Fall through; backend will reject unsigned requests.
+                pass
+
+        req = urllib.request.Request(
+            url,
+            data=body_bytes,
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=float(timeout_sec or 3.0)) as response:
+                status_code = int(getattr(response, "status", 200) or 200)
+                body = response.read().decode("utf-8", errors="replace")
+                return status_code, body
+        except urllib.error.HTTPError as e:
+            try:
+                status_code = int(getattr(e, "code", 0) or 0)
+            except Exception:
+                status_code = 0
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            return status_code, body
+
+    async def _backend_post_worker_loop(self) -> None:
+        assert self._backend_post_queue is not None
+        while not self._stopped:
+            try:
+                endpoint, payload, attempts, not_before = await self._backend_post_queue.get()
+            except Exception:
+                await asyncio.sleep(0.05)
+                continue
+
+            try:
+                try:
+                    now = time.time()
+                except Exception:
+                    now = 0.0
+
+                # If this item isn't due yet, requeue and wait a bit.
+                try:
+                    if float(not_before or 0.0) > float(now):
+                        try:
+                            self._backend_post_queue.put_nowait((endpoint, payload, int(attempts or 0), float(not_before)))
+                        except Exception:
+                            pass
+                        try:
+                            await asyncio.sleep(min(0.8, max(0.05, float(not_before) - float(now))))
+                        except Exception:
+                            await asyncio.sleep(0.05)
+                        continue
+                except Exception:
+                    pass
+
+                url = f"{BACKEND_BASE_URL}/{str(endpoint).lstrip('/')}"
+                last_err: Optional[str] = None
+
+                for attempt in range(1, int(self._backend_post_retries) + 1):
+                    try:
+                        status, _body = await asyncio.to_thread(
+                            self._post_json_blocking,
+                            url,
+                            payload,
+                            float(self._backend_post_timeout),
+                            str(getattr(self, "telegram_ingest_secret", "") or ""),
+                        )
+
+                        # Extract backend JSON message if available.
+                        detail: str = ""
+                        try:
+                            import json as _json
+
+                            obj = _json.loads(_body) if isinstance(_body, str) and _body.strip().startswith("{") else None
+                            if isinstance(obj, dict) and obj.get("message"):
+                                detail = str(obj.get("message") or "")
+                        except Exception:
+                            detail = ""
+
+                        # Hard fail on auth errors (no retries; user must fix secret).
+                        if int(status) in {401, 403}:
+                            try:
+                                sec = str(getattr(self, "telegram_ingest_secret", "") or "").strip()
+                                has_secret = bool(sec)
+                            except Exception:
+                                has_secret = False
+                            try:
+                                secret_len = len(str(sec or ""))
+                            except Exception:
+                                secret_len = 0
+                            hint = "missing per-user ingest secret (re-register)" if not has_secret else "signature/timestamp mismatch (check system clock; ensure latest app)"
+                            meta = f"present={('Y' if has_secret else 'N')},len={secret_len},src=settings"
+                            if bool(getattr(self, "_debug_enabled", False)):
+                                if detail:
+                                    last_err = f"HTTP {status} (unauthorized: {detail}; {hint}; {meta})"
+                                else:
+                                    last_err = f"HTTP {status} (unauthorized; {hint}; {meta})"
+                            else:
+                                if detail:
+                                    last_err = f"HTTP {status} (unauthorized: {detail}; {hint})"
+                                else:
+                                    last_err = f"HTTP {status} (unauthorized; {hint})"
+                            break
+
+                        # Retry on transient backend errors (esp. 503 when DB persist fails).
+                        if int(status) >= 500:
+                            last_err = f"HTTP {status}"
+                            await asyncio.sleep(min(2.0, 0.2 * (2 ** (attempt - 1))))
+                            continue
+
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = f"{e.__class__.__name__}: {e}"
+                        await asyncio.sleep(min(2.0, 0.2 * (2 ** (attempt - 1))))
+
+                # Update durable outbox state.
+                outbox_key = ""
+                try:
+                    if isinstance(payload, dict):
+                        outbox_key = self._backend_outbox_key(str(endpoint), payload)
+                except Exception:
+                    outbox_key = ""
+
+                if last_err:
+                    # UX: Do not spam the normal UI with backend/network errors.
+                    # Keep detailed diagnostics available only when debug is enabled.
+                    try:
+                        if bool(getattr(self, "_debug_enabled", False)):
+                            chat_id = payload.get("chat_id") if isinstance(payload, dict) else None
+                            message_id = payload.get("message_id") if isinstance(payload, dict) else None
+                            tag = f" chat_id={chat_id} message_id={message_id}" if (chat_id or message_id) else ""
+                            self.log_message.emit(f"⚠️ Backend POST failed after retries: {endpoint}{tag} ({last_err})")
+                    except Exception:
+                        pass
+
+                    # Persist + requeue with backoff until it succeeds.
+                    try:
+                        a = int(attempts or 0) + 1
+                    except Exception:
+                        a = 1
+                    # Exponential backoff with cap and jitter.
+                    try:
+                        backoff = min(60.0, 0.6 * (2.0 ** min(10, a)))
+                    except Exception:
+                        backoff = 10.0
+                    try:
+                        jitter = (hash(outbox_key) % 250) / 1000.0 if outbox_key else 0.0
+                    except Exception:
+                        jitter = 0.0
+                    delay = float(min(90.0, max(1.0, backoff + jitter)))
+                    next_time = float(now) + delay
+
+                    try:
+                        if isinstance(payload, dict):
+                            self._note_backend_outbox_item(
+                                str(endpoint),
+                                dict(payload),
+                                attempts=int(a),
+                                not_before=float(next_time),
+                                last_error=str(last_err or ""),
+                            )
+                    except Exception:
+                        pass
+
+                    try:
+                        self._backend_post_queue.put_nowait((str(endpoint), dict(payload), int(a), float(next_time)))
+                    except Exception:
+                        pass
+                else:
+                    # Delivered; remove from outbox if present.
+                    try:
+                        if outbox_key:
+                            self._backend_outbox.pop(str(outbox_key), None)
+                            self._schedule_backend_outbox_persist()
+                    except Exception:
+                        pass
+            except Exception as e:
+                self._dev_log_exc("backend_post_worker", e)
+            finally:
+                try:
+                    self._backend_post_queue.task_done()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _make_login_result(success: bool, status: str, message: str = "") -> dict:
+        return {
+            "success": bool(success),
+            "status": str(status or ""),
+            "message": str(message or ""),
+        }
+
+    def _map_login_exception(self, exc: BaseException) -> dict:
+        """Map any Telethon/Telegram error to a UI-safe contract."""
+        # NOTE: acceptance requires banned/invalid/wrong code all show the same generic failure.
+        try:
+            if isinstance(exc, SessionPasswordNeededError):
+                return self._make_login_result(False, "2FA_REQUIRED", _generic_2fa_required_message())
+            if isinstance(exc, (PhoneCodeInvalidError, PhoneCodeExpiredError, PhoneNumberInvalidError, PhoneNumberBannedError)):
+                return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+            if isinstance(exc, FloodWaitError):
+                return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+            if isinstance(exc, RPCError):
+                return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+        except Exception:
+            pass
+        return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+
+    def set_telegram_id(self, telegram_id: str) -> None:
+        """Store the telegram_id for backend signal forwarding."""
+        self.telegram_id = telegram_id
+
+    def set_platform(self, platform: str) -> None:
+        """Store the platform (mt4/mt5) for backend signal forwarding."""
+        self.platform = platform.lower() if platform else "mt5"
+        try:
+            s = str((getattr(self, "telegram_ingest_secrets_by_platform", {}) or {}).get(self.platform, "") or "").strip()
+            if not s:
+                # Best-effort fallback: use any known secret.
+                for _p in ("mt4", "mt5"):
+                    v = str((getattr(self, "telegram_ingest_secrets_by_platform", {}) or {}).get(_p, "") or "").strip()
+                    if v:
+                        s = v
+                        break
+            self.telegram_ingest_secret = s
+        except Exception:
+            self.telegram_ingest_secret = ""
+
+    def set_telegram_ingest_secrets(self, secrets_by_platform: dict) -> None:
+        """Set per-user ingest secret(s) used for signing Telethon ingest."""
+        try:
+            mt4 = str((secrets_by_platform or {}).get("mt4", "") or "").strip()
+        except Exception:
+            mt4 = ""
+        try:
+            mt5 = str((secrets_by_platform or {}).get("mt5", "") or "").strip()
+        except Exception:
+            mt5 = ""
+        self.telegram_ingest_secrets_by_platform = {"mt4": mt4, "mt5": mt5}
+        # Recompute active secret based on current platform.
+        try:
+            self.set_platform(getattr(self, "platform", "mt5"))
+        except Exception:
+            pass
+    
+    def set_registered_platforms(self, flamebot_ids: dict) -> None:
+        """Store which platforms (MT4/MT5) are registered."""
+        self.registered_platforms = [p for p, fid in flamebot_ids.items() if fid]
+
+    def _looks_like_trade_control_message(self, text: str) -> bool:
+        """Return True if text is a trade-control command (BE/close/secure-half).
+
+        These should be delivered via /push_trade_command only (not /push_signal),
+        otherwise the EA may receive duplicate actions.
+        """
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        # Match common command phrases.
+        if any(k in t for k in ["secure half", "close half", "partial close"]):
+            return True
+        if any(k in t for k in ["set be", "setbe", "breakeven", "break even"]):
+            return True
+        # Also treat leading verbs as commands.
+        if re.match(r"^(be|breakeven|close|exit)\b", t):
+            return True
+        return False
+
+    def run(self) -> None:
+        self.loop = asyncio.new_event_loop()
+
+        # Ensure unhandled task exceptions are logged (and not silently lost).
+        try:
+            logger = _configure_crash_logging()
+
+            def _loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+                try:
+                    msg = str((context or {}).get("message") or "")
+                except Exception:
+                    msg = ""
+                exc = None
+                try:
+                    exc = (context or {}).get("exception")
+                except Exception:
+                    exc = None
+                try:
+                    if isinstance(exc, BaseException):
+                        logger.error(
+                            "Unhandled asyncio exception in TelegramWorker: %s",
+                            msg,
+                            exc_info=(type(exc), exc, getattr(exc, "__traceback__", None)),
+                        )
+                    else:
+                        logger.error("Unhandled asyncio exception in TelegramWorker: %s | %r", msg, context)
+                except Exception:
+                    pass
+
+            self.loop.set_exception_handler(_loop_exception_handler)
+        except Exception:
+            pass
+
+        asyncio.set_event_loop(self.loop)
+        self._loop_ready.set()
+        try:
+            self.loop.run_forever()
+        finally:
+            # IMPORTANT: avoid "Task was destroyed but it is pending" warnings.
+            # When the app exits, Telethon may still have connection send/recv
+            # tasks alive. Cancel + drain tasks before closing the loop.
+            try:
+                if self.loop and not self.loop.is_closed():
+                    async def _finalize_loop() -> None:
+                        try:
+                            current = asyncio.current_task()
+                        except Exception:
+                            current = None
+                        try:
+                            tasks = [t for t in asyncio.all_tasks() if t is not current]
+                        except Exception:
+                            tasks = []
+                        for t in list(tasks):
+                            try:
+                                t.cancel()
+                            except Exception:
+                                pass
+                        if tasks:
+                            try:
+                                await asyncio.gather(*tasks, return_exceptions=True)
+                            except Exception:
+                                pass
+
+                    try:
+                        self.loop.run_until_complete(_finalize_loop())
+                    except Exception:
+                        pass
+
+                    # Best-effort cleanup of async generators before closing.
+                    try:
+                        self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Detach this thread from the event loop before closing it.
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+
+            try:
+                if self.loop and not self.loop.is_closed():
+                    self.loop.close()
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        # Make stop idempotent and shutdown gracefully from inside the loop.
+        try:
+            if self._shutdown_requested:
+                return
+        except Exception:
+            pass
+
+        self._shutdown_requested = True
+        self._stopped = True
+        self._auto_reconnect_enabled = False
+        self._auto_reconnect_started = False
+
+        try:
+            self._loop_ready.wait(timeout=2)
+        except Exception:
+            pass
+
+        if self.loop:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self._shutdown_async(), self.loop)
+                # Wait long enough for Telethon send/recv tasks to cancel cleanly.
+                try:
+                    fut.result(timeout=20)
+                except Exception:
+                    pass
+                # Ensure the loop is asked to stop even if shutdown got stuck.
+                try:
+                    self.loop.call_soon_threadsafe(self.loop.stop)
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    self.loop.call_soon_threadsafe(self.loop.stop)
+                except Exception:
+                    pass
+
+        # Allow the QThread to exit.
+        try:
+            # Give the thread time to finish its loop cleanup.
+            self.wait(15000)
+        except Exception:
+            pass
+
+    def _track_background_task(self, task: asyncio.Task, *, client_bound: bool = True) -> None:
+        try:
+            self._background_tasks.add(task)
+        except Exception:
+            return
+
+        if client_bound:
+            try:
+                self._client_bound_tasks.add(task)
+            except Exception:
+                pass
+
+        def _done(_t: asyncio.Task) -> None:
+            try:
+                self._background_tasks.discard(_t)
+            except Exception:
+                pass
+            try:
+                self._client_bound_tasks.discard(_t)
+            except Exception:
+                pass
+
+            # Surface task failures to logs so they can be debugged in the field.
+            try:
+                exc = _t.exception()
+            except asyncio.CancelledError:
+                exc = None
+            except Exception:
+                exc = None
+            if exc is not None:
+                try:
+                    self._dev_log_exc("asyncio_task", exc)
+                except Exception:
+                    pass
+
+        try:
+            task.add_done_callback(_done)
+        except Exception:
+            pass
+
+    async def _shutdown_async(self) -> None:
+        """Shutdown the worker loop and Telethon client cleanly."""
+        # Cancel any UI-scheduled futures.
+        try:
+            with self._pending_futures_lock:
+                pending = list(self._pending_futures)
+                self._pending_futures.clear()
+            for f in pending:
+                try:
+                    f.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Flush persisted cursors so app restarts can backfill messages sent
+        # while the app was closed (important when closing quickly).
+        try:
+            h = getattr(self, "_cursor_save_handle", None)
+            if h is not None:
+                try:
+                    h.cancel()
+                except Exception:
+                    pass
+                try:
+                    self._cursor_save_handle = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            await self._flush_cursors_to_disk()
+        except Exception:
+            pass
+
+        # Flush durable backend outbox so any pending backend posts survive
+        # app close and are replayed on next start.
+        try:
+            h = getattr(self, "_backend_outbox_save_handle", None)
+            if h is not None:
+                try:
+                    h.cancel()
+                except Exception:
+                    pass
+                try:
+                    self._backend_outbox_save_handle = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            await self._flush_backend_outbox_to_disk()
+        except Exception:
+            pass
+
+        # Cancel worker-created background tasks (e.g., icon loaders).
+        try:
+            for t in list(self._background_tasks):
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Disconnect Telethon to stop its internal send/recv tasks.
+        try:
+            await self._destroy_client()
+        except Exception:
+            pass
+
+        # Cancel any remaining tasks in this loop (excluding ourselves).
+        try:
+            current = asyncio.current_task()
+            tasks = [t for t in asyncio.all_tasks() if t is not current]
+            for t in tasks:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            if tasks:
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Stop the loop after cancellations are processed.
+        try:
+            if self.loop and self.loop.is_running():
+                self.loop.stop()
+        except Exception:
+            pass
+
+    def _run_coro(self, coro: asyncio.Future, on_success=None, on_error=None) -> None:
+        self._loop_ready.wait(timeout=2)
+        if not self.loop:
+            self.error.emit("Worker not ready")
+            return
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+        try:
+            with self._pending_futures_lock:
+                self._pending_futures.append(future)
+        except Exception:
+            pass
+
+        def callback(fut: asyncio.Future) -> None:
+            try:
+                result = fut.result()
+            except Exception as exc:
+                handled = False
+                try:
+                    if on_error:
+                        on_error(exc)
+                        handled = True
+                except Exception:
+                    handled = False
+
+                if not handled:
+                    # Preserve legacy behaviour for non-login calls.
+                    # UI decides how (or whether) to render this.
+                    try:
+                        self.error.emit(str(exc))
+                    except Exception:
+                        pass
+            else:
+                if on_success:
+                    on_success(result)
+            finally:
+                try:
+                    with self._pending_futures_lock:
+                        if fut in self._pending_futures:
+                            self._pending_futures.remove(fut)
+                except Exception:
+                    pass
+
+        future.add_done_callback(callback)
+
+    def cancel_pending_requests(self) -> None:
+        """Cancel in-flight requests and disconnect the client (best-effort)."""
+        try:
+            self._loop_ready.wait(timeout=1)
+        except Exception:
+            pass
+
+        try:
+            with self._pending_futures_lock:
+                pending = list(self._pending_futures)
+                self._pending_futures.clear()
+            for fut in pending:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Disconnect to force Telethon to abandon any stuck IO.
+        try:
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(self._destroy_client(), self.loop)
+        except Exception:
+            pass
+
+    async def _destroy_client(self) -> None:
+        await self._ensure_reconnect_lock()
+        async with self._reconnect_lock:  # type: ignore[arg-type]
+            await self._destroy_client_unlocked()
+
+    async def _destroy_client_unlocked(self) -> None:
+        # Cancel only tasks that are bound to the current client.
+        # IMPORTANT: Do NOT cancel auto-reconnect here; otherwise reconnect
+        # will silently stop after an offline disconnect.
+        try:
+            for t in list(getattr(self, "_client_bound_tasks", set()) or set()):
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if self.client:
+            try:
+                # Avoid hanging shutdown on flaky networks.
+                try:
+                    await asyncio.wait_for(self.client.disconnect(), timeout=8)
+                except Exception:
+                    try:
+                        await self.client.disconnect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self.client = None
+
+    def _get_updates_task(self) -> Optional[asyncio.Task]:
+        """Best-effort access to Telethon's internal updates task.
+
+        If this task crashes (like the messagebox KeyError/RuntimeError you saw),
+        the client can remain 'connected' but stop receiving updates.
+        """
+        if not self.client:
+            return None
+        for attr in ("_updates_task", "_update_loop_task", "_updates_handle"):
+            try:
+                task = getattr(self.client, attr, None)
+                if isinstance(task, asyncio.Task):
+                    return task
+            except Exception:
+                continue
+        return None
+
+    async def _ensure_reconnect_lock(self) -> None:
+        if self._reconnect_lock is None:
+            # Must be created in the worker thread's running event loop.
+            self._reconnect_lock = asyncio.Lock()
+
+    async def _is_client_healthy(self) -> bool:
+        if not self.client:
+            return False
+
+        # If Telethon's update loop crashed, 'is_connected' may still be True.
+        task = self._get_updates_task()
+        if task is not None and task.done():
+            return False
+
+        if not self.client.is_connected():
+            return False
+
+        # Lightweight ping (throttled) to detect dead sockets after network toggles.
+        now = time.monotonic()
+        if (now - float(self._last_healthcheck_monotonic or 0.0)) < max(1.0, self._healthcheck_interval_sec):
+            return True
+        self._last_healthcheck_monotonic = now
+
+        try:
+            # get_me is cheap and verifies the connection is actually usable.
+            await asyncio.wait_for(self.client.get_me(), timeout=3)
+            return True
+        except Exception:
+            return False
+
+    async def _restart_client_and_catch_up(self, reason: str) -> bool:
+        if not self.client:
+            return False
+
+        try:
+            self._emit_debug_log(f"⚠ Telegram reconnect: {reason}")
+        except Exception:
+            pass
+
+        try:
+            await self.client.disconnect()
+        except Exception:
+            pass
+
+        # Small pause helps Telethon settle before reconnecting.
+        await asyncio.sleep(0.35)
+
+        await self.client.connect()
+
+        # IMPORTANT: Do not emit "Session expired" from a reconnect health-check.
+        # On flaky networks, `is_user_authorized()` can temporarily fail/return False
+        # even when the session is still valid. Routing to the wizard must be based
+        # on an explicit login/auto-login failure, not a transient reconnect.
+        try:
+            if self.phone:
+                ok = await self.client.is_user_authorized()
+                if not ok:
+                    self._emit_debug_log("⚠ Telegram reconnect: not authorized (will re-check via auto-login)")
+        except Exception:
+            # Treat as transient.
+            pass
+
+        # Give Telethon a brief moment to resume its internal update loop.
+        await asyncio.sleep(0.35)
+        await self._catch_up_after_reconnect()
+        return True
+
+    async def _create_client(self, api_id: int, api_hash: str, phone: str) -> None:
+        await self._ensure_reconnect_lock()
+        async with self._reconnect_lock:  # type: ignore[arg-type]
+            await self._create_client_unlocked(api_id, api_hash, phone)
+
+    async def _create_client_unlocked(self, api_id: int, api_hash: str, phone: str) -> None:
+        # Caller must hold `_reconnect_lock`.
+        await self._destroy_client_unlocked()
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        safe_digits = re.sub(r"\D", "", phone)
+        # IMPORTANT: Telegram auth keys are scoped to the API app (api_id/api_hash).
+        # If we reuse a session file across different api_id values (e.g., switching to
+        # managed creds), Telethon may hold an auth key that Telegram treats as belonging
+        # to a different app. That can break login-token export/import flows.
+        session_path = SESSION_DIR / f"session_{safe_digits}_{int(api_id)}.session"
+        self.client = TelegramClient(
+            SQLiteSession(str(session_path)),
+            api_id,
+            api_hash,
+            timeout=20,
+            request_retries=5,
+            connection_retries=5,
+            device_model="FlameBot",
+            system_version="Windows 10",
+            app_version="1.0",
+            lang_code="en",
+        )
+        await self.client.connect()
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.phone = phone
+        # If the user was previously listening to chats, re-attach handlers to
+        # this new client instance so messages keep showing.
+        await self._restore_listeners_unlocked()
+
+    async def _restore_listeners_unlocked(self) -> None:
+        # Caller must hold `_reconnect_lock`.
+        if not self.client:
+            return
+        try:
+            chats = list(getattr(self, "_listening_chats", set()) or [])
+        except Exception:
+            chats = []
+        for chat_id in chats:
+            try:
+                msg_h = self._message_handlers.get(chat_id)
+                edit_h = self._edit_handlers.get(chat_id)
+                album_h = self._album_handlers.get(chat_id)
+                if msg_h:
+                    self.client.add_event_handler(msg_h, events.NewMessage(chats=chat_id))
+                if edit_h:
+                    self.client.add_event_handler(edit_h, events.MessageEdited(chats=chat_id))
+                if album_h:
+                    self.client.add_event_handler(album_h, events.Album(chats=chat_id))
+            except Exception:
+                continue
+
+    def start_auto_reconnect(self) -> None:
+        # Idempotent and restartable.
+        self._auto_reconnect_enabled = True
+        if not self._auto_reconnect_started:
+            self._auto_reconnect_started = True
+
+        try:
+            self._loop_ready.wait(timeout=1)
+        except Exception:
+            pass
+
+        loop = getattr(self, "loop", None)
+        if loop is None:
+            return
+
+        # If an existing reconnect loop is still running, keep it.
+        try:
+            fut = getattr(self, "_auto_reconnect_future", None)
+            if fut is not None:
+                try:
+                    if not fut.done():
+                        return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            self._auto_reconnect_future = asyncio.run_coroutine_threadsafe(self._auto_reconnect_loop(), loop)
+        except Exception:
+            return
+
+    async def _auto_reconnect_loop(self) -> None:
+        self._emit_debug_log("🔄 Auto-Reconnect Started")
+        backoff_sec: float = max(0.5, float(TG_RECONNECT_POLL_DISCONNECTED_SEC or 2.0))
+        while self._auto_reconnect_enabled and not self._stopped:
+            try:
+                if not self.client:
+                    # If the client was destroyed (e.g., due to offline cancel),
+                    # recreate it using the last known credentials.
+                    if self.api_id and self.api_hash and self.phone:
+                        try:
+                            await self._create_client(int(self.api_id), str(self.api_hash), str(self.phone))
+                        except Exception as e:
+                            self._emit_debug_log(f"Reconnect error: {e}")
+                            backoff_sec = min(float(TG_RECONNECT_BACKOFF_MAX_SEC or 20.0), max(backoff_sec * 2.0, 2.0))
+                            await asyncio.sleep(min(5.0, backoff_sec))
+                            continue
+                    else:
+                        await asyncio.sleep(min(5.0, backoff_sec))
+                        continue
+
+                await self._ensure_reconnect_lock()
+                async with self._reconnect_lock:  # type: ignore[arg-type]
+                    # Detect update-loop crashes (common after network toggles) and recover.
+                    updates_task = self._get_updates_task()
+                    if updates_task is not None and updates_task.done():
+                        try:
+                            exc = updates_task.exception()
+                        except Exception:
+                            exc = None
+                        await self._restart_client_and_catch_up(
+                            f"update loop stopped ({exc.__class__.__name__ if exc else 'unknown'})"
+                        )
+                        backoff_sec = max(0.5, float(TG_RECONNECT_POLL_DISCONNECTED_SEC or 2.0))
+                    else:
+                        healthy = await self._is_client_healthy()
+                        if not healthy:
+                            await self._restart_client_and_catch_up("health-check failed")
+                            backoff_sec = max(0.5, float(TG_RECONNECT_POLL_DISCONNECTED_SEC or 2.0))
+
+                # When healthy/connected, poll less frequently (events deliver instantly).
+                await asyncio.sleep(max(1.0, float(TG_RECONNECT_POLL_CONNECTED_SEC or 5.0)))
+            except RuntimeError as exc:
+                self._emit_debug_log(f"Runtime reconnect error: {exc} — resetting client")
+                # Increase backoff on repeated failures.
+                backoff_sec = min(float(TG_RECONNECT_BACKOFF_MAX_SEC or 20.0), max(backoff_sec * 2.0, 2.0))
+                await asyncio.sleep(min(3.0, backoff_sec))
+                try:
+                    await self._ensure_reconnect_lock()
+                    async with self._reconnect_lock:  # type: ignore[arg-type]
+                        await self._restart_client_and_catch_up(f"runtime error: {exc}")
+                    backoff_sec = max(0.5, float(TG_RECONNECT_POLL_DISCONNECTED_SEC or 2.0))
+                except Exception as exc2:
+                    self._emit_debug_log(f"Reconnect after reset failed: {exc2}")
+                    backoff_sec = min(float(TG_RECONNECT_BACKOFF_MAX_SEC or 20.0), max(backoff_sec * 2.0, 2.0))
+                    await asyncio.sleep(backoff_sec)
+            except Exception as exc:
+                self._emit_debug_log(f"Reconnect error: {exc}")
+                backoff_sec = min(float(TG_RECONNECT_BACKOFF_MAX_SEC or 20.0), max(backoff_sec * 2.0, 2.0))
+                await asyncio.sleep(backoff_sec)
+
+        self._emit_debug_log("🛑 Auto-Reconnect Stopped")
+
+    async def _restart_client_and_catch_up(self, reason: str) -> bool:
+        """Restart the Telethon client and replay missed messages.
+
+        IMPORTANT: Caller should already hold `_reconnect_lock`.
+        We prefer a full client recreate to avoid Telethon internal task reuse
+        issues after network toggles.
+        """
+        if not self.client:
+            return False
+
+        try:
+            self._emit_debug_log(f"⚠ Telegram reconnect: {reason}")
+        except Exception:
+            pass
+
+        # Snapshot credentials; required to recreate the client.
+        try:
+            api_id = int(getattr(self, "api_id", 0) or 0)
+        except Exception:
+            api_id = 0
+        try:
+            api_hash = str(getattr(self, "api_hash", "") or "").strip()
+        except Exception:
+            api_hash = ""
+        try:
+            phone = str(getattr(self, "phone", "") or "").strip()
+        except Exception:
+            phone = ""
+
+        # Best-effort: fully destroy and recreate the client. This avoids
+        # some Telethon edge cases where connection send/recv tasks get into
+        # an inconsistent state (seen as "cannot reuse already awaited coroutine").
+        try:
+            await self._destroy_client_unlocked()
+        except Exception:
+            pass
+
+        if api_id <= 0 or not api_hash or not phone:
+            return False
+
+        # Small pause helps OS sockets settle before reconnecting.
+        try:
+            await asyncio.sleep(0.35)
+        except Exception:
+            pass
+
+        try:
+            await self._create_client_unlocked(api_id, api_hash, phone)
+        except Exception:
+            return False
+
+        # IMPORTANT: Do not emit "Session expired" from a reconnect health-check.
+        try:
+            if self.phone and self.client:
+                ok = await self.client.is_user_authorized()
+                if not ok:
+                    self._emit_debug_log("⚠ Telegram reconnect: not authorized (will re-check via auto-login)")
+        except Exception:
+            pass
+
+        try:
+            await asyncio.sleep(0.35)
+        except Exception:
+            pass
+
+        try:
+            await self._catch_up_after_reconnect()
+        except Exception:
+            pass
+        return True
+
+    async def _catch_up_after_reconnect(self) -> None:
+        if not self.client:
+            return
+        # Optional safety cap (0 = unlimited). Default unlimited.
+        try:
+            max_messages = int(os.environ.get("FLAMEBOT_TG_CATCHUP_MAX", "0") or 0)
+        except Exception:
+            max_messages = 0
+        try:
+            batch_size = int(os.environ.get("FLAMEBOT_TG_CATCHUP_BATCH", "200") or 200)
+        except Exception:
+            batch_size = 200
+        batch_size = max(20, min(500, int(batch_size)))
+
+        for chat_id in list(self._listening_chats):
+            try:
+                base_last_id = int(self._last_message_ids.get(chat_id) or 0)
+            except Exception:
+                base_last_id = 0
+            if base_last_id <= 0:
+                continue
+
+            processed = 0
+            max_seen_id = base_last_id
+            emitted_ids: set[int] = set()
+            try:
+                # Page newest->older using offset_id, but PROCESS oldest->newest
+                # within each page by reversing the returned list.
+                offset_id = 0
+                while True:
+                    msgs = await self.client.get_messages(
+                        chat_id,
+                        limit=int(batch_size),
+                        offset_id=int(offset_id or 0),
+                        min_id=int(base_last_id),
+                    )
+                    if not msgs:
+                        break
+
+                    # Determine next page cursor (oldest message id in this page).
+                    try:
+                        oldest = msgs[-1]
+                        offset_id = int(getattr(oldest, "id", 0) or 0)
+                    except Exception:
+                        offset_id = 0
+
+                    for message in reversed(list(msgs)):
+                        try:
+                            message_id = int(getattr(message, "id", 0) or 0)
+                        except Exception:
+                            message_id = 0
+                        if message_id <= 0:
+                            continue
+
+                        # IMPORTANT (match tg_copier_pro.py semantics):
+                        # Catch-up must be anchored to the cursor we had *when reconnect started*.
+                        # Do NOT compare against a moving `_last_message_ids` value, otherwise a
+                        # newer live message can arrive first and cause us to skip older missed
+                        # messages permanently.
+                        if message_id <= int(base_last_id):
+                            continue
+                        if message_id in emitted_ids:
+                            continue
+                        emitted_ids.add(int(message_id))
+                        if message_id > int(max_seen_id):
+                            max_seen_id = int(message_id)
+
+                        sender = None
+                        try:
+                            sender = await message.get_sender()
+                        except Exception:
+                            sender = None
+                        name = self._display_name(sender)
+                        text = getattr(message, "message", None) or ""
+                        timestamp = _format_telegram_local_time(getattr(message, "date", None))
+                        tg_ts = _telegram_utc_epoch_seconds(getattr(message, "date", None))
+                        outgoing = bool(getattr(message, "out", False))
+                        reply_to_msg_id = getattr(message, "reply_to_msg_id", None)
+
+                        try:
+                            self._save_message(chat_id, name, text, tg_time=timestamp, tg_ts=int(tg_ts or 0), outgoing=outgoing)
+                        except Exception:
+                            pass
+
+                        await self._post_trade_command_to_backend(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=text,
+                            reply_to_msg_id=reply_to_msg_id,
+                            is_edit=False,
+                            tg_message_timestamp=tg_ts,
+                        )
+                        await self._post_signal_to_backend(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=text,
+                            is_edit=False,
+                            reply_to_msg_id=reply_to_msg_id,
+                            message_obj=message,
+                            tg_message_timestamp=tg_ts,
+                        )
+
+                        # Ensure missed messages are visible in the same UI surface
+                        # as live messages (MessageLogWidget parses 📩TS=...).
+                        try:
+                            try:
+                                out_i = 1 if bool(outgoing) else 0
+                            except Exception:
+                                out_i = 0
+                            try:
+                                epoch_i = int(tg_ts or 0)
+                            except Exception:
+                                epoch_i = 0
+                            if timestamp and epoch_i > 0:
+                                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} TS={timestamp} [{name}] {text}")
+                            elif timestamp:
+                                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} TS={timestamp} [{name}] {text}")
+                            elif epoch_i > 0:
+                                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} [{name}] {text}")
+                            else:
+                                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} [{name}] {text}")
+                        except Exception:
+                            pass
+
+                        try:
+                            self.message_received.emit(chat_id, name, text, timestamp, outgoing)
+                        except Exception:
+                            pass
+
+                        processed += 1
+                        if max_messages > 0 and processed >= max_messages:
+                            break
+                        if processed % 100 == 0:
+                            await asyncio.sleep(0)
+
+                    if max_messages > 0 and processed >= max_messages:
+                        break
+                    if len(msgs) < int(batch_size):
+                        break
+                    if offset_id <= 0:
+                        break
+
+                if processed:
+                    # Advance the cursor to the maximum id we actually replayed.
+                    try:
+                        if int(max_seen_id or 0) > int(base_last_id or 0):
+                            self._mark_last_id(chat_id, int(max_seen_id))
+                    except Exception:
+                        pass
+                    self._emit_debug_log(f"✔ Catch-up replayed {processed} messages for {chat_id}")
+            except Exception as exc:
+                try:
+                    self.log_message.emit(f"⚠️ Catch-up error for {chat_id}")
+                except Exception:
+                    pass
+                self._dev_log_exc(f"catch_up chat_id={chat_id}", exc)
+
+    async def _emit_user_profile(self) -> None:
+        if not self.client:
+            return
+        try:
+            me = await self.client.get_me()
+            name = getattr(me, "first_name", "") or getattr(me, "username", "") or "Telegram User"
+            phone_raw = getattr(me, "phone", None) or self.phone or ""
+            tg_id = getattr(me, "id", None)
+            tg_str = str(tg_id) if tg_id is not None else ""
+            self.user_ready.emit(name, phone_raw, tg_str)
+        except Exception:
+            self.user_ready.emit("Telegram User", self.phone or "", "")
+
+    def _is_signal(self, text: str) -> bool:
+        """Check if text looks like a trading signal."""
+        if not text:
+            return False
+        lower = text.lower()
+        has_direction = any(k in lower for k in ["buy", "sell", "long", "short"])
+        has_target = any(k in lower for k in ["tp", "take profit", "sl", "stop loss", "entry", "@"])
+        return has_direction and has_target
+
+    async def _walk_to_signal(self, chat_id: int, start_msg_id: int) -> Optional[int]:
+        """Walk up reply chain until a signal message is found.
+        
+        Returns the message_id of the original signal, or None if not found.
+        """
+        if not self.client:
+            return None
+            
+        current_id = start_msg_id
+        visited = set()
+        max_depth = 20  # Prevent infinite loops
+        
+        while current_id and current_id not in visited and len(visited) < max_depth:
+            visited.add(current_id)
+            
+            try:
+                msg = await self.client.get_messages(chat_id, ids=current_id)
+                if not msg:
+                    return None
+                    
+                # Check if this is a signal
+                text = msg.text or ""
+                if self._is_signal(text):
+                    self.log_message.emit(f"✅ Resolved to signal message: {current_id}")
+                    return current_id
+                    
+                # Walk to parent reply
+                if msg.reply_to and msg.reply_to.reply_to_msg_id:
+                    current_id = msg.reply_to.reply_to_msg_id
+                    self.log_message.emit(f"🔗 Walking up reply chain: {current_id}")
+                else:
+                    # No more parents
+                    break
+            except Exception as e:
+                self.log_message.emit(f"⚠️ Error walking reply chain: {e}")
+                break
+        
+        return None
+
+    def send_code(self, api_id: int, api_hash: str, phone: str) -> None:
+        async def safe_send() -> dict:
+            try:
+                phone_norm = normalize_phone(phone)
+            except Exception as exc:
+                self._dev_log_exc("login_normalize_phone", exc)
+                return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+
+            try:
+                await self._ensure_reconnect_lock()
+                async with self._reconnect_lock:  # type: ignore[arg-type]
+                    await self._create_client_unlocked(api_id, api_hash, phone_norm)
+                    if await self.client.is_user_authorized():
+                        self.log_message.emit("✔ Session active. Auto-login.")
+                        await self._emit_user_profile()
+                        return self._make_login_result(True, "LOGIN_SUCCESS", "")
+
+                    self.log_message.emit(f"Sending code to {phone_norm} …")
+                    await self.client.send_code_request(phone_norm)
+                    self.log_message.emit("Code sent. Check Telegram.")
+                    return self._make_login_result(True, "CODE_SENT", "")
+            except Exception as exc:
+                self._dev_log_exc("login_send_code", exc)
+                return self._map_login_exception(exc)
+
+        def _on_success(result: dict) -> None:
+            try:
+                self.login_result.emit(result)
+            except Exception:
+                pass
+
+            status = str((result or {}).get("status") or "").upper()
+            if status == "CODE_SENT":
+                try:
+                    self.code_sent.emit()
+                except Exception:
+                    pass
+            elif status == "LOGIN_SUCCESS":
+                try:
+                    self.login_success.emit()
+                except Exception:
+                    pass
+
+        def _on_error(exc: BaseException) -> None:
+            try:
+                self._dev_log_exc("login_send_code_unhandled", exc)
+            except Exception:
+                pass
+            try:
+                self.login_result.emit(self._map_login_exception(exc))
+            except Exception:
+                pass
+
+        self._run_coro(safe_send(), on_success=_on_success, on_error=_on_error)
+
+    def try_auto_login(self, api_id: int, api_hash: str, phone: str) -> None:
+        """Silently reuse an existing Telethon session if still authorized.
+
+        Intended for app startup: if the prior session is valid, emits
+        `login_success` (and `user_ready`). If not valid, it does nothing.
+        """
+
+        async def safe_try() -> bool:
+            # Track whether failures are due to transient exceptions vs. a real
+            # unauthorized/expired session.
+            try:
+                self._last_auto_login_error_was_exception = False
+                self._last_auto_login_error_text = ""
+            except Exception:
+                pass
+            try:
+                phone_norm = normalize_phone(phone)
+                await self._ensure_reconnect_lock()
+                async with self._reconnect_lock:  # type: ignore[arg-type]
+                    # Avoid destroying/recreating an already-matching client.
+                    if (
+                        self.client
+                        and str(getattr(self, "phone", "") or "") == str(phone_norm)
+                        and str(getattr(self, "api_hash", "") or "") == str(api_hash)
+                        and int(getattr(self, "api_id", 0) or 0) == int(api_id)
+                    ):
+                        if not self.client.is_connected():
+                            await self.client.connect()
+                    else:
+                        await self._create_client_unlocked(api_id, api_hash, phone_norm)
+
+                    try:
+                        if await self.client.is_user_authorized():
+                            await self._emit_user_profile()
+                            return True
+                    except Exception as exc_auth:
+                        try:
+                            self._last_auto_login_error_was_exception = True
+                            self._last_auto_login_error_text = str(exc_auth)
+                        except Exception:
+                            pass
+                        return False
+                    finally:
+                        # If not authorized, don't keep a connected client alive.
+                        try:
+                            if self.client and not await self.client.is_user_authorized():
+                                await self._destroy_client_unlocked()
+                        except Exception:
+                            pass
+                    return False
+            except Exception as exc:
+                # Never raise during boot resolution.
+                try:
+                    try:
+                        self._last_auto_login_error_was_exception = True
+                        self._last_auto_login_error_text = str(exc)
+                    except Exception:
+                        pass
+                    await self._destroy_client()
+                except Exception:
+                    pass
+                return False
+
+        def _on_resolved(ok: bool) -> None:
+            # Boot controller decides initial route; do NOT auto-navigate.
+            try:
+                self.auto_login_resolved.emit(bool(ok))
+            except Exception:
+                pass
+
+        self._run_coro(safe_try(), on_success=_on_resolved)
+
+    def login(self, code: str, password: str) -> None:
+        def _on_success(result: dict) -> None:
+            try:
+                self.login_result.emit(result)
+            except Exception:
+                pass
+
+            status = str((result or {}).get("status") or "").upper()
+            if status == "LOGIN_SUCCESS":
+                try:
+                    self.login_success.emit()
+                except Exception:
+                    pass
+
+        def _on_error(exc: BaseException) -> None:
+            try:
+                self._dev_log_exc("login_sign_in_unhandled", exc)
+            except Exception:
+                pass
+            try:
+                self.login_result.emit(self._map_login_exception(exc))
+            except Exception:
+                pass
+
+        self._run_coro(self._login_flow(code, password), on_success=_on_success, on_error=_on_error)
+
+    async def _login_flow(self, code: str, password: str) -> dict:
+        try:
+            await self._ensure_reconnect_lock()
+            async with self._reconnect_lock:  # type: ignore[arg-type]
+                if not self.client:
+                    if not self.api_id or not self.api_hash or not self.phone:
+                        return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+                    await self._create_client_unlocked(int(self.api_id), str(self.api_hash), str(self.phone))
+                if not self.client.is_connected():
+                    await self.client.connect()
+
+            try:
+                if code:
+                    await self.client.sign_in(phone=self.phone, code=code)
+                else:
+                    # UI should validate blank inputs; keep response generic.
+                    if not password:
+                        return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+                    await self.client.sign_in(password=password)
+            except SessionPasswordNeededError as exc:
+                # 2FA needed: do NOT leak details.
+                if not password:
+                    return self._make_login_result(False, "2FA_REQUIRED", _generic_2fa_required_message())
+                try:
+                    await self.client.sign_in(password=password)
+                except Exception as exc2:
+                    self._dev_log_exc("login_2fa_sign_in", exc2)
+                    return self._map_login_exception(exc2)
+            except Exception as exc:
+                self._dev_log_exc("login_sign_in", exc)
+                return self._map_login_exception(exc)
+
+            try:
+                if not await self.client.is_user_authorized():
+                    return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+            except Exception as exc:
+                self._dev_log_exc("login_auth_check", exc)
+                return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+
+            self.log_message.emit("✔ Login successful")
+            await self._emit_user_profile()
+            return self._make_login_result(True, "LOGIN_SUCCESS", "")
+        except Exception as exc:
+            self._dev_log_exc("login_flow_unhandled", exc)
+            return self._map_login_exception(exc)
+
+    def fetch_groups(self) -> None:
+        if bool(getattr(self, "_fetch_groups_inflight", False)):
+            return
+        self._fetch_groups_inflight = True
+
+        def _on_success(groups: list) -> None:
+            try:
+                self._fetch_groups_inflight = False
+            except Exception:
+                pass
+            try:
+                self.groups_ready.emit(groups)
+            except Exception:
+                pass
+
+        def _on_error(exc: BaseException) -> None:
+            try:
+                self._fetch_groups_inflight = False
+            except Exception:
+                pass
+            # Preserve legacy behavior: surface error to UI.
+            try:
+                self.error.emit(str(exc))
+            except Exception:
+                pass
+
+        self._run_coro(self._fetch_groups(), on_success=_on_success, on_error=_on_error)
+
+    async def _fetch_groups(self) -> list:
+        await self._ensure_reconnect_lock()
+        async with self._reconnect_lock:  # type: ignore[arg-type]
+            if not self.client:
+                # Self-heal after offline cancellation.
+                if not self.api_id or not self.api_hash or not self.phone:
+                    raise RuntimeError("Client not initialized.")
+                await self._create_client_unlocked(int(self.api_id), str(self.api_hash), str(self.phone))
+            if not self.client.is_connected():
+                await self.client.connect()
+            dialogs = await self.client.get_dialogs()
+        icons_dir = ICON_CACHE
+        icons_dir.mkdir(parents=True, exist_ok=True)
+        groups: list = []
+        missing_entities = []
+        for dialog in dialogs:
+            entity = dialog.entity
+            if not isinstance(entity, (Channel, Chat)):
+                continue
+            icon_path = None
+            cached_path = _find_cached_icon_file(icons_dir, int(entity.id))
+            if cached_path is not None and cached_path.exists():
+                # If the cache contains a partial/truncated JPEG (crash/network),
+                # delete it and re-download. This prevents libjpeg spam.
+                if _is_complete_jpeg_file(cached_path):
+                    icon_path = str(cached_path)
+                else:
+                    try:
+                        cached_path.unlink()
+                    except Exception:
+                        pass
+                    missing_entities.append(entity)
+            else:
+                missing_entities.append(entity)
+            name = getattr(entity, "title", None) or "(No title)"
+            username = getattr(entity, "username", None)
+            groups.append((name, entity.id, icon_path, username))
+        if missing_entities:
+            try:
+                task = asyncio.create_task(self._load_icons_in_background(missing_entities))
+                self._track_background_task(task)
+            except Exception:
+                pass
+        self.log_message.emit(f"✔ Found {len(groups)} groups")
+        return groups
+
+    async def _load_icons_in_background(self, entities: List[Channel | Chat]) -> None:
+        if not self.client:
+            return
+        icons_dir = ICON_CACHE
+        icons_dir.mkdir(parents=True, exist_ok=True)
+        for entity in entities:
+            try:
+                cached = _find_cached_icon_file(icons_dir, int(entity.id))
+                if cached is not None and cached.exists():
+                    if _is_complete_jpeg_file(cached):
+                        self.icon_ready.emit(entity.id, str(cached))
+                        continue
+                    try:
+                        cached.unlink()
+                    except Exception:
+                        pass
+
+                # Do NOT force a .jpg extension: Telegram/Telethon may provide
+                # PNG/WebP; let Telethon pick the final extension.
+                target_base = icons_dir / f"{entity.id}"
+                downloaded = await self.client.download_profile_photo(entity, file=str(target_base))
+                if not downloaded:
+                    continue
+
+                downloaded_path: Optional[Path] = None
+                try:
+                    downloaded_path = Path(str(downloaded))
+                except Exception:
+                    downloaded_path = None
+
+                if downloaded_path is None:
+                    try:
+                        downloaded_path = _find_cached_icon_file(icons_dir, int(entity.id))
+                    except Exception:
+                        downloaded_path = None
+                if downloaded_path is None:
+                    try:
+                        downloaded_path = Path(str(target_base))
+                    except Exception:
+                        downloaded_path = None
+
+                if downloaded_path is None:
+                    continue
+
+                if downloaded_path.exists() and _is_complete_jpeg_file(downloaded_path):
+                    self.icon_ready.emit(entity.id, str(downloaded_path))
+                else:
+                    try:
+                        if downloaded_path.exists():
+                            downloaded_path.unlink()
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+    async def _extract_image_payload_from_message(self, message: Any) -> tuple[str, str]:
+        """Return (image_b64, image_mime) for a Telegram message if it contains an image."""
+        try:
+            if not self.client or not message:
+                return "", "image/jpeg"
+
+            file_obj = getattr(message, "file", None)
+            mime = getattr(file_obj, "mime_type", None) or ""
+            mime_lower = str(mime).lower()
+            has_photo = bool(getattr(message, "photo", None))
+
+            # Telegram may deliver screenshots as a "document" with a missing/incorrect
+            # mime type (e.g. application/octet-stream). Use filename/extension as a
+            # fallback to still forward the image to the backend.
+            name = str(getattr(file_obj, "name", None) or "")
+            ext = str(getattr(file_obj, "ext", None) or "")
+            if not ext and name:
+                try:
+                    ext = Path(name).suffix
+                except Exception:
+                    ext = ""
+            ext_lower = ext.lower()
+            image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".heic"}
+            is_image_doc = bool(mime_lower.startswith("image/")) or (ext_lower in image_exts)
+
+            if not (has_photo or is_image_doc):
+                return "", "image/jpeg"
+
+            # Default mime if Telegram doesn't provide a helpful one.
+            if not mime_lower:
+                if ext_lower == ".png":
+                    mime = "image/png"
+                elif ext_lower == ".webp":
+                    mime = "image/webp"
+                elif ext_lower == ".gif":
+                    mime = "image/gif"
+                elif ext_lower == ".bmp":
+                    mime = "image/bmp"
+                elif ext_lower == ".heic":
+                    mime = "image/heic"
+                else:
+                    mime = "image/jpeg"
+
+            data = await self.client.download_media(message, file=bytes)
+            if not data or not isinstance(data, (bytes, bytearray)):
+                return "", mime
+
+            # Avoid sending huge payloads to the backend.
+            # Telegram screenshots can be several MB; keep a reasonable cap to
+            # avoid request rejection while still supporting typical charts.
+            max_bytes = 10_000_000  # ~10MB
+            if len(data) > max_bytes:
+                try:
+                    self.log_message.emit(f"⚠️ Image too large to attach ({len(data)} bytes)")
+                except Exception:
+                    pass
+                return "", mime
+
+            import base64
+
+            image_b64 = base64.b64encode(bytes(data)).decode("ascii")
+            return image_b64, mime
+        except Exception:
+            return "", "image/jpeg"
+
+    async def _post_signal_to_backend(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        is_edit: bool,
+        reply_to_msg_id: Optional[int],
+        message_obj: Any = None,
+        event_type: str = "",
+        tg_message_timestamp: Optional[int] = None,
+    ) -> None:
+        """POST signal to backend with unified reply chain resolution."""
+        if not self.telegram_id:
+            self.log_message.emit("⚠️ Cannot forward signal: telegram_id not set")
+            return
+
+        try:
+            # Determine target_id using reply chain resolution (priority order matters!)
+            target_id = None
+            
+            if reply_to_msg_id:
+                # REPLY or EDITED REPLY path: forward immediately (no reply-chain walking).
+                target_id = f"{chat_id}:{int(reply_to_msg_id)}"
+                signal_type = "UPDATE_SIGNAL"
+            elif is_edit:
+                # EDIT (non-reply) path: action applies to this message itself (must be a signal)
+                target_id = f"{chat_id}:{message_id}"
+                signal_type = "UPDATE_SIGNAL"
+            else:
+                # NEW_SIGNAL path
+                signal_type = "NEW_SIGNAL"
+                target_id = f"{chat_id}:{message_id}"
+                
+            signal_id = f"{chat_id}:{message_id}"
+
+            image_b64, image_mime = await self._extract_image_payload_from_message(message_obj)
+            tg_ts = int(tg_message_timestamp or 0)
+            payload = {
+                "correlation_id": f"{chat_id}:{message_id}:{str(event_type or ('message_edited' if is_edit else 'new_message'))}:{int(bool(is_edit))}",
+                "telegram_id": self.telegram_id,
+                # Platform intentionally omitted: Telegram messages are not MT4/MT5-specific.
+                "type": signal_type,
+                "signal_id": signal_id,
+                "target_id": target_id,
+                "raw_text": text,
+                "group_id": str(chat_id),  # group_id is chat_id
+                "is_edit": bool(is_edit),
+                "event_type": str(event_type or ("message_edited" if is_edit else "new_message")),
+                # Required for backend time-gating + reply suppression
+                "tg_message_id": str(message_id),
+                "tg_chat_id": str(chat_id),
+                "tg_message_timestamp": tg_ts,
+                "reply_to_message_id": (str(reply_to_msg_id) if reply_to_msg_id else None),
+                # Backward-compat convenience
+                "message_id": str(message_id),
+                "chat_id": str(chat_id),
+            }
+            if image_b64:
+                payload["image_b64"] = image_b64
+                payload["image_mime"] = image_mime or "image/jpeg"
+
+            await self._enqueue_backend_post("push_signal", payload)
+                
+        except Exception as e:
+            self.log_message.emit(f"❌ Failed to forward signal: {e}")
+    
+    async def _post_trade_command_to_backend(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_to_msg_id: Optional[int],
+        is_edit: bool = False,
+        tg_message_timestamp: Optional[int] = None,
+    ) -> None:
+        """POST every Telegram message to backend trade-command endpoint.
+
+        This must be a dumb pipe: no filtering, no blocking network calls.
+        Retries are handled by the background worker.
+        """
+        if not self.telegram_id:
+            return
+
+        try:
+            # Best-effort context. No reply-chain walking (avoid extra Telegram API calls).
+            target_signal_id: Optional[str] = None
+            if reply_to_msg_id:
+                target_signal_id = f"{chat_id}:{int(reply_to_msg_id)}"
+            elif is_edit:
+                target_signal_id = f"{chat_id}:{int(message_id)}"
+
+            tg_ts = int(tg_message_timestamp or 0)
+            payload = {
+                "correlation_id": f"{chat_id}:{message_id}:{('message_edited' if is_edit else 'new_message')}:{int(bool(is_edit))}",
+                "telegram_id": self.telegram_id,
+                # Platform intentionally omitted: backend broadcasts to MT4 + MT5 bound to this telegram_id.
+                "message_id": str(message_id),
+                "chat_id": str(chat_id),
+                "raw_text": text,
+                "reply_to_signal_id": (str(target_signal_id) if target_signal_id else None),
+                "reply_to_message_id": (str(reply_to_msg_id) if reply_to_msg_id else None),
+                "tg_message_id": str(message_id),
+                "tg_chat_id": str(chat_id),
+                "tg_message_timestamp": tg_ts,
+                "is_edit": bool(is_edit),
+                "group_id": str(chat_id),
+                "event_type": "message_edited" if is_edit else "new_message",
+            }
+
+            await self._enqueue_backend_post("push_trade_command", payload)
+        except Exception as e:
+            try:
+                self.log_message.emit(f"❌ Failed to process trade command: {e}")
+            except Exception:
+                pass
+
+    def start_listening(self, chat_id: int, *, catch_up: bool = True) -> None:
+        self._run_coro(self._start_listening(chat_id, catch_up=catch_up))
+
+    async def _start_listening(self, chat_id: int, *, catch_up: bool = True) -> None:
+        if not self.client:
+            raise RuntimeError("Client not initialized.")
+        await self._ensure_backend_post_worker()
+        await self._ensure_reconnect_lock()
+        async with self._reconnect_lock:  # type: ignore[arg-type]
+            if not await self._is_client_healthy():
+                await self._restart_client_and_catch_up("start_listening")
+
+        # Catch-up behavior:
+        # - If catch_up=True (auto-resume, reconnect, app restart), we backfill from cursor.
+        # - If catch_up=False (user manually toggles ON after being OFF), we anchor cursor
+        #   to "now" (latest message id) and DO NOT backfill messages sent while OFF.
+        base_cursor = 0
+        try:
+            persisted = int(self._get_persisted_last_id(chat_id) or 0)
+        except Exception:
+            persisted = 0
+
+        if bool(catch_up):
+            try:
+                current = int(self._last_message_ids.get(chat_id) or 0)
+            except Exception:
+                current = 0
+
+            base_cursor = int(persisted if persisted > 0 else current)
+
+            # Seed in-memory cursor from persisted (never move it backwards).
+            if persisted > 0:
+                try:
+                    if int(self._last_message_ids.get(chat_id) or 0) < int(persisted):
+                        self._last_message_ids[chat_id] = int(persisted)
+                except Exception:
+                    pass
+        else:
+            # Manual ON: fast-forward cursor to latest so no backfill occurs.
+            try:
+                latest = await self.client.get_messages(chat_id, limit=1)
+                msg0 = None
+                try:
+                    msg0 = latest[0] if latest else None
+                except Exception:
+                    msg0 = latest
+                latest_mid = int(getattr(msg0, "id", 0) or 0) if msg0 is not None else 0
+            except Exception:
+                latest_mid = 0
+
+            anchor_mid = int(persisted if int(persisted or 0) > int(latest_mid or 0) else latest_mid)
+            if anchor_mid > 0:
+                try:
+                    self._mark_last_id(chat_id, int(anchor_mid))
+                except Exception:
+                    pass
+            base_cursor = 0
+        if chat_id in self._message_handlers:
+            try:
+                self.client.remove_event_handler(
+                    self._message_handlers[chat_id], events.NewMessage
+                )
+            except Exception:
+                pass
+        if chat_id in self._edit_handlers:
+            try:
+                self.client.remove_event_handler(
+                    self._edit_handlers[chat_id], events.MessageEdited
+                )
+            except Exception:
+                pass
+        if chat_id in getattr(self, "_album_handlers", {}):
+            try:
+                self.client.remove_event_handler(
+                    self._album_handlers[chat_id], events.Album
+                )
+            except Exception:
+                pass
+
+        async def handler(event):
+            sender = None
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                sender = None
+            name = self._display_name(sender)
+            text = event.message.message or ""
+            message_id = event.message.id
+            reply_to_msg_id = getattr(event.message, "reply_to_msg_id", None)
+
+            is_outgoing = bool(getattr(event, "out", False)) or bool(getattr(event.message, "out", False))
+
+            tg_dt = getattr(event.message, "date", None)
+            timestamp = _format_telegram_local_time(tg_dt)
+            tg_ts = _telegram_utc_epoch_seconds(tg_dt)
+            # Carry Telegram's original timestamp into the UI log so reconnect/catch-up
+            # doesn't make messages look like they were sent "now".
+            try:
+                out_i = 1 if bool(is_outgoing) else 0
+            except Exception:
+                out_i = 0
+            try:
+                epoch_i = int(tg_ts or 0)
+            except Exception:
+                epoch_i = 0
+            if timestamp and epoch_i > 0:
+                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} TS={timestamp} [{name}] {text}")
+            elif timestamp:
+                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} TS={timestamp} [{name}] {text}")
+            elif epoch_i > 0:
+                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} [{name}] {text}")
+            else:
+                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} [{name}] {text}")
+            try:
+                self._save_message(
+                    chat_id,
+                    name,
+                    text,
+                    tg_time=str(timestamp or ""),
+                    tg_ts=int(tg_ts or 0),
+                    outgoing=is_outgoing,
+                )
+            except Exception:
+                pass
+            if message_id:
+                self._mark_last_id(chat_id, int(message_id))
+
+            # Cache last-seen text for reaction/edit de-dup.
+            try:
+                cache_key = f"{chat_id}:{int(message_id or 0)}"
+                self._last_message_text[cache_key] = str(text or "")
+            except Exception:
+                pass
+            
+            # UI must update immediately. Backend forwarding must never block UI.
+            try:
+                self.message_received.emit(chat_id, name, text, timestamp, is_outgoing)
+            except Exception:
+                pass
+
+            # Forward to backend in background (fire-and-forget).
+            try:
+                asyncio.create_task(
+                    self._post_trade_command_to_backend(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        reply_to_msg_id=reply_to_msg_id,
+                        is_edit=False,
+                        tg_message_timestamp=tg_ts,
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                asyncio.create_task(
+                    self._post_signal_to_backend(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        is_edit=False,
+                        reply_to_msg_id=reply_to_msg_id,
+                        message_obj=event.message,
+                        event_type="new_message",
+                        tg_message_timestamp=tg_ts,
+                    )
+                )
+            except Exception:
+                pass
+
+        async def edit_handler(event):
+            """Handle edited messages."""
+            sender = None
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                sender = None
+            name = self._display_name(sender)
+            text = event.message.message or ""
+            message_id = event.message.id
+            reply_to_msg_id = None
+            
+            # Extract reply_to_msg_id if this edited message is a reply
+            if hasattr(event.message, 'reply_to') and event.message.reply_to:
+                reply_to_msg_id = getattr(event.message.reply_to, 'reply_to_msg_id', None)
+            
+            tg_dt = getattr(event.message, "date", None)
+            timestamp = _format_telegram_local_time(tg_dt)
+            tg_ts = _telegram_utc_epoch_seconds(tg_dt)
+            # Treat edits as chat activity entries too, with the Telegram timestamp.
+            try:
+                out_i = 1 if bool(getattr(event, "out", False)) or bool(getattr(event.message, "out", False)) else 0
+            except Exception:
+                out_i = 0
+            try:
+                epoch_i = int(tg_ts or 0)
+            except Exception:
+                epoch_i = 0
+            if timestamp and epoch_i > 0:
+                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} TS={timestamp} ✏️ [{name}] (edited) {text}")
+            elif timestamp:
+                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} TS={timestamp} ✏️ [{name}] (edited) {text}")
+            elif epoch_i > 0:
+                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} ✏️ [{name}] (edited) {text}")
+            else:
+                self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} ✏️ [{name}] (edited) {text}")
+
+            # Reaction updates often trigger MessageEdited even though the text is unchanged.
+            # Do not drop: forward ALL edits. Keep cache updated for debugging only.
+            try:
+                cache_key = f"{chat_id}:{int(message_id or 0)}"
+                self._last_message_text[cache_key] = str(text or "")
+            except Exception:
+                pass
+            is_outgoing = bool(getattr(event, "out", False)) or bool(
+                getattr(event.message, "out", False)
+            )
+
+            try:
+                self._save_message(
+                    chat_id,
+                    name,
+                    f"(edited) {text}",
+                    tg_time=str(timestamp or ""),
+                    tg_ts=int(tg_ts or 0),
+                    outgoing=is_outgoing,
+                )
+            except Exception:
+                pass
+            
+            # UI update first (must not block on backend).
+            try:
+                self.message_received.emit(chat_id, name, f"(edited) {text}", timestamp, is_outgoing)
+            except Exception:
+                pass
+
+            # Forward edits to backend in background.
+            try:
+                asyncio.create_task(
+                    self._post_trade_command_to_backend(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        reply_to_msg_id=reply_to_msg_id,
+                        is_edit=True,
+                        tg_message_timestamp=tg_ts,
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                asyncio.create_task(
+                    self._post_signal_to_backend(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        is_edit=True,
+                        reply_to_msg_id=reply_to_msg_id,
+                        message_obj=event.message,
+                        event_type="message_edited",
+                        tg_message_timestamp=tg_ts,
+                    )
+                )
+            except Exception:
+                pass
+
+        async def album_handler(event):
+            """Handle album (multiple media) messages.
+
+            Telegram clients sometimes send image+caption as an album/media group.
+            We forward caption + first image as a single /push_signal with image_b64.
+            """
+            try:
+                messages = list(getattr(event, "messages", []) or [])
+                if not messages:
+                    return
+
+                sender = None
+                try:
+                    sender = await event.get_sender()
+                except Exception:
+                    sender = None
+                name = self._display_name(sender)
+
+                # Find caption text (first non-empty)
+                text = ""
+                for m in messages:
+                    t = getattr(m, "message", None) or ""
+                    if t.strip():
+                        text = t
+                        break
+
+                # Find first image-like message
+                image_msg = None
+                for m in messages:
+                    mime = getattr(getattr(m, "file", None), "mime_type", None) or ""
+                    if getattr(m, "photo", None) or str(mime).lower().startswith("image/"):
+                        image_msg = m
+                        break
+
+                if not image_msg:
+                    return
+
+                message_id = getattr(image_msg, "id", None) or getattr(messages[0], "id", None)
+                reply_to_msg_id = getattr(image_msg, "reply_to_msg_id", None)
+                timestamp_dt = getattr(image_msg, "date", None) or getattr(messages[0], "date", None)
+                timestamp = _format_telegram_local_time(timestamp_dt)
+                tg_ts = _telegram_utc_epoch_seconds(timestamp_dt)
+                is_outgoing = bool(getattr(image_msg, "out", False))
+                if message_id:
+                    self._mark_last_id(chat_id, int(message_id))
+
+                # Forward to backend in background (UI should never wait).
+                try:
+                    asyncio.create_task(
+                        self._post_trade_command_to_backend(
+                            chat_id=chat_id,
+                            message_id=int(message_id or 0),
+                            text=text,
+                            reply_to_msg_id=reply_to_msg_id,
+                            is_edit=False,
+                            tg_message_timestamp=tg_ts,
+                        )
+                    )
+                except Exception:
+                    pass
+                try:
+                    asyncio.create_task(
+                        self._post_signal_to_backend(
+                            chat_id=chat_id,
+                            message_id=int(message_id or 0),
+                            text=text,
+                            is_edit=False,
+                            reply_to_msg_id=reply_to_msg_id,
+                            message_obj=image_msg,
+                            event_type="album",
+                            tg_message_timestamp=tg_ts,
+                        )
+                    )
+                except Exception:
+                    pass
+
+                if text.strip():
+                    try:
+                        try:
+                            out_i = 1 if bool(is_outgoing) else 0
+                        except Exception:
+                            out_i = 0
+                        try:
+                            epoch_i = int(tg_ts or 0)
+                        except Exception:
+                            epoch_i = 0
+                        if timestamp and epoch_i > 0:
+                            self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} TS={timestamp} [{name}] {text}")
+                        elif timestamp:
+                            self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} TS={timestamp} [{name}] {text}")
+                        elif epoch_i > 0:
+                            self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} EPOCH={epoch_i} [{name}] {text}")
+                        else:
+                            self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} [{name}] {text}")
+                    except Exception:
+                        pass
+                    try:
+                        self._save_message(
+                            chat_id,
+                            name,
+                            text,
+                            tg_time=str(timestamp or ""),
+                            tg_ts=int(tg_ts or 0),
+                            outgoing=is_outgoing,
+                        )
+                    except Exception:
+                        pass
+                    self.message_received.emit(chat_id, name, text, timestamp, is_outgoing)
+            except Exception:
+                return
+
+        self._message_handlers[chat_id] = handler
+        self._edit_handlers[chat_id] = edit_handler
+        self._album_handlers[chat_id] = album_handler
+        self._listening_chats.add(chat_id)
+        self.client.add_event_handler(handler, events.NewMessage(chats=chat_id))
+        self.client.add_event_handler(edit_handler, events.MessageEdited(chats=chat_id))
+        self.client.add_event_handler(album_handler, events.Album(chats=chat_id))
+
+        # Initialize the catch-up cursor so if the network drops before any new
+        # message arrives, we can still fetch messages sent while offline.
+        try:
+            if int(self._last_message_ids.get(chat_id) or 0) <= 0:
+                latest = await self.client.get_messages(chat_id, limit=1)
+                msg0 = None
+                try:
+                    msg0 = latest[0] if latest else None
+                except Exception:
+                    msg0 = latest
+                mid = int(getattr(msg0, "id", 0) or 0) if msg0 is not None else 0
+                if mid > 0:
+                    self._mark_last_id(chat_id, mid)
+        except Exception:
+            pass
+
+        # Backfill messages that arrived while the app was closed / offline.
+        if bool(catch_up) and int(base_cursor or 0) > 0:
+            try:
+                await self._catch_up_for_chat(chat_id, int(base_cursor))
+            except Exception:
+                pass
+
+    def stop_listening(self, chat_id: Optional[int] = None) -> None:
+        """Stop listening to one chat or all chats.
+
+        IMPORTANT: Telethon client access must be confined to the worker thread.
+        This method schedules the removal work onto the worker asyncio loop.
+        """
+        try:
+            self._loop_ready.wait(timeout=1)
+        except Exception:
+            pass
+
+        loop = getattr(self, "loop", None)
+        if loop is None or (hasattr(loop, "is_closed") and loop.is_closed()):
+            # Loop not running (e.g., during shutdown). Best-effort local cleanup.
+            self._clear_listening_state_local(chat_id)
+            return
+
+        try:
+            self._run_coro(self._stop_listening_async(chat_id))
+        except Exception:
+            self._clear_listening_state_local(chat_id)
+
+    def _clear_listening_state_local(self, chat_id: Optional[int]) -> None:
+        """Best-effort cleanup when the worker loop isn't running."""
+        try:
+            targets = list(self._message_handlers.keys()) if chat_id is None else [int(chat_id)]
+        except Exception:
+            targets = []
+        for cid in targets:
+            try:
+                self._message_handlers.pop(cid, None)
+            except Exception:
+                pass
+            try:
+                self._edit_handlers.pop(cid, None)
+            except Exception:
+                pass
+            try:
+                self._album_handlers.pop(cid, None)
+            except Exception:
+                pass
+            try:
+                self._listening_chats.discard(cid)
+            except Exception:
+                pass
+            try:
+                self._last_message_ids.pop(cid, None)
+            except Exception:
+                pass
+
+        try:
+            if chat_id is None:
+                self._last_message_text.clear()
+            else:
+                prefix = f"{int(chat_id)}:"
+                for k in list(self._last_message_text.keys()):
+                    if str(k).startswith(prefix):
+                        self._last_message_text.pop(k, None)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _display_name(entity: Any) -> str:
+        """Return a human-friendly Telegram display name for a sender/chat."""
+        if entity is None:
+            return "Unknown"
+        try:
+            name = tg_utils.get_display_name(entity)
+        except Exception:
+            name = ""
+        try:
+            name_s = str(name or "").strip()
+        except Exception:
+            name_s = ""
+        if name_s:
+            return name_s
+
+        parts: List[str] = []
+        for attr in ("title", "first_name", "last_name"):
+            try:
+                v = getattr(entity, attr, None)
+            except Exception:
+                v = None
+            if v:
+                try:
+                    parts.append(str(v).strip())
+                except Exception:
+                    pass
+        try:
+            combined = " ".join([p for p in parts if p])
+        except Exception:
+            combined = ""
+        combined = str(combined or "").strip()
+        if combined:
+            return combined
+        try:
+            u = getattr(entity, "username", None)
+            if u:
+                return str(u).strip()
+        except Exception:
+            pass
+        return "Unknown"
+
+    async def _stop_listening_async(self, chat_id: Optional[int]) -> None:
+        """Remove Telethon handlers inside the worker event loop."""
+        await self._ensure_reconnect_lock()
+        async with self._reconnect_lock:  # type: ignore[arg-type]
+            client = getattr(self, "client", None)
+
+            try:
+                targets = list(self._message_handlers.keys()) if chat_id is None else [int(chat_id)]
+            except Exception:
+                targets = []
+
+            for cid in targets:
+                handler = self._message_handlers.get(cid)
+                if handler and client is not None:
+                    try:
+                        client.remove_event_handler(handler, events.NewMessage)
+                    except Exception:
+                        pass
+
+                edit_handler = self._edit_handlers.get(cid)
+                if edit_handler and client is not None:
+                    try:
+                        client.remove_event_handler(edit_handler, events.MessageEdited)
+                    except Exception:
+                        pass
+
+                album_handler = getattr(self, "_album_handlers", {}).get(cid)
+                if album_handler and client is not None:
+                    try:
+                        client.remove_event_handler(album_handler, events.Album)
+                    except Exception:
+                        pass
+
+                self._message_handlers.pop(cid, None)
+                self._edit_handlers.pop(cid, None)
+                try:
+                    self._album_handlers.pop(cid, None)
+                except Exception:
+                    pass
+                self._listening_chats.discard(cid)
+                self._last_message_ids.pop(cid, None)
+
+            # Opportunistic cleanup of text cache for stopped chats
+            try:
+                if chat_id is None:
+                    self._last_message_text.clear()
+                else:
+                    prefix = f"{int(chat_id)}:"
+                    for k in list(self._last_message_text.keys()):
+                        if str(k).startswith(prefix):
+                            self._last_message_text.pop(k, None)
+            except Exception:
+                pass
+
+    def _save_message(
+        self,
+        chat_id: int,
+        sender: str,
+        text: str,
+        *,
+        tg_time: str = "",
+        tg_ts: int = 0,
+        outgoing: bool = False,
+    ) -> None:
+        # NDJSON format: one JSON object per line.
+        path = Path(SIGNALS_NDJSON_FILE)
+        lock = getattr(self, "_signals_file_lock", None)
+        try:
+            if lock is None:
+                lock_cm = threading.Lock()
+            else:
+                lock_cm = lock
+        except Exception:
+            lock_cm = threading.Lock()
+
+        with lock_cm:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            try:
+                tg_time_s = str(tg_time or "").strip()
+            except Exception:
+                tg_time_s = ""
+            if not tg_time_s:
+                try:
+                    tg_time_s = _format_local_hhmmss_from_utc_epoch(int(tg_ts or 0))
+                except Exception:
+                    tg_time_s = ""
+
+            try:
+                entry = {
+                    "chat_id": int(chat_id),
+                    "sender": str(sender or ""),
+                    "text": str(text or ""),
+                    "outgoing": bool(outgoing),
+                    # recv_time is local arrival time.
+                    "recv_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    # tg_time/tg_ts are Telegram send-time (preferred for UI restore).
+                    "tg_time": str(tg_time_s or ""),
+                    "tg_ts": int(tg_ts or 0),
+                }
+            except Exception:
+                return
+
+            try:
+                line = json.dumps(entry, ensure_ascii=False)
+            except Exception:
+                return
+
+            # Append-only write (fast, avoids rewriting the whole file).
+            lock_path = None
+            try:
+                lock_path = path.with_name(path.name + ".lock")
+            except Exception:
+                lock_path = None
+
+            if lock_path is not None:
+                with _cross_process_lock(lock_path, wait_sec=float(SIGNALS_LOCK_WAIT_SEC), stale_sec=float(LOCK_STALE_SEC)) as ok:
+                    if not ok:
+                        return
+                    try:
+                        with path.open("a", encoding="utf-8", newline="\n") as handle:
+                            handle.write(line + "\n")
+                            try:
+                                handle.flush()
+                            except Exception:
+                                pass
+                    except Exception:
+                        return
+            else:
+                try:
+                    with path.open("a", encoding="utf-8", newline="\n") as handle:
+                        handle.write(line + "\n")
+                        try:
+                            handle.flush()
+                        except Exception:
+                            pass
+                except Exception:
+                    return
+
+            # Rotate after append so file cannot grow without bound.
+            try:
+                self._rotate_ndjson(path, max_bytes=SIGNALS_MAX_BYTES, backups=SIGNALS_BACKUPS)
+            except Exception:
+                pass
+
+    def logout(self) -> None:
+        self._auto_reconnect_enabled = False
+        self._auto_reconnect_started = False
+        self.stop_listening()
+        self._run_coro(self._logout_async())
+
+    async def _logout_async(self) -> None:
+        # Explicit logout should prevent next-start auto-login.
+        phone_raw = str(self.phone or "")
+        safe_digits = re.sub(r"\D", "", phone_raw)
+        # Session files are keyed by phone digits + api_id to avoid cross-app auth-key reuse.
+        # On explicit logout, we should remove *all* session files for this phone.
+        session_candidates: List[Path] = []
+        if safe_digits:
+            try:
+                # Legacy name (older builds).
+                session_candidates.append(SESSION_DIR / f"session_{safe_digits}.session")
+            except Exception:
+                pass
+            try:
+                session_candidates.extend(list(SESSION_DIR.glob(f"session_{safe_digits}_*.session")))
+            except Exception:
+                pass
+
+        # Best-effort server-side logout when online.
+        if self.client:
+            try:
+                if self.client.is_connected():
+                    await self.client.log_out()
+            except Exception:
+                pass
+
+        await self._destroy_client()
+
+        # Best-effort local session cleanup.
+        try:
+            # Explicit logout is an intentional boundary; safe to remove all
+            # session variants for the current phone.
+            seen: set[str] = set()
+            for base in session_candidates:
+                try:
+                    base_str = str(base)
+                except Exception:
+                    continue
+                if not base_str or base_str in seen:
+                    continue
+                seen.add(base_str)
+
+                for suffix in ("", "-journal", "-wal", "-shm"):
+                    try:
+                        target = Path(base_str + suffix)
+                        if target.exists():
+                            target.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self.api_id = None
+        self.api_hash = None
+        self.phone = None
+        self._message_handlers.clear()
+        self._last_message_ids.clear()
+        self._last_message_text.clear()
+        self._listening_chats.clear()
+
+
+class MainWindow(QtWidgets.QWidget):
+    # Startup gate: emitted exactly once per app launch.
+    boot_resolved = QtCore.pyqtSignal(bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Set very early so any timer/slot can check during shutdown.
+        self._closing: bool = False
+        # Logging / UX flags
+        self._debug_enabled = os.environ.get("FLAMEBOT_DEBUG", "0") == "1"
+        # Global boot state (required): block routing until resolved.
+        self.app_state = {"booting": True, "authenticated": None}
+        self._boot_inflight = False
+        self._boot_resolved = False
+        # Network UX: only show "Connection restored" after a real offline period.
+        self._net_ever_offline = False
+        self._toast_last_msg = ""
+        self._toast_last_ts = 0.0
+        # Startup session reuse: attempt at most once per run.
+        self._startup_auto_login_attempted = False
+        # Offline startup support: allow entering Home while offline if a prior
+        # local Telegram session exists, then authenticate when online returns.
+        self._startup_deferred_auth: bool = False
+        self._startup_deferred_auth_inflight: bool = False
+        self._startup_deferred_auth_last_attempt_monotonic: float = 0.0
+        self._startup_deferred_auth_timeout_timer: Optional[QtCore.QTimer] = None
+        # Group fetch robustness: retry a few times after reconnect.
+        self._groups_retry_count: int = 0
+        self._groups_retry_timer: Optional[QtCore.QTimer] = None
+
+        # Icon cache (reduces repeated pixmap load/scale work when lists rebuild).
+        try:
+            self._icon_cache_max = int(os.environ.get("FLAMEBOT_ICON_CACHE_MAX", "512"))
+        except Exception:
+            self._icon_cache_max = 512
+        try:
+            self._icon_cache: "OrderedDict[Tuple[str, int, int], QtGui.QPixmap]" = OrderedDict()
+        except Exception:
+            self._icon_cache = OrderedDict()
+
+        # Bound in-memory per-chat history to keep RAM stable in long sessions.
+        # Set to 0/negative to disable.
+        try:
+            self._chat_history_max_messages = int(os.environ.get("FLAMEBOT_CHAT_MAX_MESSAGES", "200"))
+        except Exception:
+            self._chat_history_max_messages = 200
+        self.settings = self._load_settings()
+
+        # Durable settings outbox: if settings saves fail due to transient
+        # network issues, keep the latest save payload and retry automatically
+        # when connectivity returns (including across restarts).
+        self._settings_outbox: Dict[str, dict] = {}
+        self._settings_outbox_flush_inflight: bool = False
+        self._settings_outbox_had_items: bool = False
+        self._settings_outbox_save_timer: Optional[QtCore.QTimer] = None
+        self._settings_outbox_retry_timer: Optional[QtCore.QTimer] = None
+        self._load_settings_outbox()
+
+        self.countries = load_countries()
+        self._countries_by_dial = sorted(
+            self.countries, key=lambda c: len(str(c.get("dial_code", ""))), reverse=True
+        )
+        self._current_country: Optional[dict] = None
+        self._suppress_phone_sync = False
+        self._country_dialog_open = False
+        # Platform: "mt4" or "mt5" - determines which backend identity to use
+        self.platform = self.settings.get("platform", PLATFORM)
+        if self.platform not in {"mt4", "mt5"}:
+            self.platform = "mt5"
+        # Do NOT load or persist any local FlameBot ID — backend is authoritative.
+        self._desktop_state = {}
+        self.theme_mode = self.settings.get("theme_mode", "system")
+        self.dark_mode = self._is_dark_mode(self.theme_mode)
+        self.current_group_id: Optional[int] = None
+        self.user_name = "Telegram User"
+        self.user_phone = ""
+        # Platform-specific EA state (MT4 and MT5 are independent)
+        self.ea_states = {
+            "mt4": {"prop": {"ea_active": False}, "normal": {"ea_active": False}},
+            "mt5": {"prop": {"ea_active": False}, "normal": {"ea_active": False}}
+        }
+        self.ea_active = False  # Legacy field - will be set based on selected platform
+        self.telegram_phone = self.settings.get("telegram_phone", "")
+        # Persisted Telegram identity (numeric id) to detect account switches.
+        self._saved_telegram_id = str(self.settings.get("telegram_id", "") or "").strip()
+        # FlameBot IDs and licenses are platform-specific (MT4 vs MT5)
+        # Backend maintains separate identities per platform
+        credentials = self.settings.get("credentials", {})
+        self.flamebot_ids = credentials.get("flamebot_ids", {"mt4": "", "mt5": ""}) or {"mt4": "", "mt5": ""}
+        # Never load or trust licenses from local settings — backend is SOT.
+        self.licenses_by_platform = credentials.get("licenses", {"mt4": {}, "mt5": {}}) or {"mt4": {}, "mt5": {}}
+        # Per-user ingest secret (issued by backend on /register) used to sign Telethon ingest.
+        # Stored per platform for convenience; backend may keep these identical for the same telegram_id.
+        self.telegram_ingest_secrets = credentials.get("telegram_ingest_secrets", {"mt4": "", "mt5": ""}) or {"mt4": "", "mt5": ""}
+        
+        # Detect backend URL change and force credential reset
+        saved_backend_url = self.settings.get("backend_url", "")
+        self.backend_url = BACKEND_BASE_URL  # Always use current backend URL
+        # Entry strategy mode for range signals (default: market_edge)
+        self.entry_mode = self.settings.get("entry_mode", "market_edge")
+        self._saved_entry_mode = self.entry_mode
+        
+        # If backend URL changed, clear all cached credentials (Railway migration scenario)
+        if saved_backend_url and saved_backend_url != self.backend_url:
+            # Maintenance detail (debug only)
+            self._log(f"[STARTUP DEBUG] Server URL changed from {saved_backend_url} to {self.backend_url}")
+            self._log("[STARTUP DEBUG] Clearing cached credentials - fresh registration required")
+            # Force clear ALL platforms (MT4 and MT5)
+            self.flamebot_ids = {"mt4": "", "mt5": ""}
+            self.licenses_by_platform = {"mt4": {}, "mt5": {}}
+            self.telegram_ingest_secrets = {"mt4": "", "mt5": ""}
+            # Clear auth.json files that may contain old credentials
+            try:
+                auth_file = Path("auth.json")
+                if auth_file.exists():
+                    auth_file.unlink()
+                    self._log("[STARTUP DEBUG] Cleared auth.json (old credentials)")
+            except Exception:
+                pass
+            # Immediately save cleared state to settings.json to prevent old values from being loaded
+            try:
+                # Build minimal cleared settings payload
+                cleared_payload = {
+                    "backend_url": self.backend_url,
+                    "platform": self.platform,
+                    "credentials": {
+                        "flamebot_ids": {"mt4": "", "mt5": ""},
+                        "licenses": {"mt4": {}, "mt5": {}},
+                        "telegram_ingest_secrets": {"mt4": "", "mt5": ""},
+                    },
+                    "theme_mode": self.settings.get("theme_mode", "system"),
+                    "api_id": self.settings.get("api_id", ""),
+                    "api_hash": self.settings.get("api_hash", ""),
+                    "telegram_phone": self.settings.get("telegram_phone", ""),
+                    "current_account_type": self.settings.get("current_account_type", "prop"),
+                }
+                ok = False
+                try:
+                    ok = _atomic_write_json(SETTINGS_FILE, cleared_payload)
+                except Exception:
+                    ok = False
+                if not ok:
+                    try:
+                        ok = _atomic_write_json(SETTINGS_FALLBACK_FILE, cleared_payload)
+                    except Exception:
+                        ok = False
+                if ok:
+                    self._log("[STARTUP DEBUG] Saved cleared credentials to settings.json")
+            except Exception as e:
+                # This is user-relevant because it can cause confusion if settings don't reset.
+                self._log(f"⚠️ Failed to reset local settings: {e}")
+        
+        # Shorthand accessors for current platform
+        self.flamebot_id = self.flamebot_ids.get(self.platform, "")
+        self.licenses = self.licenses_by_platform.get(self.platform, {})
+        self.telegram_ingest_secret = str(self.telegram_ingest_secrets.get(self.platform, "") or "").strip()
+        if not self.telegram_ingest_secret:
+            try:
+                # Best-effort fallback: use any known secret.
+                for _p in ("mt4", "mt5"):
+                    v = str(self.telegram_ingest_secrets.get(_p, "") or "").strip()
+                    if v:
+                        self.telegram_ingest_secret = v
+                        break
+            except Exception:
+                pass
+        self.lot_mode = self.settings.get("lot_mode", "default")
+        self.custom_lot = self.settings.get("custom_lot")
+        self.lot_configured = bool(self.settings.get("lot_configured", False))
+        self.symbol_mode = self.settings.get("symbol_mode", "default")
+        self.available_symbols = self.settings.get("available_symbols", []) or []
+        self.symbols_allowed = self.settings.get("symbols_allowed", []) or []
+        self.symbol_configured = bool(self.settings.get("symbol_configured", False))
+        # Track whether the user has made an unsaved selection in the UI.
+        # When True, background polling must not overwrite selection state.
+        self._lot_user_dirty = False
+        self._symbol_user_dirty = False
+        self._trade_control_user_dirty = False
+        self._psl_user_dirty = False
+        # Persisted (last-saved) configuration snapshot from backend/settings.
+        self._saved_lot_mode = self.lot_mode
+        self._saved_custom_lot = self.custom_lot
+        self._saved_lot_configured = self.lot_configured
+        self._saved_symbol_mode = self.symbol_mode
+        self._saved_symbols_allowed = list(self.symbols_allowed)
+        self._saved_symbol_configured = self.symbol_configured
+        self._symbol_list_updating = False
+        self._last_polled_creds: Optional[Tuple[str, str]] = None
+
+        # Async backend polling (prevents UI freezes)
+        self._backend_pool = QtCore.QThreadPool.globalInstance()
+        self._backend_poll_seq = 0
+        self._backend_poll_inflight = False
+
+        # Global connectivity state (ONLINE/OFFLINE/RECONNECTING)
+        self.net_state_mgr = NetworkStateManager(thread_pool=self._backend_pool, parent=self)
+        self.net_state_mgr.stateChanged.connect(self._on_network_state_changed)
+        self.net_state_mgr.start()
+
+        # UX state: auth flows and automatic recovery
+        self._auth_inflight = False
+        self._groups_loaded = False
+        self._pending_register_context: Optional[dict] = None
+        self._backend_register_seq = 0
+        self._backend_register_expected_seq = 0
+        self._backend_register_inflight = False
+
+        # Blocking verification UI overlay (only when verification is needed).
+        self._verification_dialog: Optional[BlockingTelegramVerificationDialog] = None
+        self._verification_blur_effect: Optional[QtWidgets.QGraphicsBlurEffect] = None
+        self._verification_prev_effect: Optional[QtWidgets.QGraphicsEffect] = None
+        self._verification_prev_main_stack_enabled: Optional[bool] = None
+        self._verification_active_context: Optional[dict] = None
+        self._verification_active_seq: int = 0
+        self._verification_user_start_event: Optional[threading.Event] = None
+        self._verification_auto_open_on_challenge: bool = False
+        self._verification_latest_challenge: dict = {"nonce": "", "bot_start_url": "", "expires_in_sec": 0, "seq": 0}
+        self._verification_latest_challenge_lock = threading.Lock()
+        self._backend_register_cancel_event: Optional[threading.Event] = None
+        # Manual symbol refresh (user-initiated fast-path)
+        self._backend_refresh_seq = 0
+        self._backend_refresh_expected_seq = 0
+        self._symbols_refresh_inflight = False
+        # PSL (Per-Symbol Lot) state
+        self.psl_configured = bool(self.settings.get("psl_configured", False))
+        self.per_symbol_lots: Dict[str, float] = self.settings.get("per_symbol_lots", {}) or {}
+        self._saved_psl_configured = self.psl_configured
+        self._saved_per_symbol_lots: Dict[str, float] = dict(self.per_symbol_lots)
+        self.current_account_type = self.settings.get("current_account_type", "prop")
+
+        # Backend record presence per (platform, account_type) context.
+        # Configured labels must not show ✅ unless the backend has a saved record.
+        self._backend_presence_by_context = {
+            "lot": {},
+            "symbol": {},
+            "psl": {},
+        }
+        # Separate edit mode flags for GLS and PSL
+        # While edit mode is ON, background polling must not override UI values.
+        self.gls_edit_mode = False
+        self.psl_edit_mode = False
+        # Which account type is currently active on the EA (source of truth from backend)
+        self._ea_active_account: Optional[str] = None
+        
+        # Telegram Trade Control toggles
+        # Backend is authoritative: default to False until backend hydration.
+        self.allow_message_close = False
+        self.allow_message_breakeven = False
+        self.allow_secure_half = False
+        # Multiple signals per symbol toggle
+        self.allow_multiple_signals_per_symbol = False
+
+        # Time-based Trade Scheduler (broker/server time)
+        # NOTE: Scheduler is mode-independent (applies regardless of GLS/PSL).
+        self.scheduler_active: bool = False
+        self.scheduler_pause_day: Optional[int] = None
+        self.scheduler_pause_time: Optional[str] = None  # "HH:MM"
+        self.scheduler_resume_day: Optional[int] = None
+        self.scheduler_resume_time: Optional[str] = None  # "HH:MM"
+        # Backend snapshots for Trade Control settings (for revert on cancel)
+        self._saved_allow_message_close = self.allow_message_close
+        self._saved_allow_message_breakeven = self.allow_message_breakeven
+        self._saved_allow_secure_half = self.allow_secure_half
+        self._saved_allow_multiple_signals = self.allow_multiple_signals_per_symbol
+
+        # Snapshot Scheduler (mode-independent) so Cancel can revert.
+        try:
+            self._saved_scheduler_active = bool(getattr(self, "scheduler_active", False))
+            self._saved_scheduler_pause_day = getattr(self, "scheduler_pause_day", None)
+            self._saved_scheduler_pause_time = getattr(self, "scheduler_pause_time", None)
+            self._saved_scheduler_resume_day = getattr(self, "scheduler_resume_day", None)
+            self._saved_scheduler_resume_time = getattr(self, "scheduler_resume_time", None)
+        except Exception:
+            pass
+
+        # Backend snapshots for Scheduler settings (for revert on cancel)
+        self._saved_scheduler_active = self.scheduler_active
+        self._saved_scheduler_pause_day = self.scheduler_pause_day
+        self._saved_scheduler_pause_time = self.scheduler_pause_time
+        self._saved_scheduler_resume_day = self.scheduler_resume_day
+        self._saved_scheduler_resume_time = self.scheduler_resume_time
+
+        # === MODE-SCOPED Telegram Trade Control (GLS vs PSL) ===
+        # GLS and PSL must NOT share trade control settings.
+        # We keep the existing single-value fields (allow_message_close, entry_mode, etc.)
+        # as the *currently active mode's* live state, and maintain per-mode storage here.
+        gls_trade = {
+            "allow_message_close": self.allow_message_close,
+            "allow_message_breakeven": self.allow_message_breakeven,
+            "allow_secure_half": self.allow_secure_half,
+            "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+            "entry_mode": self.entry_mode,
+        }
+        psl_trade = {
+            "allow_message_close": False,
+            "allow_message_breakeven": False,
+            "allow_secure_half": False,
+            "allow_multiple_signals_per_symbol": False,
+            "entry_mode": self.settings.get("entry_mode_psl", self.entry_mode),
+        }
+        self._trade_control_by_mode = {"gls": gls_trade, "psl": psl_trade}
+        # Saved snapshots per mode (used for Cancel).
+        self._saved_trade_control_by_mode = {"gls": dict(gls_trade), "psl": dict(psl_trade)}
+        self._apply_theme(self.theme_mode)
+        self.setWindowIcon(QtGui.QIcon(resolve_resource_path("icon.ico")))
+        self.setWindowTitle("FlameBot Telegram Copier")
+        # TelegramWorker supervision: if the worker thread exits unexpectedly,
+        # restart it with backoff so Telegram syncing can't stop silently.
+        self._tg_worker_restart_attempts: int = 0
+        self._tg_worker_started_at_monotonic: float = 0.0
+        self._tg_worker_restart_timer = QtCore.QTimer(self)
+        self._tg_worker_restart_timer.setSingleShot(True)
+        self._tg_worker_restart_timer.timeout.connect(self._restart_telegram_worker_now)
+
+        self.worker = TelegramWorker()
+        self.worker.set_platform(self.platform)  # Pass platform to worker
+        try:
+            self.worker.set_telegram_ingest_secrets(getattr(self, "telegram_ingest_secrets", {"mt4": "", "mt5": ""}))
+        except Exception:
+            pass
+        self.worker.set_registered_platforms(self.flamebot_ids)  # Pass registered platforms
+
+        # Detect thread exit early (even before UI signals are wired).
+        try:
+            self.worker.finished.connect(self._on_telegram_worker_finished, QtCore.Qt.QueuedConnection)
+        except Exception:
+            pass
+
+        self.worker.start()
+        try:
+            self._tg_worker_started_at_monotonic = float(time.monotonic())
+        except Exception:
+            self._tg_worker_started_at_monotonic = 0.0
+        try:
+            self.worker.auto_login_resolved.connect(self._on_startup_auto_login_resolved)
+        except Exception:
+            pass
+        try:
+            # A second handler used for offline-startup deferred auth.
+            self.worker.auto_login_resolved.connect(self._on_deferred_auto_login_resolved)
+        except Exception:
+            pass
+        self.group_states: Dict[int, GroupState] = {}
+        self.group_widgets: Dict[int, dict] = {}
+        self.groups_cache: List[Tuple[str, int, Optional[str]]] = []
+
+        # Fallback: follow local NDJSON writes to keep UI live even if a
+        # cross-thread signal is dropped. No UX change.
+        self._ndjson_follow_offset: int = 0
+        self._ndjson_follow_timer: Optional[QtCore.QTimer] = None
+        self._ndjson_follow_partial: str = ""
+        self._seen_message_keys_by_chat: Dict[int, Tuple[set, deque]] = {}
+        self._build_ui()
+        self._connect_signals()
+        self._init_toast()
+        self._configure_log_scroll()
+        self._apply_runtime_theme()
+        self._apply_saved_credentials()
+        # If this is a public distribution build, prefer managed Telegram API app creds.
+        # This prevents users from entering mismatched API apps and breaking verification.
+        try:
+            self._apply_managed_telegram_app_config()
+        except Exception:
+            pass
+
+        # Restore saved Telegram phone into the login UI (helps auto-login).
+        try:
+            if getattr(self, "telegram_phone", "") and hasattr(self, "phone"):
+                # Preserve any user-typed value if already present.
+                if not str(self.phone.text() or "").strip() or str(self.phone.text()).strip() == "+":
+                    self.phone.setText(str(self.telegram_phone))
+        except Exception:
+            pass
+
+        # Startup boot gating is handled by FlameApp. Do NOT auto-navigate here.
+        
+        # CRITICAL: Force-exit edit mode if EA not active on startup (BEFORE updating UI state)
+        platform = (getattr(self, "platform", None) or "mt5").lower()
+        selected_account = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop")
+        ctx_state = self._get_ea_context_state(platform, selected_account)
+        ea_active = bool(ctx_state.get("ea_active", False))
+        if not ea_active:
+            # Force-exit any edit modes
+            self.gls_edit_mode = False
+            self.psl_edit_mode = False
+        
+        self._update_ea_status_panel()
+        self._update_settings_lock_state()
+        self._update_edit_button_state()
+        self._apply_lot_state_to_ui()
+        self._apply_symbol_state_to_ui()
+        # Persisted status will be initialized when the backend provides
+        # authoritative settings (see `_fetch_symbol_settings`).
+        self._symbols_status_initialized = False
+        self._update_active_profile_label()
+        try:
+            self._render_backend_health_label()
+        except Exception:
+            pass
+        # Update credential labels to show platform-specific values
+        self._update_credential_labels()
+        # Remove any lingering desktop cache file so UI cannot read stale IDs.
+        try:
+            ds = Path("desktop_state.json")
+            if ds.exists():
+                try:
+                    ds.unlink()
+                    self._log("Removed stale desktop_state.json to avoid SOT mismatch")
+                except Exception:
+                    # If deletion fails, ignore — app will not read the file anymore.
+                    pass
+        except Exception:
+            pass
+        # Registration will occur once the Telethon worker emits a real
+        # numeric Telegram ID via `on_user_ready`. Do not call /register
+        # based on stored phone numbers alone.
+        
+        # CRITICAL: Startup logic guards (NEVER poll without both modes)
+        self.user_execution_mode = None  # "gls" | "psl" | None
+        self.user_symbol_mode = None     # "default" | "custom" | None
+        self.user_has_configuration = False  # True only if both modes exist
+
+        # Async user-app-state fetch (non-blocking)
+        self._app_state_seq = 0
+        self._app_state_expected_seq = 0
+        self._app_state_inflight = False
+        self._app_state_started_at = 0.0
+        
+        self.backend_timer = QtCore.QTimer(self)
+        self.backend_timer.setInterval(5000)
+        # Poll MT4 and MT5 continuously once user is logged in.
+        self.backend_timer.timeout.connect(self._poll_backend_state_all_platforms)
+
+        # Poll intervals (seconds) per resource
+        self._poll_intervals: Dict[str, float] = {
+            "ea_status": 10.0,
+            "get_lot_settings": 12.0,
+            "get_symbol_settings": 45.0,
+            "get_psl_settings": 20.0,
+        }
+        self._last_poll_by_platform: Dict[str, Dict[str, float]] = {
+            "mt4": {"ea_status": 0.0, "get_lot_settings": 0.0, "get_symbol_settings": 0.0, "get_psl_settings": 0.0},
+            "mt5": {"ea_status": 0.0, "get_lot_settings": 0.0, "get_symbol_settings": 0.0, "get_psl_settings": 0.0},
+        }
+
+        # Debounce heavy symbol grid rebuilds during window resize.
+        self._symbol_resize_timer = QtCore.QTimer(self)
+        self._symbol_resize_timer.setSingleShot(True)
+        self._symbol_resize_timer.timeout.connect(self._refresh_symbol_list)
+
+        # Debounce symbol filtering during typing (prevents full rebuild per keystroke).
+        self._symbol_filter_timer = QtCore.QTimer(self)
+        self._symbol_filter_timer.setSingleShot(True)
+        self._symbol_filter_timer.timeout.connect(self._refresh_symbol_list)
+
+        # Per-platform backend poll tracking (MT4 and MT5 can poll concurrently)
+        self._backend_poll_inflight_by_platform: Dict[str, bool] = {"mt4": False, "mt5": False}
+        self._backend_poll_expected_seq_by_platform: Dict[str, int] = {"mt4": 0, "mt5": 0}
+        self._backend_poll_pending_auth_by_platform: Dict[str, Optional[dict]] = {"mt4": None, "mt5": None}
+        self._backend_poll_started_meta_by_platform: Dict[str, Tuple[int, float]] = {"mt4": (0, 0.0), "mt5": (0, 0.0)}
+
+        # Cache last poll responses by platform for instant UI refresh on switch.
+        self._cached_poll_responses_by_platform: Dict[str, dict] = {}
+
+        # Backend health tracking (per platform) so repeated poll failures are visible.
+        self._backend_health_by_platform: Dict[str, dict] = {
+            "mt4": {"fail_streak": 0, "last_ok": 0.0, "last_error": ""},
+            "mt5": {"fail_streak": 0, "last_ok": 0.0, "last_error": ""},
+        }
+        self._backend_health_state_by_platform: Dict[str, str] = {"mt4": "unknown", "mt5": "unknown"}
+
+        # Platform-scoped UI state cache and hydration tracking
+        # Each platform owns its own snapshot; switching only swaps the snapshot into view.
+        self._platform_ui_state: Dict[str, dict] = {}
+        # MUST be user-scoped: key is "<platform>:<user_id>".
+        self._platform_settings_hydrated: Dict[str, bool] = {}
+
+        # Track per-context hydration status/timestamps and last known good configured flags
+        self._settings_hydration_pending: Dict[str, bool] = {}
+        self._settings_hydration_started_at: Dict[str, float] = {}
+        self._context_hydrated_at: Dict[str, float] = {}
+        self._last_good_config_by_ctx: Dict[str, dict] = {}
+        self._context_state_by_ctx: Dict[str, dict] = {}
+
+        # Lazy init: timers require a Qt parent.
+        try:
+            self._groups_retry_timer = QtCore.QTimer(self)
+            self._groups_retry_timer.setSingleShot(True)
+            self._groups_retry_timer.timeout.connect(self._retry_groups_fetch)
+        except Exception:
+            self._groups_retry_timer = None
+
+        try:
+            self._startup_deferred_auth_timeout_timer = QtCore.QTimer(self)
+            self._startup_deferred_auth_timeout_timer.setSingleShot(True)
+            self._startup_deferred_auth_timeout_timer.timeout.connect(self._on_deferred_auth_timeout)
+        except Exception:
+            self._startup_deferred_auth_timeout_timer = None
+
+        # Incremental group list build (prevents UI stalls on large dialog lists).
+        try:
+            self._group_build_timer = QtCore.QTimer(self)
+            self._group_build_timer.setSingleShot(True)
+            self._group_build_timer.timeout.connect(self._continue_group_list_build)
+        except Exception:
+            self._group_build_timer = None
+        self._group_build_inflight: bool = False
+        self._group_build_pending_gids: Deque[int] = deque()
+        self._group_build_term: str = ""
+        self._group_build_target_gid: Optional[int] = None
+
+    def _schedule_groups_fetch_retry(self, delay_ms: int = 1500) -> None:
+        try:
+            t = getattr(self, "_groups_retry_timer", None)
+            if t is None:
+                return
+            if t.isActive():
+                return
+        except Exception:
+            return
+
+        try:
+            if int(getattr(self, "_groups_retry_count", 0) or 0) >= 4:
+                return
+        except Exception:
+            return
+
+        try:
+            t.start(max(250, int(delay_ms or 1500)))
+        except Exception:
+            pass
+
+    def _retry_groups_fetch(self) -> None:
+        """Retry Telegram group fetch after reconnect.
+
+        This is intentionally bounded (max 4 attempts) to avoid infinite loops
+        on expired sessions.
+        """
+        try:
+            if not self._is_online():
+                self._schedule_groups_fetch_retry(2500)
+                return
+        except Exception:
+            return
+
+        # Only retry while user is in Home.
+        try:
+            if getattr(self, "main_stack", None) is None or self.main_stack.currentIndex() != 1:
+                return
+        except Exception:
+            return
+
+        try:
+            if bool(getattr(self, "_groups_loaded", False)):
+                return
+        except Exception:
+            return
+
+        try:
+            self._groups_retry_count = int(getattr(self, "_groups_retry_count", 0) or 0) + 1
+        except Exception:
+            self._groups_retry_count = 1
+
+        try:
+            if hasattr(self, "loading_label"):
+                self.loading_label.setVisible(True)
+        except Exception:
+            pass
+
+        try:
+            self.worker.start_auto_reconnect()
+        except Exception:
+            pass
+        try:
+            self.worker.fetch_groups()
+        except Exception:
+            pass
+
+        # Exponential-ish backoff.
+        try:
+            delay = 1500 + (self._groups_retry_count * 1200)
+            self._schedule_groups_fetch_retry(delay)
+        except Exception:
+            pass
+
+    def _maybe_auto_login_startup(self) -> None:
+        """Attempt silent auto-login on startup (session reuse)."""
+        # Deprecated: kept for backwards compatibility but MUST NOT be scheduled.
+        try:
+            if bool(getattr(self, "_startup_auto_login_attempted", False)):
+                return
+        except Exception:
+            pass
+        try:
+            # If user is already in the app, do nothing.
+            if getattr(self, "main_stack", None) and self.main_stack.currentIndex() != 0:
+                return
+        except Exception:
+            pass
+
+        # Only attempt when online to avoid surfacing avoidable errors.
+        try:
+            if not self._is_online():
+                return
+        except Exception:
+            return
+
+        try:
+            api_id_txt = str(self.api_id.text() or "").strip()
+            api_hash = str(self.api_hash.text() or "").strip()
+        except Exception:
+            return
+
+        phone = str(getattr(self, "telegram_phone", "") or "").strip()
+        if not phone:
+            try:
+                phone = str(self.phone.text() or "").strip()
+            except Exception:
+                phone = ""
+
+        if not api_id_txt or not api_hash or not phone:
+            return
+
+        try:
+            api_id = int(api_id_txt)
+        except Exception:
+            return
+
+        try:
+            self._startup_auto_login_attempted = True
+            self.worker.try_auto_login(api_id, api_hash, phone)
+        except Exception:
+            pass
+
+    def resolve_auth_state(self) -> None:
+        """Resolve startup auth BEFORE any navigation.
+
+        This must run before the MainWindow is shown to prevent wizard flicker.
+        """
+        if bool(getattr(self, "_boot_resolved", False)):
+            return
+        if bool(getattr(self, "_boot_inflight", False)):
+            return
+
+        self._boot_inflight = True
+
+        # If we don't have credentials/phone, we cannot auto-auth.
+        try:
+            api_id_txt = str(self.api_id.text() or "").strip()
+            api_hash = str(self.api_hash.text() or "").strip()
+        except Exception:
+            api_id_txt = ""
+            api_hash = ""
+
+        phone = str(getattr(self, "telegram_phone", "") or "").strip()
+        if not phone:
+            try:
+                phone = str(self.phone.text() or "").strip()
+            except Exception:
+                phone = ""
+
+        if not api_id_txt or not api_hash or not phone:
+            self._finish_boot(authenticated=False)
+            return
+
+        try:
+            api_id = int(api_id_txt)
+        except Exception:
+            self._finish_boot(authenticated=False)
+            return
+
+        # If offline but we have a previously saved session, enter Home now
+        # and defer authentication until connectivity returns.
+        try:
+            if not self._is_online():
+                if self._has_local_telegram_session(phone=phone, api_id=api_id):
+                    self._startup_deferred_auth = True
+                    self._finish_boot(authenticated=False)
+                    return
+        except Exception:
+            pass
+
+        # Safety: timeout so boot cannot hang forever.
+        try:
+            if not hasattr(self, "_boot_timeout_timer"):
+                self._boot_timeout_timer = QtCore.QTimer(self)
+                self._boot_timeout_timer.setSingleShot(True)
+                self._boot_timeout_timer.timeout.connect(lambda: self._finish_boot(authenticated=False))
+            self._boot_timeout_timer.start(8000)
+        except Exception:
+            pass
+
+        try:
+            self.worker.try_auto_login(api_id, api_hash, phone)
+        except Exception:
+            self._finish_boot(authenticated=False)
+
+    def _has_local_telegram_session(self, *, phone: str, api_id: int) -> bool:
+        """Best-effort detection of an existing Telethon session file.
+
+        We use this only to decide whether we can safely enter Home while
+        offline and retry authentication later.
+        """
+        try:
+            safe_digits = re.sub(r"\D", "", str(phone or ""))
+        except Exception:
+            safe_digits = ""
+        if not safe_digits:
+            return False
+        try:
+            base = Path(SESSION_DIR)
+        except Exception:
+            return False
+        try:
+            if not base.exists():
+                return False
+        except Exception:
+            return False
+
+        # Current naming includes api_id.
+        try:
+            p1 = base / f"session_{safe_digits}_{int(api_id)}.session"
+            if p1.exists():
+                return True
+        except Exception:
+            pass
+
+        # Backwards compatibility: older builds may have used different names.
+        try:
+            p2 = base / f"session_{safe_digits}.session"
+            if p2.exists():
+                return True
+        except Exception:
+            pass
+        try:
+            # Any session matching this phone digits.
+            for _p in base.glob(f"session_{safe_digits}_*.session"):
+                try:
+                    if _p.is_file():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _on_startup_auto_login_resolved(self, ok: bool) -> None:
+        if bool(getattr(self, "_boot_resolved", False)):
+            return
+        self._finish_boot(authenticated=bool(ok))
+
+    def _finish_boot(self, *, authenticated: bool) -> None:
+        if bool(getattr(self, "_boot_resolved", False)):
+            return
+        self._boot_resolved = True
+        self._boot_inflight = False
+        try:
+            if hasattr(self, "_boot_timeout_timer") and self._boot_timeout_timer.isActive():
+                self._boot_timeout_timer.stop()
+        except Exception:
+            pass
+
+        try:
+            self.app_state["authenticated"] = bool(authenticated)
+            self.app_state["booting"] = False
+        except Exception:
+            pass
+
+        try:
+            self.boot_resolved.emit(bool(authenticated))
+        except Exception:
+            pass
+
+    def decide_initial_route(self) -> None:
+        """Centralized startup route decision (called by FlameApp only)."""
+        authed = bool(getattr(self, "app_state", {}).get("authenticated"))
+        if authed:
+            # Enter Home without rendering wizard first.
+            self.on_logged_in()
+        elif bool(getattr(self, "_startup_deferred_auth", False)):
+            # Offline-startup: enter Home immediately, then authenticate when
+            # connectivity returns.
+            self._enter_home_deferred_startup()
+        else:
+            # Ensure wizard is the only rendered screen on cold start.
+            try:
+                self.main_stack.setCurrentIndex(0)
+            except Exception:
+                pass
+            try:
+                # If Telegram API credentials are managed, skip the now-useless
+                # credentials page entirely (start on phone page).
+                idx = 1 if bool(getattr(self, "_tg_api_managed", False)) else 0
+                self.stack.setCurrentIndex(int(idx))
+            except Exception:
+                pass
+            try:
+                if bool(getattr(self, "_tg_api_managed", False)) and hasattr(self, "subtitle_label"):
+                    self.subtitle_label.setText("Connect your Telegram account in two simple steps.")
+            except Exception:
+                pass
+            try:
+                self.menu_button.hide()
+            except Exception:
+                pass
+
+    def _enter_home_deferred_startup(self) -> None:
+        """Show Home while offline without claiming the user is authenticated."""
+        try:
+            self._set_auth_busy(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "subtitle_label"):
+                self.subtitle_label.setText("Offline — waiting for connection to restore…")
+        except Exception:
+            pass
+        try:
+            self.main_stack.setCurrentIndex(1)
+        except Exception:
+            pass
+        try:
+            self.loading_label.setVisible(True)
+        except Exception:
+            pass
+        try:
+            self._groups_loaded = False
+        except Exception:
+            pass
+        try:
+            self.menu_button.show()
+        except Exception:
+            pass
+        # Keep the rest of the UI consistent with being in Home.
+        try:
+            self.profile_btn.setEnabled(True)
+            self.settings_btn.setEnabled(True)
+            self.subscription_btn.setEnabled(True)
+            self.expert_btn.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            self._show_message_log()
+        except Exception:
+            pass
+
+    def _on_deferred_auth_timeout(self) -> None:
+        """Fail-safe: if deferred silent auth hangs, fall back to the wizard."""
+        try:
+            if not bool(getattr(self, "_startup_deferred_auth_inflight", False)):
+                return
+        except Exception:
+            return
+
+        try:
+            self._startup_deferred_auth_inflight = False
+        except Exception:
+            pass
+        try:
+            self._startup_deferred_auth = False
+        except Exception:
+            pass
+        try:
+            self.app_state["authenticated"] = False
+        except Exception:
+            pass
+        try:
+            self.decide_initial_route()
+        except Exception:
+            pass
+
+    def _attempt_deferred_startup_auth(self) -> None:
+        """When we started in Home while offline, retry silent auth on reconnect."""
+        if not bool(getattr(self, "_startup_deferred_auth", False)):
+            return
+        if bool(getattr(self, "_startup_deferred_auth_inflight", False)):
+            return
+        try:
+            if not self._is_online():
+                return
+        except Exception:
+            return
+
+        # Throttle repeated attempts on flappy networks.
+        try:
+            now = time.monotonic()
+            last = float(getattr(self, "_startup_deferred_auth_last_attempt_monotonic", 0.0) or 0.0)
+            if (now - last) < 3.0:
+                return
+            self._startup_deferred_auth_last_attempt_monotonic = now
+        except Exception:
+            pass
+
+        try:
+            api_id, api_hash = self._get_effective_telegram_api_credentials()
+        except Exception:
+            api_id, api_hash = 0, ""
+
+        phone = str(getattr(self, "telegram_phone", "") or "").strip()
+        if not phone:
+            try:
+                phone = str(self.phone.text() or "").strip()
+            except Exception:
+                phone = ""
+
+        if not api_id or not api_hash or not phone:
+            # Can't retry; drop back to wizard.
+            try:
+                self._startup_deferred_auth = False
+            except Exception:
+                pass
+            try:
+                self.decide_initial_route()
+            except Exception:
+                pass
+            return
+
+        self._startup_deferred_auth_inflight = True
+        try:
+            # Timeout so we can't hang forever if Telegram connect stalls.
+            try:
+                t = getattr(self, "_startup_deferred_auth_timeout_timer", None)
+                if t is not None:
+                    if t.isActive():
+                        t.stop()
+                    t.start(12000)
+            except Exception:
+                pass
+            self.worker.try_auto_login(int(api_id), str(api_hash), str(phone))
+        except Exception:
+            self._startup_deferred_auth_inflight = False
+
+    def _on_deferred_auto_login_resolved(self, ok: bool) -> None:
+        """Handle silent auth result for deferred offline-startup."""
+        if not bool(getattr(self, "_startup_deferred_auth_inflight", False)):
+            return
+        self._startup_deferred_auth_inflight = False
+
+        try:
+            t = getattr(self, "_startup_deferred_auth_timeout_timer", None)
+            if t is not None and t.isActive():
+                t.stop()
+        except Exception:
+            pass
+
+        if bool(ok):
+            # Mark authenticated; keep user in Home and load groups.
+            try:
+                self.app_state["authenticated"] = True
+            except Exception:
+                pass
+            try:
+                self._startup_deferred_auth = False
+            except Exception:
+                pass
+            try:
+                # Reuse the normal online recovery flow (starts auto-reconnect
+                # and fetches groups when needed).
+                self._recover_after_network_return()
+            except Exception:
+                pass
+            # Safety: if groups didn't load (race during reconnect), retry.
+            try:
+                self._groups_retry_count = 0
+            except Exception:
+                pass
+            try:
+                self._schedule_groups_fetch_retry(1200)
+            except Exception:
+                pass
+            return
+
+        # If we failed due to a transient exception (common during network
+        # flaps), stay in Home and retry shortly.
+        try:
+            transient = bool(getattr(self.worker, "_last_auto_login_error_was_exception", False))
+        except Exception:
+            transient = False
+
+        if transient:
+            try:
+                self.app_state["authenticated"] = False
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "subtitle_label"):
+                    self.subtitle_label.setText("Reconnecting — restoring session…")
+            except Exception:
+                pass
+            try:
+                QtCore.QTimer.singleShot(1800, self._attempt_deferred_startup_auth)
+            except Exception:
+                pass
+            return
+
+        # Otherwise: session is not valid; fall back to the login wizard.
+        try:
+            self._startup_deferred_auth = False
+        except Exception:
+            pass
+        try:
+            self.app_state["authenticated"] = False
+        except Exception:
+            pass
+        try:
+            self.decide_initial_route()
+        except Exception:
+            pass
+
+    def _load_settings(self) -> dict:
+        # Prefer the historical local settings.json in CWD, but fall back to the
+        # per-user app directory if CWD is not writable or the file is missing.
+        try:
+            obj = _safe_read_json_dict(SETTINGS_FILE)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+        try:
+            obj2 = _safe_read_json_dict(SETTINGS_FALLBACK_FILE)
+            if isinstance(obj2, dict):
+                return obj2
+        except Exception:
+            pass
+
+        return {}
+
+    def _settings_outbox_key(
+        self,
+        *,
+        platform: Optional[str],
+        account_type: Optional[str],
+        mode: str,
+        flamebot_id: Optional[str],
+    ) -> str:
+        p = self._platform_key(platform)
+        acct = self._normalize_account_type(account_type or getattr(self, "current_account_type", None) or "prop") or "prop"
+        fid = str(flamebot_id or "").strip()
+        m = str(mode or "").strip().lower() or "gls"
+        if m not in {"gls", "psl"}:
+            m = "gls"
+        # Key is user+context scoped to avoid cross-account leakage.
+        return f"{p}:{acct}:{m}:{fid}" if fid else f"{p}:{acct}:{m}:"
+
+    def _settings_outbox_item_matches_current_user(self, item: dict) -> bool:
+        try:
+            platform = str(item.get("platform") or "").lower()
+        except Exception:
+            platform = ""
+        if platform not in {"mt4", "mt5"}:
+            platform = self._platform_key()
+        try:
+            fid = str(item.get("flamebot_id") or "").strip()
+        except Exception:
+            fid = ""
+        if not fid:
+            return False
+        try:
+            current = str((getattr(self, "flamebot_ids", {}) or {}).get(platform, "") or "").strip()
+        except Exception:
+            current = ""
+        if not current and platform == self._platform_key():
+            try:
+                current = str(getattr(self, "flamebot_id", "") or "").strip()
+            except Exception:
+                current = ""
+        return bool(current) and (fid == current)
+
+    def _load_settings_outbox(self) -> None:
+        try:
+            obj = _safe_read_json_dict(Path(SETTINGS_OUTBOX_FILE))
+        except Exception:
+            obj = None
+        if not isinstance(obj, dict):
+            return
+        items = obj.get("items")
+        if not isinstance(items, dict):
+            return
+        cleaned: Dict[str, dict] = {}
+        for k, v in items.items():
+            if not isinstance(k, str) or not k.strip():
+                continue
+            if not isinstance(v, dict):
+                continue
+            posts = v.get("posts")
+            if not isinstance(posts, list) or not posts:
+                continue
+            ok_posts: List[dict] = []
+            for p in posts:
+                if not isinstance(p, dict):
+                    continue
+                ep = p.get("endpoint")
+                payload = p.get("payload")
+                if not isinstance(ep, str) or not ep.strip():
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                ok_posts.append({"endpoint": ep.strip(), "payload": dict(payload)})
+            if not ok_posts:
+                continue
+            v2 = dict(v)
+            v2["posts"] = ok_posts
+            cleaned[k.strip()] = v2
+        self._settings_outbox = cleaned
+        try:
+            self._settings_outbox_had_items = bool(cleaned)
+        except Exception:
+            pass
+
+    def _ensure_settings_outbox_timers(self) -> None:
+        if getattr(self, "_settings_outbox_save_timer", None) is None:
+            t = QtCore.QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._persist_settings_outbox_now)
+            self._settings_outbox_save_timer = t
+        if getattr(self, "_settings_outbox_retry_timer", None) is None:
+            t2 = QtCore.QTimer(self)
+            t2.setSingleShot(True)
+            t2.timeout.connect(self._maybe_flush_settings_outbox)
+            self._settings_outbox_retry_timer = t2
+
+    def _schedule_settings_outbox_persist(self) -> None:
+        self._ensure_settings_outbox_timers()
+        try:
+            if self._settings_outbox_save_timer is not None and not self._settings_outbox_save_timer.isActive():
+                self._settings_outbox_save_timer.start(1250)
+        except Exception:
+            pass
+
+    def _persist_settings_outbox_now(self) -> None:
+        payload = {
+            "version": 1,
+            "updated_at": int(time.time()),
+            "items": dict(getattr(self, "_settings_outbox", {}) or {}),
+        }
+        try:
+            p = Path(SETTINGS_OUTBOX_FILE)
+        except Exception:
+            return
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            _atomic_write_json(p, payload)
+        except Exception:
+            pass
+
+    def _note_settings_outbox_item(
+        self,
+        *,
+        platform: str,
+        account_type: str,
+        mode: str,
+        flamebot_id: str,
+        posts: List[Tuple[str, dict]],
+        attempts: int,
+        not_before: float,
+        last_error: str = "",
+    ) -> str:
+        key = self._settings_outbox_key(
+            platform=platform,
+            account_type=account_type,
+            mode=mode,
+            flamebot_id=flamebot_id,
+        )
+        now = int(time.time())
+        try:
+            existing = self._settings_outbox.get(key)
+        except Exception:
+            existing = None
+        created_at = None
+        if isinstance(existing, dict):
+            created_at = existing.get("created_at")
+        if not isinstance(created_at, int) or created_at <= 0:
+            created_at = now
+        self._settings_outbox[key] = {
+            "platform": str(platform or "mt5").lower(),
+            "account_type": str(account_type or "prop").lower(),
+            "mode": str(mode or "gls").lower(),
+            "flamebot_id": str(flamebot_id or "").strip(),
+            "posts": [{"endpoint": ep, "payload": dict(payload or {})} for ep, payload in (posts or [])],
+            "attempts": int(max(0, attempts)),
+            "not_before": float(max(0.0, not_before)),
+            "last_error": str(last_error or ""),
+            "created_at": int(created_at),
+            "updated_at": int(now),
+        }
+        self._schedule_settings_outbox_persist()
+        try:
+            self._settings_outbox_had_items = True
+        except Exception:
+            pass
+        return key
+
+    def _enqueue_settings_outbox(
+        self,
+        *,
+        mode: str,
+        posts: List[Tuple[str, dict]],
+        toast: bool = True,
+    ) -> None:
+        try:
+            if not posts:
+                return
+        except Exception:
+            return
+
+        # Pull context metadata from the first post's payload.
+        first_payload: dict = {}
+        try:
+            first_payload = dict((posts[0] or ("", {}))[1] or {})
+        except Exception:
+            first_payload = {}
+        platform = str(first_payload.get("platform") or getattr(self, "platform", "mt5") or "mt5").lower()
+        if platform not in {"mt4", "mt5"}:
+            platform = "mt5"
+        account_type = self._normalize_account_type(first_payload.get("account_type") or getattr(self, "current_account_type", None) or "prop") or "prop"
+        flamebot_id = str(first_payload.get("flamebot_id") or getattr(self, "flamebot_id", "") or "").strip()
+        if not flamebot_id:
+            # Without a user id we cannot safely replay.
+            return
+
+        self._note_settings_outbox_item(
+            platform=platform,
+            account_type=account_type,
+            mode=str(mode or "gls").lower(),
+            flamebot_id=flamebot_id,
+            posts=posts,
+            attempts=0,
+            not_before=0.0,
+            last_error="",
+        )
+
+        if toast:
+            try:
+                self._show_toast("💾 Saved locally (syncing when online)", duration_ms=3500)
+            except Exception:
+                pass
+
+        # If already online, attempt to flush immediately.
+        try:
+            if self._is_online():
+                self._maybe_flush_settings_outbox()
+        except Exception:
+            pass
+
+    def _schedule_settings_outbox_retry(self) -> None:
+        self._ensure_settings_outbox_timers()
+        if not bool(getattr(self, "_settings_outbox", {}) or {}):
+            return
+        try:
+            if not self._is_online():
+                return
+        except Exception:
+            return
+
+        now = time.time()
+        earliest: Optional[float] = None
+        try:
+            for item in (getattr(self, "_settings_outbox", {}) or {}).values():
+                if not isinstance(item, dict):
+                    continue
+                if not self._settings_outbox_item_matches_current_user(item):
+                    continue
+                try:
+                    nb = float(item.get("not_before") or 0.0)
+                except Exception:
+                    nb = 0.0
+                if earliest is None or nb < earliest:
+                    earliest = nb
+        except Exception:
+            earliest = None
+        if earliest is None:
+            return
+        delay_ms = int(max(0.0, (earliest - now)) * 1000)
+        delay_ms = max(250, min(delay_ms, 5 * 60 * 1000))
+        try:
+            if self._settings_outbox_retry_timer is not None:
+                self._settings_outbox_retry_timer.start(delay_ms)
+        except Exception:
+            pass
+
+    def _maybe_flush_settings_outbox(self) -> None:
+        try:
+            if not self._is_online():
+                return
+        except Exception:
+            return
+        try:
+            if bool(getattr(self, "_closing", False)):
+                return
+        except Exception:
+            pass
+        if bool(getattr(self, "_settings_outbox_flush_inflight", False)):
+            return
+        if not bool(getattr(self, "_settings_outbox", {}) or {}):
+            return
+
+        now = time.time()
+        next_key: Optional[str] = None
+        next_not_before: Optional[float] = None
+
+        try:
+            for k, item in (getattr(self, "_settings_outbox", {}) or {}).items():
+                if not isinstance(k, str) or not isinstance(item, dict):
+                    continue
+                if not self._settings_outbox_item_matches_current_user(item):
+                    continue
+                try:
+                    nb = float(item.get("not_before") or 0.0)
+                except Exception:
+                    nb = 0.0
+                if next_not_before is None or nb < next_not_before:
+                    next_not_before = nb
+                    next_key = k
+        except Exception:
+            next_key = None
+            next_not_before = None
+
+        if not next_key:
+            return
+
+        if next_not_before is not None and next_not_before > now:
+            self._schedule_settings_outbox_retry()
+            return
+
+        item = (getattr(self, "_settings_outbox", {}) or {}).get(next_key)
+        if not isinstance(item, dict):
+            return
+        posts_raw = item.get("posts")
+        if not isinstance(posts_raw, list) or not posts_raw:
+            try:
+                self._settings_outbox.pop(next_key, None)
+            except Exception:
+                pass
+            self._schedule_settings_outbox_persist()
+            return
+        posts: List[Tuple[str, dict]] = []
+        for p in posts_raw:
+            if not isinstance(p, dict):
+                continue
+            ep = p.get("endpoint")
+            payload = p.get("payload")
+            if not isinstance(ep, str) or not ep.strip() or not isinstance(payload, dict):
+                continue
+            posts.append((ep.strip(), dict(payload)))
+        if not posts:
+            try:
+                self._settings_outbox.pop(next_key, None)
+            except Exception:
+                pass
+            self._schedule_settings_outbox_persist()
+            return
+
+        try:
+            backend_url = str(getattr(self, "backend_url", "") or "").strip()
+        except Exception:
+            backend_url = ""
+        if not backend_url:
+            self._schedule_settings_outbox_retry()
+            return
+
+        self._settings_outbox_flush_inflight = True
+        try:
+            self._backend_poll_seq += 1
+            seq = self._backend_poll_seq
+        except Exception:
+            seq = int(time.time())
+
+        task = _BackendMultiPostTask(seq, backend_url, posts=posts, timeout=DEFAULT_HTTP_TIMEOUT)
+        task.signals.finished.connect(lambda s, results, key=next_key: self._on_settings_outbox_flush_finished(key, s, results))
+        task.signals.error.connect(lambda s, msg, key=next_key: self._on_settings_outbox_flush_error(key, s, msg))
+        try:
+            self._backend_pool.start(task)
+        except Exception:
+            self._settings_outbox_flush_inflight = False
+            self._schedule_settings_outbox_retry()
+
+    def _on_settings_outbox_flush_error(self, key: str, seq: int, message: str) -> None:
+        self._settings_outbox_flush_inflight = False
+        item = (getattr(self, "_settings_outbox", {}) or {}).get(key)
+        if not isinstance(item, dict):
+            return
+        try:
+            attempts = int(item.get("attempts") or 0) + 1
+        except Exception:
+            attempts = 1
+        # Exponential backoff capped.
+        delay_sec = min(300.0, float(max(2.0, (2 ** min(6, attempts)))))
+        try:
+            item["attempts"] = attempts
+            item["last_error"] = str(message or "")
+            item["not_before"] = float(time.time() + delay_sec)
+            item["updated_at"] = int(time.time())
+        except Exception:
+            pass
+        self._schedule_settings_outbox_persist()
+        self._schedule_settings_outbox_retry()
+
+    def _on_settings_outbox_flush_finished(self, key: str, seq: int, results: dict) -> None:
+        self._settings_outbox_flush_inflight = False
+        item = (getattr(self, "_settings_outbox", {}) or {}).get(key)
+        if not isinstance(item, dict):
+            return
+
+        ok = True
+        fail_msg = ""
+        try:
+            for ep, resp in (results or {}).items():
+                if not isinstance(resp, dict):
+                    ok = False
+                    fail_msg = f"{ep}: no response"
+                    break
+                st = str(resp.get("status") or "").upper()
+                if st != "OK":
+                    ok = False
+                    fail_msg = str(resp.get("message") or "")
+                    break
+        except Exception:
+            ok = False
+            fail_msg = "sync failed"
+
+        if ok:
+            try:
+                self._settings_outbox.pop(key, None)
+            except Exception:
+                pass
+            self._schedule_settings_outbox_persist()
+
+            # Continue flushing remaining items.
+            try:
+                if bool(getattr(self, "_settings_outbox", {}) or {}):
+                    self._maybe_flush_settings_outbox()
+                else:
+                    if bool(getattr(self, "_settings_outbox_had_items", False)):
+                        self._settings_outbox_had_items = False
+                        try:
+                            self._show_toast("✅ Pending settings synced", duration_ms=2000)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            return
+
+        # Failure: reschedule with backoff.
+        try:
+            attempts = int(item.get("attempts") or 0) + 1
+        except Exception:
+            attempts = 1
+        delay_sec = min(300.0, float(max(2.0, (2 ** min(6, attempts)))))
+        try:
+            item["attempts"] = attempts
+            item["last_error"] = str(fail_msg or "")
+            item["not_before"] = float(time.time() + delay_sec)
+            item["updated_at"] = int(time.time())
+        except Exception:
+            pass
+        self._schedule_settings_outbox_persist()
+        self._schedule_settings_outbox_retry()
+
+    def _context_key(self, platform: Optional[str] = None, account_type: Optional[str] = None) -> str:
+        platform_key = (platform or getattr(self, "platform", None) or "mt5").lower()
+        if platform_key not in {"mt4", "mt5"}:
+            platform_key = "mt5"
+        acct = self._normalize_account_type(
+            account_type if account_type is not None else getattr(self, "current_account_type", None) or "prop"
+        ) or "prop"
+        return f"{platform_key}:{acct}"
+
+    def _platform_key(self, platform: Optional[str] = None) -> str:
+        key = (platform or getattr(self, "platform", None) or "mt5").lower()
+        return key if key in {"mt4", "mt5"} else "mt5"
+
+    def _platform_user_key(self, platform: Optional[str] = None, flamebot_id: Optional[str] = None) -> str:
+        """Return a user-scoped cache key.
+
+        IMPORTANT: All UI caches/snapshots/hydration flags MUST be keyed by the
+        current user_id to prevent cross-account leakage when switching logins.
+        """
+        p = self._platform_key(platform)
+        fid = (flamebot_id or "").strip()
+        if not fid:
+            try:
+                fid = str((getattr(self, "flamebot_ids", {}) or {}).get(p, "") or "").strip()
+            except Exception:
+                fid = ""
+        if not fid:
+            try:
+                fid = str(getattr(self, "flamebot_id", "") or "").strip() if p == self._platform_key() else ""
+            except Exception:
+                fid = ""
+        return f"{p}:{fid}" if fid else f"{p}:"
+
+    def _snapshot_platform_ui_state(self, platform: Optional[str] = None) -> None:
+        """Capture the current UI state for a platform to allow instant restore on switch."""
+        key = self._platform_user_key(platform)
+        if key.endswith(":"):
+            return
+        try:
+            ctx = None
+            try:
+                ctx = self._context_key(platform)
+            except Exception:
+                ctx = None
+            presence = {"lot": False, "symbol": False, "psl": False}
+            try:
+                if ctx:
+                    presence = {
+                        "lot": bool(getattr(self, "_backend_presence_by_context", {}).get("lot", {}).get(ctx, False)),
+                        "symbol": bool(getattr(self, "_backend_presence_by_context", {}).get("symbol", {}).get(ctx, False)),
+                        "psl": bool(getattr(self, "_backend_presence_by_context", {}).get("psl", {}).get(ctx, False)),
+                    }
+            except Exception:
+                presence = {"lot": False, "symbol": False, "psl": False}
+
+            self._platform_ui_state[key] = {
+                "lot_mode": getattr(self, "lot_mode", "default"),
+                "custom_lot": getattr(self, "custom_lot", None),
+                "lot_configured": bool(getattr(self, "lot_configured", False)),
+                "_saved_lot_mode": getattr(self, "_saved_lot_mode", "default"),
+                "_saved_custom_lot": getattr(self, "_saved_custom_lot", None),
+                "_saved_lot_configured": bool(getattr(self, "_saved_lot_configured", False)),
+                "symbol_mode": getattr(self, "symbol_mode", "default"),
+                "available_symbols": list(getattr(self, "available_symbols", []) or []),
+                "symbols_allowed": list(getattr(self, "symbols_allowed", []) or []),
+                "symbol_configured": bool(getattr(self, "symbol_configured", False)),
+                "_saved_symbol_mode": getattr(self, "_saved_symbol_mode", "default"),
+                "_saved_symbols_allowed": list(getattr(self, "_saved_symbols_allowed", []) or []),
+                "_saved_symbol_configured": bool(getattr(self, "_saved_symbol_configured", False)),
+                "psl_configured": bool(getattr(self, "psl_configured", False)),
+                "per_symbol_lots": dict(getattr(self, "per_symbol_lots", {}) or {}),
+                "_saved_psl_configured": bool(getattr(self, "_saved_psl_configured", False)),
+                "_saved_per_symbol_lots": dict(getattr(self, "_saved_per_symbol_lots", {}) or {}),
+                "allow_message_close": bool(getattr(self, "allow_message_close", False)),
+                "allow_message_breakeven": bool(getattr(self, "allow_message_breakeven", False)),
+                "allow_secure_half": bool(getattr(self, "allow_secure_half", False)),
+                "allow_multiple_signals_per_symbol": bool(getattr(self, "allow_multiple_signals_per_symbol", False)),
+                "entry_mode": getattr(self, "entry_mode", None),
+                "_saved_entry_mode": getattr(self, "_saved_entry_mode", None),
+                "_trade_control_by_mode": copy.deepcopy(getattr(self, "_trade_control_by_mode", {})),
+                "_saved_trade_control_by_mode": copy.deepcopy(getattr(self, "_saved_trade_control_by_mode", {})),
+                "_backend_presence": presence,
+            }
+        except Exception:
+            pass
+
+    def _restore_platform_ui_state(self, platform: Optional[str] = None) -> bool:
+        """Restore UI state for a platform from cached snapshot. Returns True if restored."""
+        key = self._platform_user_key(platform)
+        if key.endswith(":"):
+            return False
+        snap = getattr(self, "_platform_ui_state", {}).get(key)
+        if not snap:
+            return False
+        try:
+            self.lot_mode = snap.get("lot_mode", "default")
+            self.custom_lot = snap.get("custom_lot")
+            self.lot_configured = bool(snap.get("lot_configured", False))
+            self._saved_lot_mode = snap.get("_saved_lot_mode", "default")
+            self._saved_custom_lot = snap.get("_saved_custom_lot")
+            self._saved_lot_configured = bool(snap.get("_saved_lot_configured", False))
+
+            self.symbol_mode = snap.get("symbol_mode", "default")
+            self.available_symbols = list(snap.get("available_symbols", []) or [])
+            self.symbols_allowed = list(snap.get("symbols_allowed", []) or [])
+            self.symbol_configured = bool(snap.get("symbol_configured", False))
+            self._saved_symbol_mode = snap.get("_saved_symbol_mode", "default")
+            self._saved_symbols_allowed = list(snap.get("_saved_symbols_allowed", []) or [])
+            self._saved_symbol_configured = bool(snap.get("_saved_symbol_configured", False))
+
+            self.psl_configured = bool(snap.get("psl_configured", False))
+            self.per_symbol_lots = dict(snap.get("per_symbol_lots", {}) or {})
+            self._saved_psl_configured = bool(snap.get("_saved_psl_configured", False))
+            self._saved_per_symbol_lots = dict(snap.get("_saved_per_symbol_lots", {}) or {})
+
+            self.allow_message_close = bool(snap.get("allow_message_close", False))
+            self.allow_message_breakeven = bool(snap.get("allow_message_breakeven", False))
+            self.allow_secure_half = bool(snap.get("allow_secure_half", False))
+            self.allow_multiple_signals_per_symbol = bool(snap.get("allow_multiple_signals_per_symbol", False))
+            self.entry_mode = snap.get("entry_mode", self.entry_mode)
+            self._saved_entry_mode = snap.get("_saved_entry_mode", self._saved_entry_mode)
+
+            self._trade_control_by_mode = copy.deepcopy(snap.get("_trade_control_by_mode", {}))
+            self._saved_trade_control_by_mode = copy.deepcopy(snap.get("_saved_trade_control_by_mode", {}))
+
+            # Restore backend presence flags for this context so configured labels remain stable
+            try:
+                ctx = self._context_key(platform)
+                presence = snap.get("_backend_presence", {}) or {}
+                if ctx:
+                    self._backend_presence_by_context.setdefault("lot", {})[ctx] = bool(presence.get("lot", False))
+                    self._backend_presence_by_context.setdefault("symbol", {})[ctx] = bool(presence.get("symbol", False))
+                    self._backend_presence_by_context.setdefault("psl", {})[ctx] = bool(presence.get("psl", False))
+            except Exception:
+                pass
+        except Exception:
+            return False
+
+        try:
+            self._apply_lot_state_to_ui()
+            self._apply_symbol_state_to_ui()
+            self._apply_trade_control_state_to_ui()
+            if hasattr(self, "psl_panel") and self.psl_panel.isVisible() and not getattr(self, "psl_edit_mode", False):
+                self._refresh_psl_list()
+            self._update_symbols_status()
+            # Immediately re-snapshot to ensure the platform always retains a cached view
+            self._snapshot_platform_ui_state(platform)
+        except Exception:
+            pass
+        return True
+
+    def _save_settings(self, immediate: bool = False) -> None:
+        """Persist settings to disk.
+
+        Debounced by default to avoid UI freezes when called frequently
+        (e.g., on message events, group search, and small UI toggles).
+        """
+        # Sync current platform's credentials back to dictionaries
+        self.flamebot_ids[self.platform] = self.flamebot_id
+        self.licenses_by_platform[self.platform] = self.licenses
+
+        # Mark dirty and debounce the actual disk write.
+        try:
+            self._settings_dirty = True
+        except Exception:
+            pass
+
+        if not hasattr(self, "_settings_save_timer"):
+            try:
+                self._settings_save_timer = QtCore.QTimer(self)
+                self._settings_save_timer.setSingleShot(True)
+                self._settings_save_timer.setInterval(250)
+                self._settings_save_timer.timeout.connect(self._flush_settings_to_disk)
+            except Exception:
+                self._settings_save_timer = None
+
+        # Coalesce frequent calls; still allow forced flush for critical moments.
+        if immediate:
+            try:
+                self._flush_settings_to_disk()
+            except Exception:
+                pass
+            return
+        try:
+            if self._settings_save_timer:
+                self._settings_save_timer.start()
+        except Exception:
+            # Fallback: write immediately
+            try:
+                self._flush_settings_to_disk()
+            except Exception:
+                pass
+
+    def _flush_settings_to_disk(self) -> None:
+        try:
+            if not getattr(self, "_settings_dirty", False):
+                return
+        except Exception:
+            pass
+
+        # If Telegram API credentials are managed (telegram_app.json), do not
+        # persist them in settings.json.
+        try:
+            tg_managed = bool(getattr(self, "_tg_api_managed", False))
+        except Exception:
+            tg_managed = False
+
+        payload = {
+            "last_group_id": self.current_group_id,
+            "listening_ids": [
+                gid for gid, state in self.group_states.items() if state.listening
+            ],
+            "unread": {gid: state.unread for gid, state in self.group_states.items()},
+            "api_id": "" if tg_managed else self.api_id.text().strip(),
+            # SECURITY: avoid storing raw Telegram API hash in plaintext.
+            "api_hash": "" if tg_managed else _dpapi_protect_string(self.api_hash.text().strip()),
+            "theme_mode": self.theme_mode,
+            "platform": self.platform,
+            "ea_active": self.ea_active,
+            # Numeric Telegram user id (stable) for account-switch detection.
+            "telegram_id": str(getattr(self, "telegram_id", "") or "").strip(),
+            "credentials": {
+                "flamebot_ids": self.flamebot_ids,
+                "licenses": self.licenses_by_platform,
+                "telegram_ingest_secrets": getattr(self, "telegram_ingest_secrets", {"mt4": "", "mt5": ""}),
+            },
+            "telegram_phone": self.telegram_phone,
+            "current_account_type": self.current_account_type,
+            "backend_url": self.backend_url,
+            "lot_mode": self.lot_mode,
+            "custom_lot": self.custom_lot,
+            "lot_configured": self.lot_configured,
+            "symbol_mode": self.symbol_mode,
+            "available_symbols": self.available_symbols,
+            "symbols_allowed": self.symbols_allowed,
+            "symbol_configured": self.symbol_configured,
+            "allow_message_close": self.allow_message_close,
+            "allow_message_breakeven": self.allow_message_breakeven,
+            "allow_secure_half": self.allow_secure_half,
+            "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+            "scheduler_active": bool(getattr(self, "scheduler_active", False)),
+            "scheduler_pause_day": getattr(self, "scheduler_pause_day", None),
+            "scheduler_pause_time": self._hhmm_payload_value(getattr(self, "scheduler_pause_time", None)),
+            "scheduler_resume_day": getattr(self, "scheduler_resume_day", None),
+            "scheduler_resume_time": self._hhmm_payload_value(getattr(self, "scheduler_resume_time", None)),
+            # Mode-scoped Trade Control persistence (GLS vs PSL must be independent)
+            "allow_message_close_gls": bool(self._trade_control_by_mode.get("gls", {}).get("allow_message_close", False)) if hasattr(self, "_trade_control_by_mode") else self.allow_message_close,
+            "allow_message_breakeven_gls": bool(self._trade_control_by_mode.get("gls", {}).get("allow_message_breakeven", False)) if hasattr(self, "_trade_control_by_mode") else self.allow_message_breakeven,
+            "allow_secure_half_gls": bool(self._trade_control_by_mode.get("gls", {}).get("allow_secure_half", False)) if hasattr(self, "_trade_control_by_mode") else self.allow_secure_half,
+            "allow_multiple_signals_per_symbol_gls": bool(self._trade_control_by_mode.get("gls", {}).get("allow_multiple_signals_per_symbol", False)) if hasattr(self, "_trade_control_by_mode") else self.allow_multiple_signals_per_symbol,
+            "entry_mode_gls": (self._trade_control_by_mode.get("gls", {}).get("entry_mode") if hasattr(self, "_trade_control_by_mode") else self.entry_mode),
+
+            "allow_message_close_psl": bool(self._trade_control_by_mode.get("psl", {}).get("allow_message_close", False)) if hasattr(self, "_trade_control_by_mode") else self.allow_message_close,
+            "allow_message_breakeven_psl": bool(self._trade_control_by_mode.get("psl", {}).get("allow_message_breakeven", False)) if hasattr(self, "_trade_control_by_mode") else self.allow_message_breakeven,
+            "allow_secure_half_psl": bool(self._trade_control_by_mode.get("psl", {}).get("allow_secure_half", False)) if hasattr(self, "_trade_control_by_mode") else self.allow_secure_half,
+            "allow_multiple_signals_per_symbol_psl": bool(self._trade_control_by_mode.get("psl", {}).get("allow_multiple_signals_per_symbol", False)) if hasattr(self, "_trade_control_by_mode") else self.allow_multiple_signals_per_symbol,
+            "entry_mode_psl": (self._trade_control_by_mode.get("psl", {}).get("entry_mode") if hasattr(self, "_trade_control_by_mode") else self.entry_mode),
+        }
+        ok = False
+        try:
+            ok = _atomic_write_json(SETTINGS_FILE, payload)
+        except Exception:
+            ok = False
+
+        # If CWD is not writable (common for installed apps), fall back to a
+        # per-user path under SESSION_DIR.
+        if not ok:
+            try:
+                ok = _atomic_write_json(SETTINGS_FALLBACK_FILE, payload)
+            except Exception:
+                ok = False
+
+        if ok:
+            try:
+                self._settings_dirty = False
+            except Exception:
+                pass
+
+    def _apply_saved_credentials(self) -> None:
+        saved_id = str(self.settings.get("api_id", ""))
+        saved_hash = _dpapi_unprotect_string(self.settings.get("api_hash", ""))
+        if saved_id:
+            self.api_id.setText(saved_id)
+        if saved_hash:
+            self.api_hash.setText(saved_hash)
+        self._update_api_next_state()
+
+    def _get_effective_telegram_api_credentials(self) -> Tuple[int, str]:
+        """Return API credentials to use for Telegram login.
+
+        If managed creds exist (telegram_app.json or dev env override), they are
+        always preferred to avoid server verification mismatch.
+        """
+        try:
+            mid, mhash, _src = _get_managed_telegram_app_credentials()
+        except Exception:
+            mid, mhash = 0, ""
+        if int(mid or 0) > 0 and str(mhash or "").strip():
+            return int(mid), str(mhash).strip()
+
+        api_id_txt = str(self.api_id.text() or "").strip()
+        api_hash_txt = str(self.api_hash.text() or "").strip()
+        return int(api_id_txt), api_hash_txt
+
+    def _apply_managed_telegram_app_config(self) -> None:
+        """Apply managed Telegram API creds to UI and wizard flow."""
+        api_id, api_hash, _src = _get_managed_telegram_app_credentials()
+        managed = bool(int(api_id or 0) > 0 and str(api_hash or "").strip())
+        self._tg_api_managed = managed
+        if not managed:
+            return
+
+        # Force values into inputs so all existing logic (auto-login, etc.) keeps working.
+        try:
+            self.api_id.setText(str(int(api_id)))
+        except Exception:
+            pass
+        try:
+            self.api_hash.setText(str(api_hash).strip())
+        except Exception:
+            pass
+
+        # Disable and hide the inputs so public users cannot edit them.
+        try:
+            self.api_id.setEnabled(False)
+            self.api_hash.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.api_id.hide()
+            self.api_hash.hide()
+        except Exception:
+            pass
+
+        # Update step text to remove the credentials step.
+        try:
+            if hasattr(self, "subtitle_label"):
+                self.subtitle_label.setText("Connect your Telegram account in two simple steps.")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "api_info_label"):
+                self.api_info_label.setText("Telegram API credentials are managed by FlameBot.")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "phone_info_label"):
+                self.phone_info_label.setText("Step 1 of 2 • Confirm your country and enter your phone number.")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "code_info_label"):
+                self.code_info_label.setText(
+                    "Step 2 of 2 • Enter the login code from Telegram.\n"
+                    "If your account has 2FA, you can also enter your password."
+                )
+        except Exception:
+            pass
+
+        # Skip directly to the phone page.
+        try:
+            self.stack.setCurrentIndex(1)
+        except Exception:
+            pass
+
+        # Remove navigation to the (now unused) credentials page.
+        try:
+            if hasattr(self, "btn_phone_back"):
+                self.btn_phone_back.hide()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "btn_api_next"):
+                self.btn_api_next.hide()
+        except Exception:
+            pass
+
+        # Ensure wizard buttons are in a consistent state.
+        try:
+            self.btn_api_next.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            self._update_api_next_state()
+        except Exception:
+            pass
+    def _is_dark_mode(self, mode: str) -> bool:
+        if mode == "dark":
+            return True
+        if mode == "light":
+            return False
+        return is_windows_dark_mode()
+
+    def _apply_theme(self, mode: str) -> None:
+        self.theme_mode = mode
+        self.dark_mode = self._is_dark_mode(mode)
+
+        # Smooth the visual transition so the UI doesn't feel "flashy".
+        self._animate_theme_transition(self.dark_mode)
+
+        app = QtWidgets.QApplication.instance()
+        if app:
+            app.setStyleSheet(DARK_STYLE if self.dark_mode else LIGHT_STYLE)
+        set_windows_native_titlebar_dark(self, self.dark_mode)
+        self._apply_runtime_theme()
+
+    def _animate_theme_transition(self, dark_mode: bool) -> None:
+        """A small fade overlay to make theme changes feel intentional."""
+        try:
+            overlay = getattr(self, "_theme_fade_overlay", None)
+            effect = getattr(self, "_theme_fade_effect", None)
+            if overlay is None:
+                overlay = QtWidgets.QWidget(self)
+                overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+                overlay.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+                overlay.hide()
+                effect = QtWidgets.QGraphicsOpacityEffect(overlay)
+                overlay.setGraphicsEffect(effect)
+                self._theme_fade_overlay = overlay
+                self._theme_fade_effect = effect
+
+            overlay.setGeometry(self.rect())
+            overlay.raise_()
+            overlay.setStyleSheet(
+                f"background-color: {'#101015' if dark_mode else '#f4f5f8'};"
+            )
+            if effect is None:
+                return
+            effect.setOpacity(1.0)
+            overlay.show()
+
+            anim = QtCore.QPropertyAnimation(effect, b"opacity", overlay)
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setDuration(220)
+            anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+            anim.finished.connect(overlay.hide)
+            anim.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
+        except Exception:
+            pass
+
+    def _apply_runtime_theme(self) -> None:
+        """Apply per-widget styles that aren't covered by the global stylesheet."""
+        try:
+            # Message Log uses its own stylesheet; keep it in sync.
+            if hasattr(self, "log") and isinstance(getattr(self, "log"), MessageLogWidget):
+                self.log.set_theme(self.dark_mode)
+
+            # Drawer + overlay are currently hardcoded dark; provide a light variant.
+            if hasattr(self, "drawer"):
+                if self.dark_mode:
+                    self.drawer.setStyleSheet(
+                        """
+                        QFrame {
+                            background-color: #1b1e23;
+                            color: #f5f5f5;
+                            border-top-right-radius: 12px;
+                            border-bottom-right-radius: 12px;
+                        }
+                        QPushButton, QToolButton {
+                            background: transparent;
+                            color: #f5f5f5;
+                            border: none;
+                            text-align: left;
+                            padding: 8px 10px;
+                            font-size: 14px;
+                        }
+                        QPushButton:hover, QToolButton:hover { background: rgba(255, 255, 255, 0.06); }
+                        QFrame#divider { background: rgba(255, 255, 255, 0.08); min-height: 1px; }
+                        """
+                    )
+                    if hasattr(self, "drawer_overlay"):
+                        self.drawer_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 90);")
+
+                    # Drawer secondary actions
+                    if hasattr(self, "system_sync_btn"):
+                        self.system_sync_btn.setStyleSheet(
+                            "background: transparent; color: #8fa0b3; font-size: 12px; padding-left: 0;"
+                        )
+                    if hasattr(self, "logout_btn"):
+                        self.logout_btn.setStyleSheet(
+                            "background: transparent; color: #f5f5f5; font-weight: 600; padding-left: 10px;"
+                        )
+                else:
+                    self.drawer.setStyleSheet(
+                        """
+                        QFrame {
+                            background-color: #ffffff;
+                            color: #111827;
+                            border-top-right-radius: 12px;
+                            border-bottom-right-radius: 12px;
+                            border-right: 1px solid rgba(17, 24, 39, 0.10);
+                        }
+                        QPushButton, QToolButton {
+                            background: transparent;
+                            color: #111827;
+                            border: none;
+                            text-align: left;
+                            padding: 8px 10px;
+                            font-size: 14px;
+                        }
+                        QPushButton:hover, QToolButton:hover { background: rgba(17, 24, 39, 0.06); }
+                        QFrame#divider { background: rgba(17, 24, 39, 0.08); min-height: 1px; }
+                        """
+                    )
+                    if hasattr(self, "drawer_overlay"):
+                        self.drawer_overlay.setStyleSheet("background-color: rgba(17, 24, 39, 60);")
+
+                    # Drawer secondary actions
+                    if hasattr(self, "system_sync_btn"):
+                        self.system_sync_btn.setStyleSheet(
+                            "background: transparent; color: #6b7280; font-size: 12px; padding-left: 0;"
+                        )
+                    if hasattr(self, "logout_btn"):
+                        self.logout_btn.setStyleSheet(
+                            "background: transparent; color: #111827; font-weight: 600; padding-left: 10px;"
+                        )
+
+            # Scrollbar handle color should also flip with theme.
+            try:
+                self._configure_log_scroll()
+            except Exception:
+                pass
+
+            self._apply_premium_effects()
+        except Exception:
+            pass
+
+    def _apply_premium_effects(self) -> None:
+        try:
+            if self.dark_mode:
+                shadow_color = QtGui.QColor(0, 0, 0, 170)
+                shadow_color_soft = QtGui.QColor(0, 0, 0, 120)
+            else:
+                shadow_color = QtGui.QColor(17, 24, 39, 45)
+                shadow_color_soft = QtGui.QColor(17, 24, 39, 28)
+
+            def apply_shadow(widget: Optional[QtWidgets.QWidget], *, radius: int, y: int, color: QtGui.QColor) -> None:
+                if widget is None:
+                    return
+                try:
+                    effect = QtWidgets.QGraphicsDropShadowEffect(widget)
+                    effect.setBlurRadius(radius)
+                    effect.setOffset(0, y)
+                    effect.setColor(color)
+                    widget.setGraphicsEffect(effect)
+                except Exception:
+                    pass
+
+            # Apply to all frames that are styled as "card" (wizard card, settings cards, etc.).
+            try:
+                for frame in self.findChildren(QtWidgets.QFrame, "card"):
+                    apply_shadow(frame, radius=28, y=10, color=shadow_color)
+            except Exception:
+                pass
+
+            # Message log surface (QScrollArea) benefits from a slightly softer shadow.
+            try:
+                if hasattr(self, "log"):
+                    apply_shadow(getattr(self, "log"), radius=26, y=8, color=shadow_color_soft)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_night_toggle(self, checked: bool) -> None:
+        self.theme_mode = "dark" if checked else "light"
+        self._apply_theme(self.theme_mode)
+        self._apply_theme_selection(self.theme_mode)
+        self._save_settings()
+
+    def _sync_with_system(self) -> None:
+        self.theme_mode = "system"
+        self._apply_theme(self.theme_mode)
+        self._apply_theme_selection(self.theme_mode)
+        self._save_settings()
+
+    def _update_profile_avatar(self) -> None:
+        initials = (self.user_name[:1] or "F").upper()
+        self.profile_avatar.setText(initials)
+
+    def _switch_platform(self, new_platform: str) -> None:
+        """Switch between MT4 and MT5, loading platform-specific credentials.
+        
+        CRITICAL: Cancels any active edits and reloads fresh backend state.
+        """
+        if new_platform not in {"mt4", "mt5"}:
+            return
+        if new_platform == self.platform:
+            return
+        
+        # RULE 1 & 4: Cancel any active edit mode before switching
+        if getattr(self, "gls_edit_mode", False):
+            self._exit_edit_mode(revert=True)
+        if getattr(self, "psl_edit_mode", False):
+            self._exit_psl_edit_mode(revert=True)
+
+        # Persist the current platform snapshot before leaving
+        try:
+            self._snapshot_platform_ui_state(self.platform)
+        except Exception:
+            pass
+        
+        # Save current platform state
+        self.flamebot_ids[self.platform] = self.flamebot_id
+        self.licenses_by_platform[self.platform] = self.licenses
+        
+        # Switch to new platform
+        self.platform = new_platform
+        self.flamebot_id = self.flamebot_ids.get(new_platform, "")
+        self.licenses = self.licenses_by_platform.get(new_platform, {})
+        try:
+            self.telegram_ingest_secret = str((getattr(self, "telegram_ingest_secrets", {}) or {}).get(new_platform, "") or "").strip()
+        except Exception:
+            self.telegram_ingest_secret = ""
+
+        # Sync EA status for this platform from cached context state
+        self.ea_active = self._get_platform_ea_active(new_platform)
+        self._ea_active_account = self._get_platform_active_account(new_platform)
+
+        try:
+            auth = self._backend_auth_params()
+            if auth:
+                self._refresh_ea_status_for_context(auth)
+        except Exception:
+            pass
+        
+        # Update worker platform
+        self.worker.set_platform(new_platform)
+        try:
+            self.worker.set_telegram_ingest_secrets(getattr(self, "telegram_ingest_secrets", {"mt4": "", "mt5": ""}))
+        except Exception:
+            pass
+        self.worker.set_registered_platforms(self.flamebot_ids)
+        
+        # Update UI
+        self.setWindowTitle("FlameBot Telegram Copier")
+        self._update_credential_labels()
+        restored = False
+        hydrated = bool(getattr(self, "_platform_settings_hydrated", {}).get(self._platform_user_key(new_platform), False))
+        try:
+            restored = self._restore_platform_ui_state(new_platform)
+        except Exception:
+            restored = False
+
+        # If no snapshot was found
+        if not restored:
+            if hydrated:
+                # Hydrated but missing snapshot: keep current UI to avoid flicker
+                try:
+                    self._log(f"⚠️ Missing snapshot for hydrated platform {new_platform.upper()}, keeping current view")
+                except Exception:
+                    pass
+            else:
+                # Not hydrated and no snapshot: clear to a clean placeholder state
+                try:
+                    self._reset_settings_state_for_context_switch()
+                    self._platform_settings_hydrated[self._platform_user_key(new_platform)] = False
+                except Exception:
+                    pass
+                try:
+                    self._apply_lot_state_to_ui()
+                    self._apply_symbol_state_to_ui()
+                    self._apply_trade_control_state_to_ui()
+                    if hasattr(self, "psl_panel") and self.psl_panel.isVisible() and not getattr(self, "psl_edit_mode", False):
+                        self._refresh_psl_list()
+                except Exception:
+                    pass
+
+        # Update edit button state after platform switch
+        self._update_edit_button_state()
+        self._update_ea_status_panel()
+        self._update_settings_lock_state()
+        # Mark hydration pending for the new context to avoid interim warnings
+        try:
+            self._start_settings_hydration(new_platform, getattr(self, "current_account_type", None))
+        except Exception:
+            pass
+        self._render_config_status_labels()
+        self._save_settings()
+
+    def _reset_settings_state_for_context_switch(self) -> None:
+        """Clear settings UI state to prevent MT4/MT5 and PROP/NORMAL leakage."""
+        try:
+            ctx = self._context_key()
+        except Exception:
+            ctx = None
+        # If we have fresh cached state, restore it and skip clearing.
+        if ctx:
+            last = getattr(self, "_context_hydrated_at", {}).get(ctx)
+            if last and (time.time() - last) < HYDRATION_TTL and self._restore_cached_context_state(ctx):
+                return
+        
+        # Lots
+        self.lot_mode = "default"
+        self.custom_lot = None
+        self.lot_configured = False
+        self._lot_user_dirty = False
+        self._saved_lot_mode = "default"
+        self._saved_custom_lot = None
+        self._saved_lot_configured = False
+
+        # Symbols
+        self.symbol_mode = "default"
+        self.available_symbols = []
+        self.symbols_allowed = []
+        self.symbol_configured = False
+        self._symbol_user_dirty = False
+        self._saved_symbol_mode = "default"
+        self._saved_symbols_allowed = []
+        self._saved_symbol_configured = False
+
+        # PSL
+        self.psl_configured = False
+        self.per_symbol_lots = {}
+        self._saved_psl_configured = False
+        self._saved_per_symbol_lots = {}
+        self._psl_user_dirty = False
+
+        # Telegram controls (never infer defaults)
+        self.allow_message_close = False
+        self.allow_message_breakeven = False
+        self.allow_secure_half = False
+        self.allow_multiple_signals_per_symbol = False
+        self._saved_allow_message_close = False
+        self._saved_allow_message_breakeven = False
+        self._saved_allow_secure_half = False
+        self._saved_allow_multiple_signals = False
+
+        for cb_name in (
+            "allow_close_checkbox",
+            "allow_breakeven_checkbox",
+            "allow_secure_half_checkbox",
+            "allow_multiple_checkbox",
+        ):
+            try:
+                cb = getattr(self, cb_name, None)
+                if cb is not None:
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                    cb.blockSignals(False)
+            except Exception:
+                pass
+
+        # Also clear per-mode Telegram controls to avoid leakage between GLS and PSL
+        for cb in (
+            getattr(self, "gls_allow_close_checkbox", None),
+            getattr(self, "gls_allow_breakeven_checkbox", None),
+            getattr(self, "gls_allow_secure_half_checkbox", None),
+            getattr(self, "gls_allow_multiple_checkbox", None),
+            getattr(self, "psl_allow_close_checkbox", None),
+            getattr(self, "psl_allow_breakeven_checkbox", None),
+            getattr(self, "psl_allow_secure_half_checkbox", None),
+            getattr(self, "psl_allow_multiple_checkbox", None),
+        ):
+            try:
+                if cb is not None:
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                    cb.blockSignals(False)
+            except Exception:
+                pass
+
+        # Status labels will be rendered via recompute using pending/loading state
+        self._render_config_status_labels()
+
+        # Backend presence for this new context is unknown until we successfully
+        # load or save settings for it.
+        try:
+            ctx = self._context_key()
+            if hasattr(self, "_backend_presence_by_context"):
+                self._backend_presence_by_context.get("lot", {})[ctx] = False
+                self._backend_presence_by_context.get("symbol", {})[ctx] = False
+                self._backend_presence_by_context.get("psl", {})[ctx] = False
+        except Exception:
+            pass
+
+        # Clear per-mode trade control caches (GLS vs PSL must be independent)
+        try:
+            if hasattr(self, "_trade_control_by_mode"):
+                self._trade_control_by_mode["gls"] = {
+                    "allow_message_close": False,
+                    "allow_message_breakeven": False,
+                    "allow_secure_half": False,
+                    "allow_multiple_signals_per_symbol": False,
+                    "entry_mode": None,
+                }
+                self._trade_control_by_mode["psl"] = {
+                    "allow_message_close": False,
+                    "allow_message_breakeven": False,
+                    "allow_secure_half": False,
+                    "allow_multiple_signals_per_symbol": False,
+                    "entry_mode": None,
+                }
+            if hasattr(self, "_saved_trade_control_by_mode"):
+                self._saved_trade_control_by_mode = {
+                    "gls": dict(getattr(self, "_trade_control_by_mode", {}).get("gls", {})),
+                    "psl": dict(getattr(self, "_trade_control_by_mode", {}).get("psl", {})),
+                }
+        except Exception:
+            pass
+
+        # Re-render using the current context lock rules.
+        try:
+            self._apply_lot_state_to_ui()
+        except Exception:
+            pass
+        try:
+            self._apply_symbol_state_to_ui()
+        except Exception:
+            pass
+        try:
+            self._refresh_psl_list()
+        except Exception:
+            pass
+
+    def _update_credential_labels(self) -> None:
+        """Update FlameBot ID and license key labels for current platform."""
+        try:
+            if self.flamebot_id:
+                self.flamebot_id_label.setText(f"FlameBot ID: {self.flamebot_id}")
+            else:
+                self.flamebot_id_label.setText(f"FlameBot ID: Not registered (login required)")
+            
+            license_key = self._get_active_license()
+            account_type = self.current_account_type
+            if license_key:
+                self.license_key_label.setText(f"License Key ({account_type.upper()}): {self._mask_license_key(license_key)}")
+            else:
+                self.license_key_label.setText(f"License Key ({account_type.upper()}): Not generated (login required)")
+        except Exception:
+            pass
+
+    def _on_platform_selected(self, platform: str) -> None:
+        """Handle platform selection from UI buttons.
+        
+        CRITICAL: This does NOT trigger polling.
+        Polling is controlled solely by backend configuration state.
+        """
+        self._switch_platform(platform)
+        self.selected_platform = platform
+        # If user has telegram_id, ensure backend registration exists for the
+        # selected platform + account context.
+        try:
+            platform_key = str(platform or "mt5").lower()
+            account_key = str(getattr(self, "current_account_type", None) or "prop").lower()
+        except Exception:
+            platform_key = str(platform or "mt5").lower()
+            account_key = "prop"
+        try:
+            if hasattr(self, 'telegram_id') and self.telegram_id and (not self._has_backend_identity(platform=platform_key)):
+                self._schedule_backend_register(self.telegram_id, platform=platform_key, account_type=account_key)
+        except Exception:
+            self._dev_log("platform_switch_register_failed")
+        self.expert_stack.setCurrentIndex(1)
+
+    def _on_wizard_platform_selected(self, platform: str) -> None:
+        """Handle platform selection from wizard.
+        
+        CRITICAL: This does NOT trigger polling.
+        Polling is controlled solely by backend configuration state.
+        """
+        self._switch_platform(platform)
+        self.wizard_selected_platform = platform
+        # If user has telegram_id, ensure backend registration exists for the
+        # selected platform + account context.
+        try:
+            platform_key = str(platform or "mt5").lower()
+            account_key = str(getattr(self, "current_account_type", None) or "prop").lower()
+        except Exception:
+            platform_key = str(platform or "mt5").lower()
+            account_key = "prop"
+        try:
+            if hasattr(self, 'telegram_id') and self.telegram_id and (not self._has_backend_identity(platform=platform_key)):
+                self._schedule_backend_register(self.telegram_id, platform=platform_key, account_type=account_key)
+        except Exception:
+            self._dev_log("wizard_platform_switch_register_failed")
+        self.settings_wizard_stack.setCurrentIndex(1)
+
+    def _build_ui(self) -> None:
+        self.main_stack = QtWidgets.QStackedWidget()
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(10)
+        header = QtWidgets.QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(6)
+        self.menu_button = QtWidgets.QToolButton()
+        self.menu_button.setText("☰")
+        self.menu_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.menu_button.setToolTip("Menu")
+        self.menu_button.setStyleSheet("font-size: 18px; background: transparent;")
+        self.menu_button.hide()
+        header.addWidget(self.menu_button)
+        header.addStretch()
+        outer.addLayout(header)
+        outer.addWidget(self.main_stack)
+        wizard_page = QtWidgets.QWidget()
+        wizard_layout = QtWidgets.QVBoxLayout(wizard_page)
+        wizard_layout.setContentsMargins(32, 24, 32, 16)
+        wizard_layout.setSpacing(18)
+        center_row = QtWidgets.QHBoxLayout()
+        center_row.addStretch()
+        self.card = QtWidgets.QFrame()
+        self.card.setObjectName("card")
+        self.card.setMinimumWidth(420)
+        card_layout = QtWidgets.QVBoxLayout(self.card)
+        card_layout.setContentsMargins(32, 24, 32, 24)
+        card_layout.setSpacing(16)
+        logo = QtWidgets.QLabel()
+        pix = QtGui.QPixmap(resolve_resource_path("flame_logo.png"))
+        if not pix.isNull():
+            pix = pix.scaled(80, 80, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            logo.setPixmap(pix)
+        logo.setAlignment(QtCore.Qt.AlignCenter)
+        card_layout.addWidget(logo)
+        self.title_label = QtWidgets.QLabel("Welcome to FlameBot")
+        self.title_label.setObjectName("title")
+        self.title_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.subtitle_label = QtWidgets.QLabel(
+            "Connect your Telegram account in three simple steps."
+        )
+        self.subtitle_label.setObjectName("subtitle")
+        self.subtitle_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.subtitle_label.setWordWrap(True)
+        card_layout.addWidget(self.title_label)
+        card_layout.addWidget(self.subtitle_label)
+        self.stack = QtWidgets.QStackedWidget()
+        card_layout.addWidget(self.stack)
+        api_page = QtWidgets.QWidget()
+        api_layout = QtWidgets.QVBoxLayout(api_page)
+        api_layout.setSpacing(10)
+        api_info = QtWidgets.QLabel(
+            "Step 1 of 3 • Enter your Telegram API credentials from my.telegram.org."
+        )
+        self.api_info_label = api_info
+        api_info.setWordWrap(True)
+        api_layout.addWidget(api_info)
+        self.api_id = QtWidgets.QLineEdit()
+        self.api_id.setPlaceholderText("API ID")
+        self.api_hash = QtWidgets.QLineEdit()
+        self.api_hash.setPlaceholderText("API HASH")
+        api_layout.addWidget(self.api_id)
+        api_layout.addWidget(self.api_hash)
+        self.btn_api_next = QtWidgets.QPushButton("Next")
+        self.btn_api_next.setObjectName("primary")
+        self.btn_api_next.setEnabled(False)
+        api_btn_row = QtWidgets.QHBoxLayout()
+        api_btn_row.addStretch()
+        api_btn_row.addWidget(self.btn_api_next)
+        api_layout.addLayout(api_btn_row)
+        self.stack.addWidget(api_page)
+        phone_page = QtWidgets.QWidget()
+        phone_layout = QtWidgets.QVBoxLayout(phone_page)
+        phone_layout.setSpacing(10)
+        phone_info = QtWidgets.QLabel(
+            "Step 2 of 3 • Confirm your country and enter your phone number."
+        )
+        self.phone_info_label = phone_info
+        phone_info.setWordWrap(True)
+        phone_layout.addWidget(phone_info)
+        form_container = QtWidgets.QWidget()
+        form_layout = QtWidgets.QVBoxLayout(form_container)
+        form_layout.setContentsMargins(0, 0, 0, 0)
+        form_layout.setSpacing(6)
+        self.country_button = CountrySelectorButton("Select country")
+        self.country_button.setObjectName("country_selector")
+        self.country_button.setFocusPolicy(QtCore.Qt.ClickFocus)
+        self.country_button.setCursor(QtCore.Qt.PointingHandCursor)
+        form_layout.addWidget(self.country_button)
+        self.phone_label = QtWidgets.QLabel("Phone number")
+        self.phone_label.setObjectName("field_label")
+        form_layout.addWidget(self.phone_label)
+        self.phone = QtWidgets.QLineEdit()
+        self.phone.setPlaceholderText("Your phone number")
+        self.phone.setObjectName("phone_input")
+        if not self.phone.text().strip():
+            self.phone.setText("+")
+        form_layout.addWidget(self.phone)
+        phone_layout.addWidget(form_container)
+        self.phone_example = QtWidgets.QLabel("Example: +234 810 000 0000")
+        self.phone_example.setObjectName("subtitle")
+        phone_layout.addWidget(self.phone_example)
+        phone_btn_row = QtWidgets.QHBoxLayout()
+        self.btn_phone_back = QtWidgets.QPushButton("Back")
+        self.btn_send = QtWidgets.QPushButton("Send code")
+        self.btn_send.setObjectName("primary")
+        phone_btn_row.addWidget(self.btn_phone_back)
+        phone_btn_row.addStretch()
+        phone_btn_row.addWidget(self.btn_send)
+        phone_layout.addLayout(phone_btn_row)
+        self.stack.addWidget(phone_page)
+        code_page = QtWidgets.QWidget()
+        code_layout = QtWidgets.QVBoxLayout(code_page)
+        code_layout.setSpacing(10)
+        code_info = QtWidgets.QLabel(
+            "Step 3 of 3 • Enter the login code from Telegram.\n"
+            "If your account has 2FA, you can also enter your password."
+        )
+        self.code_info_label = code_info
+        code_info.setWordWrap(True)
+        code_layout.addWidget(code_info)
+        self.code = QtWidgets.QLineEdit()
+        self.code.setPlaceholderText("Code from Telegram (SMS / app)")
+        code_layout.addWidget(self.code)
+        self.password = QtWidgets.QLineEdit()
+        self.password.setPlaceholderText("2FA password (if enabled)")
+        self.password.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.password_toggle = QtWidgets.QToolButton(self.password)
+        self.password_toggle.setCursor(QtCore.Qt.PointingHandCursor)
+        self.password_toggle.setStyleSheet("QToolButton { border: none; padding: 0 6px; }")
+        self.password_toggle.setText("👁")
+        self.password_toggle.setCheckable(True)
+        self.password_toggle.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.password_toggle.clicked.connect(self._toggle_password_visibility)
+        self.password_toggle.hide()
+        code_layout.addWidget(self.password)
+        self.password.setVisible(False)
+        code_btn_row = QtWidgets.QHBoxLayout()
+        self.btn_code_back = QtWidgets.QPushButton("Back")
+        self.btn_login = QtWidgets.QPushButton("Login")
+        self.btn_login.setObjectName("primary")
+        code_btn_row.addWidget(self.btn_code_back)
+        code_btn_row.addStretch()
+        code_btn_row.addWidget(self.btn_login)
+        code_layout.addLayout(code_btn_row)
+        self.stack.addWidget(code_page)
+        center_row.addWidget(self.card)
+        center_row.addStretch()
+        wizard_layout.addLayout(center_row)
+        self.main_stack.addWidget(wizard_page)
+        dashboard_page = QtWidgets.QWidget()
+        dashboard_layout = QtWidgets.QHBoxLayout(dashboard_page)
+        dashboard_layout.setSpacing(0)
+        dashboard_layout.setContentsMargins(4, 4, 4, 4)
+        self.sidebar = QtWidgets.QFrame()
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setMinimumWidth(280)
+        sidebar_layout = QtWidgets.QVBoxLayout(self.sidebar)
+        sidebar_layout.setContentsMargins(16, 16, 16, 16)
+        sidebar_layout.setSpacing(12)
+        logo_small = QtWidgets.QLabel()
+        logo_small.setAlignment(QtCore.Qt.AlignCenter)
+        if not pix.isNull():
+            logo_small.setPixmap(pix.scaled(50, 50, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        else:
+            logo_small.setText("FlameBot")
+        sidebar_layout.addWidget(logo_small)
+        self.group_search = QtWidgets.QLineEdit()
+        self.group_search.setPlaceholderText("Search groups...")
+        sidebar_layout.addWidget(self.group_search)
+
+        # Debounced group search to avoid UI freezes on large group lists
+        self._pending_group_filter_text = ""
+        self._group_filter_timer = QtCore.QTimer(self)
+        self._group_filter_timer.setSingleShot(True)
+        self._group_filter_timer.setInterval(180)
+        self._group_filter_timer.timeout.connect(self._apply_pending_group_filter)
+        self.loading_label = QtWidgets.QLabel("Loading groups...")
+        self.loading_label.setObjectName("muted")
+        self.loading_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.loading_label.setVisible(False)
+        sidebar_layout.addWidget(self.loading_label)
+        self.list_groups = QtWidgets.QListWidget()
+        self.list_groups.setObjectName("group_list")
+        # Telegram-like: hover/selected shading for custom row widgets.
+        try:
+            self.list_groups.setMouseTracking(True)
+            self.list_groups.viewport().setMouseTracking(True)
+            self.list_groups.viewport().setAttribute(QtCore.Qt.WA_Hover, True)
+            self.list_groups.viewport().installEventFilter(self)
+        except Exception:
+            pass
+        sidebar_layout.addWidget(self.list_groups)
+        self.message_panel = QtWidgets.QFrame()
+        self.message_panel.setObjectName("message_panel")
+        message_layout = QtWidgets.QVBoxLayout(self.message_panel)
+        message_layout.setContentsMargins(12, 12, 12, 12)
+        message_layout.setSpacing(10)
+        self.content_stack = QtWidgets.QStackedWidget()
+        message_layout.addWidget(self.content_stack)
+        self.message_log_page = QtWidgets.QWidget()
+        message_log_layout = QtWidgets.QVBoxLayout(self.message_log_page)
+        message_log_layout.setSpacing(10)
+        header_bar = QtWidgets.QHBoxLayout()
+        header_bar.setSpacing(6)
+        title_block = QtWidgets.QVBoxLayout()
+        title_block.setSpacing(2)
+        self.group_title = QtWidgets.QLabel("Message Log")
+        self.group_title.setObjectName("chat_title")
+        self.group_subtitle = QtWidgets.QLabel("")
+        self.group_subtitle.setObjectName("chat_subtitle")
+        title_block.addWidget(self.group_title)
+        title_block.addWidget(self.group_subtitle)
+        header_bar.addLayout(title_block)
+        header_bar.addStretch()
+
+        # Passive connectivity/status indicator (never logs raw exceptions).
+        self.network_status_label = QtWidgets.QLabel("")
+        self.network_status_label.setObjectName("muted")
+        self.network_status_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.network_status_label.setStyleSheet("font-size: 12px;")
+        # Prefer the global status label; keep this hidden to avoid duplicates.
+        self.network_status_label.setVisible(False)
+        header_bar.addWidget(self.network_status_label)
+        message_log_layout.addLayout(header_bar)
+
+        # Telegram-style: show an empty panel until the user selects a chat.
+        self.message_log_stack = QtWidgets.QStackedWidget()
+
+        empty_page = QtWidgets.QWidget()
+        empty_layout = QtWidgets.QVBoxLayout(empty_page)
+        empty_layout.setContentsMargins(0, 0, 0, 0)
+        empty_layout.addStretch(1)
+        self.empty_chat_hint = QtWidgets.QLabel("Select a group to view messages")
+        self.empty_chat_hint.setObjectName("muted")
+        self.empty_chat_hint.setAlignment(QtCore.Qt.AlignCenter)
+        self.empty_chat_hint.setStyleSheet("font-size: 13px;")
+        empty_layout.addWidget(self.empty_chat_hint)
+        empty_layout.addStretch(1)
+
+        self.log = MessageLogWidget()
+        self.log.setMinimumHeight(400)
+        self.log.viewport().setAttribute(QtCore.Qt.WA_Hover, True)
+        self.log.viewport().installEventFilter(self)
+        self.log.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        try:
+            self.log.verticalScrollBar().valueChanged.connect(lambda _v=None: self._on_log_scrolled())
+        except Exception:
+            pass
+
+        self.message_log_stack.addWidget(empty_page)
+        self.message_log_stack.addWidget(self.log)
+        message_log_layout.addWidget(self.message_log_stack)
+        self.content_stack.addWidget(self.message_log_page)
+        self.settings_page = QtWidgets.QWidget()
+        settings_layout = QtWidgets.QVBoxLayout(self.settings_page)
+        settings_layout.setSpacing(12)
+        settings_header = QtWidgets.QLabel("Settings")
+        settings_header.setObjectName("title")
+        settings_layout.addWidget(settings_header)
+        self.settings_lock_banner = QtWidgets.QLabel(
+            f"❌ Please login your EA first. Go to Expert → {self.platform.upper()} and connect your EA."
+        )
+        self.settings_lock_banner.setObjectName("muted")
+        self.settings_lock_banner.setWordWrap(True)
+        self.settings_lock_banner.setStyleSheet(
+            "background: rgba(255, 122, 47, 0.12); border-radius: 10px; padding: 8px 12px;"
+        )
+        settings_layout.addWidget(self.settings_lock_banner)
+
+        # EA installer helper (bundled MT4/MT5 EAs)
+        ea_install_group = QtWidgets.QGroupBox("EA Installation")
+        ea_install_layout = QtWidgets.QVBoxLayout(ea_install_group)
+        ea_install_layout.setSpacing(6)
+        ea_install_hint = QtWidgets.QLabel(
+            "Install the bundled MT4/MT5 Expert Advisors into MetaTrader automatically."
+        )
+        ea_install_hint.setObjectName("muted")
+        ea_install_hint.setWordWrap(True)
+        ea_install_layout.addWidget(ea_install_hint)
+        self.install_eas_btn = QtWidgets.QPushButton("Install MT4/MT5 EA")
+        self.install_eas_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        ea_install_layout.addWidget(self.install_eas_btn)
+        settings_layout.addWidget(ea_install_group)
+        # GLS / PSL selector row
+        mode_selector_row = QtWidgets.QWidget()
+        mode_selector_layout = QtWidgets.QHBoxLayout(mode_selector_row)
+        mode_selector_layout.setContentsMargins(0, 0, 0, 0)
+        mode_selector_layout.setSpacing(20)
+        self.gls_checkbox = QtWidgets.QCheckBox("GLS — Global Lot & Symbols")
+        self.gls_checkbox.setCursor(QtCore.Qt.PointingHandCursor)
+        self.psl_checkbox = QtWidgets.QCheckBox("PSL — Per-Symbol Lot")
+        self.psl_checkbox.setCursor(QtCore.Qt.PointingHandCursor)
+        mode_selector_layout.addWidget(self.gls_checkbox)
+        mode_selector_layout.addWidget(self.psl_checkbox)
+        mode_selector_layout.addStretch()
+        settings_layout.addWidget(mode_selector_row)
+        # Default: GLS is checked
+        self.gls_checkbox.setChecked(True)
+        self.psl_checkbox.setChecked(False)
+        # GLS panel (existing UI)
+        self.gls_panel = QtWidgets.QWidget()
+        gls_panel_layout = QtWidgets.QVBoxLayout(self.gls_panel)
+        gls_panel_layout.setContentsMargins(0, 0, 0, 0)
+        gls_panel_layout.setSpacing(12)
+        lot_group = QtWidgets.QGroupBox("Lot Size")
+        lot_layout = QtWidgets.QVBoxLayout(lot_group)
+        self.lot_default = QtWidgets.QRadioButton("Default (EA internal)")
+        self.lot_custom = QtWidgets.QRadioButton("Custom")
+        self.lot_custom_input = QtWidgets.QLineEdit()
+        self.lot_custom_input.setPlaceholderText("Example: 0.10")
+        self.lot_custom_input.setValidator(QtGui.QDoubleValidator(0.01, 1000.0, 2))
+        self.lot_status_label = QtWidgets.QLabel("⚠️ Lot not configured yet")
+        self.lot_status_label.setObjectName("muted")
+        lot_layout.addWidget(self.lot_default)
+        lot_layout.addWidget(self.lot_custom)
+        lot_layout.addWidget(self.lot_custom_input)
+        lot_layout.addWidget(self.lot_status_label)
+        # (Moved) Entry Strategy UI now lives inside Telegram Trade Control
+        self.lot_default.setChecked(True)
+        symbol_group = QtWidgets.QGroupBox("Symbols")
+        symbol_layout = QtWidgets.QVBoxLayout(symbol_group)
+        self.symbol_default = QtWidgets.QRadioButton("Default (trade all)")
+        self.symbol_custom = QtWidgets.QRadioButton("Custom (selected only)")
+        self.symbol_search = QtWidgets.QLineEdit()
+        self.symbol_search.setPlaceholderText("Search symbols...")
+
+        # Manual fast-path: request EA to re-push broker symbols immediately.
+        # Visible only in Custom mode.
+        self.gls_refresh_symbols_btn = QtWidgets.QPushButton("Refresh Symbols")
+        self.gls_refresh_symbols_btn.setEnabled(False)
+        gls_refresh_row = QtWidgets.QWidget()
+        gls_refresh_row_layout = QtWidgets.QHBoxLayout(gls_refresh_row)
+        gls_refresh_row_layout.setContentsMargins(0, 0, 0, 0)
+        gls_refresh_row_layout.setSpacing(8)
+        gls_refresh_row_layout.addStretch()
+        gls_refresh_row_layout.addWidget(self.gls_refresh_symbols_btn)
+        # Use a scrolling container with a wrapping grid of checkboxes for symbols
+        self.symbol_scroll = QtWidgets.QScrollArea()
+        self.symbol_scroll.setWidgetResizable(True)
+        # Prefer vertical-only scrolling and allow the area to expand
+        self.symbol_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.symbol_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.symbol_scroll.setMinimumHeight(220)
+        self.symbol_scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.symbol_container = QtWidgets.QWidget()
+        # Prevent the container from forcing horizontal expansion so the grid
+        # remains predictable and fixed-width. Use Preferred to allow the
+        # scroll area to control scrolling rather than the container expanding.
+        self.symbol_container.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
+        self.symbol_grid = QtWidgets.QGridLayout(self.symbol_container)
+        self.symbol_grid.setContentsMargins(6, 6, 6, 6)
+        self.symbol_grid.setSpacing(10)
+        # Ensure symbols start top-left and never vertically center
+        try:
+            self.symbol_grid.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        except Exception:
+            pass
+        self.symbol_scroll.setWidget(self.symbol_container)
+        # Prevent the scroll area or its viewport from reserving extra space
+        # for the vertical scrollbar by removing any default margins.
+        try:
+            self.symbol_scroll.setContentsMargins(0, 0, 0, 0)
+        except Exception:
+            pass
+        try:
+            self.symbol_scroll.viewport().setContentsMargins(0, 0, 0, 0)
+        except Exception:
+            pass
+        # mapping symbol -> QCheckBox
+        self._symbol_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
+        self.symbol_status_label = QtWidgets.QLabel("⚠️ Symbols not configured yet")
+        self.symbol_status_label.setObjectName("muted")
+        symbol_layout.addWidget(self.symbol_default)
+        symbol_layout.addWidget(self.symbol_custom)
+        symbol_layout.addWidget(self.symbol_search)
+        symbol_layout.addWidget(gls_refresh_row)
+        symbol_layout.addWidget(self.symbol_scroll)
+        symbol_layout.addWidget(self.symbol_status_label)
+        self.symbol_default.setChecked(True)
+        gls_panel_layout.addWidget(lot_group)
+        gls_panel_layout.addWidget(symbol_group)
+        # GLS-specific Telegram Trade Control (isolated widgets)
+        gls_tc_group = QtWidgets.QGroupBox("Telegram Trade Control (GLS)")
+        gls_tc_layout = QtWidgets.QVBoxLayout(gls_tc_group)
+        gls_tc_layout.setSpacing(8)
+
+        self.gls_allow_close_checkbox = QtWidgets.QCheckBox("Allow Close Trades from Telegram")
+        self.gls_allow_close_checkbox.setChecked(self.allow_message_close)
+        self.gls_allow_close_checkbox.setEnabled(False)
+
+        self.gls_allow_breakeven_checkbox = QtWidgets.QCheckBox("Allow Breakeven from Telegram")
+        self.gls_allow_breakeven_checkbox.setChecked(self.allow_message_breakeven)
+        self.gls_allow_breakeven_checkbox.setEnabled(False)
+
+        self.gls_allow_secure_half_checkbox = QtWidgets.QCheckBox("Allow Secure-Half (TP Ladder Management)")
+        self.gls_allow_secure_half_checkbox.setChecked(self.allow_secure_half)
+        self.gls_allow_secure_half_checkbox.setEnabled(False)
+
+        gls_tc_layout.addWidget(self.gls_allow_close_checkbox)
+        gls_tc_layout.addWidget(self.gls_allow_breakeven_checkbox)
+        gls_tc_layout.addWidget(self.gls_allow_secure_half_checkbox)
+
+        self.gls_allow_multiple_checkbox = QtWidgets.QCheckBox("Allow Multiple Signals Per Symbol")
+        self.gls_allow_multiple_checkbox.setChecked(self.allow_multiple_signals_per_symbol)
+        self.gls_allow_multiple_checkbox.setEnabled(False)
+        gls_allow_multiple_desc = QtWidgets.QLabel(
+            "If OFF, the EA will ignore new signals for a symbol that already has an active signal.\nIf ON, the EA will allow multiple signals on the same symbol."
+        )
+        gls_allow_multiple_desc.setObjectName("muted")
+        gls_tc_layout.addWidget(self.gls_allow_multiple_checkbox)
+        gls_tc_layout.addWidget(gls_allow_multiple_desc)
+
+        # Trade Scheduler (broker/server time) — placed immediately after Allow Multiple Signals Per Symbol
+        gls_sched_title = QtWidgets.QLabel("Trade Scheduler")
+        gls_sched_title.setObjectName("title")
+        gls_tc_layout.addWidget(gls_sched_title)
+        self.gls_scheduler_active_checkbox = QtWidgets.QCheckBox("Scheduler Active")
+        self.gls_scheduler_active_checkbox.setChecked(bool(getattr(self, "scheduler_active", False)))
+        self.gls_scheduler_active_checkbox.setEnabled(False)
+        gls_tc_layout.addWidget(self.gls_scheduler_active_checkbox)
+        gls_sched_note = QtWidgets.QLabel("Times are in broker server time")
+        gls_sched_note.setObjectName("muted")
+        gls_tc_layout.addWidget(gls_sched_note)
+
+        self.gls_scheduler_fields_container = QtWidgets.QWidget()
+        gls_sched_fields_layout = QtWidgets.QVBoxLayout(self.gls_scheduler_fields_container)
+        gls_sched_fields_layout.setContentsMargins(0, 0, 0, 0)
+        gls_sched_fields_layout.setSpacing(8)
+
+        # NOTE: Do not use a strict HH:MM regex validator here.
+        # Qt will block intermediate typing like "23:" which makes it feel like
+        # you can only enter hours. We validate strictly on Save instead.
+
+        pause_group = QtWidgets.QGroupBox("Trade Pause")
+        pause_layout = QtWidgets.QGridLayout(pause_group)
+        pause_layout.setHorizontalSpacing(10)
+        pause_layout.setVerticalSpacing(8)
+        pause_layout.addWidget(QtWidgets.QLabel("Pause Day"), 0, 0)
+        self.gls_scheduler_pause_day = QtWidgets.QComboBox()
+        self._populate_dow_combo(self.gls_scheduler_pause_day)
+        pause_layout.addWidget(self.gls_scheduler_pause_day, 0, 1)
+        pause_layout.addWidget(QtWidgets.QLabel("Pause Time"), 1, 0)
+        pause_time_row = QtWidgets.QWidget()
+        pause_time_row_layout = QtWidgets.QHBoxLayout(pause_time_row)
+        pause_time_row_layout.setContentsMargins(0, 0, 0, 0)
+        pause_time_row_layout.setSpacing(6)
+        self.gls_scheduler_pause_hour = QtWidgets.QComboBox()
+        self._populate_hour_combo(self.gls_scheduler_pause_hour)
+        self.gls_scheduler_pause_minute = QtWidgets.QComboBox()
+        self._populate_minute_combo(self.gls_scheduler_pause_minute)
+        pause_time_row_layout.addWidget(self.gls_scheduler_pause_hour)
+        pause_time_row_layout.addWidget(QtWidgets.QLabel(":"))
+        pause_time_row_layout.addWidget(self.gls_scheduler_pause_minute)
+        pause_time_row_layout.addStretch()
+        pause_layout.addWidget(pause_time_row, 1, 1)
+        pause_desc = QtWidgets.QLabel("When triggered: close ALL active EA trades, delete ALL pending EA orders, and pause trading.")
+        pause_desc.setObjectName("muted")
+        pause_desc.setWordWrap(True)
+        pause_layout.addWidget(pause_desc, 2, 0, 1, 2)
+        gls_sched_fields_layout.addWidget(pause_group)
+
+        resume_group = QtWidgets.QGroupBox("Trade Resume")
+        resume_layout = QtWidgets.QGridLayout(resume_group)
+        resume_layout.setHorizontalSpacing(10)
+        resume_layout.setVerticalSpacing(8)
+        resume_layout.addWidget(QtWidgets.QLabel("Resume Day"), 0, 0)
+        self.gls_scheduler_resume_day = QtWidgets.QComboBox()
+        self._populate_dow_combo(self.gls_scheduler_resume_day)
+        resume_layout.addWidget(self.gls_scheduler_resume_day, 0, 1)
+        resume_layout.addWidget(QtWidgets.QLabel("Resume Time"), 1, 0)
+        resume_time_row = QtWidgets.QWidget()
+        resume_time_row_layout = QtWidgets.QHBoxLayout(resume_time_row)
+        resume_time_row_layout.setContentsMargins(0, 0, 0, 0)
+        resume_time_row_layout.setSpacing(6)
+        self.gls_scheduler_resume_hour = QtWidgets.QComboBox()
+        self._populate_hour_combo(self.gls_scheduler_resume_hour)
+        self.gls_scheduler_resume_minute = QtWidgets.QComboBox()
+        self._populate_minute_combo(self.gls_scheduler_resume_minute)
+        resume_time_row_layout.addWidget(self.gls_scheduler_resume_hour)
+        resume_time_row_layout.addWidget(QtWidgets.QLabel(":"))
+        resume_time_row_layout.addWidget(self.gls_scheduler_resume_minute)
+        resume_time_row_layout.addStretch()
+        resume_layout.addWidget(resume_time_row, 1, 1)
+        resume_desc = QtWidgets.QLabel("When triggered: resume EA trading normally and accept new signals.")
+        resume_desc.setObjectName("muted")
+        resume_desc.setWordWrap(True)
+        resume_layout.addWidget(resume_desc, 2, 0, 1, 2)
+        gls_sched_fields_layout.addWidget(resume_group)
+
+        gls_tc_layout.addWidget(self.gls_scheduler_fields_container)
+
+        # Mark trade-control state dirty whenever user interacts (GLS widgets)
+        for cb in (
+            self.gls_allow_close_checkbox,
+            self.gls_allow_breakeven_checkbox,
+            self.gls_allow_secure_half_checkbox,
+            self.gls_allow_multiple_checkbox,
+        ):
+            cb.toggled.connect(self._mark_trade_control_dirty)
+
+        # Scheduler dirty tracking (GLS widgets)
+        try:
+            self.gls_scheduler_active_checkbox.toggled.connect(self._on_scheduler_ui_changed)
+            self.gls_scheduler_pause_day.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.gls_scheduler_pause_hour.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.gls_scheduler_pause_minute.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.gls_scheduler_resume_day.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.gls_scheduler_resume_hour.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.gls_scheduler_resume_minute.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+        except Exception:
+            pass
+
+        # GLS Entry Strategy controls
+        gls_entry_container = QtWidgets.QWidget()
+        gls_entry_layout = QtWidgets.QVBoxLayout(gls_entry_container)
+        gls_entry_layout.setContentsMargins(0, 0, 0, 0)
+        gls_entry_layout.setSpacing(6)
+        gls_entry_label = QtWidgets.QLabel("Entry Strategy")
+        gls_entry_label.setObjectName("title")
+        gls_entry_sub = QtWidgets.QLabel("Select how to place pending orders for range signals:")
+        gls_entry_sub.setObjectName("muted")
+        self.gls_entry_market_edge_radio = QtWidgets.QRadioButton("Market Entry + Last Range Order")
+        self.gls_entry_range_distributed_radio = QtWidgets.QRadioButton("Distributed Range Entry")
+        try:
+            if (self.entry_mode or "market_edge") == "market_edge":
+                self.gls_entry_market_edge_radio.setChecked(True)
+            else:
+                self.gls_entry_range_distributed_radio.setChecked(True)
+        except Exception:
+            self.gls_entry_market_edge_radio.setChecked(True)
+        self.gls_entry_market_edge_radio.setEnabled(False)
+        self.gls_entry_range_distributed_radio.setEnabled(False)
+        gls_entry_layout.addWidget(gls_entry_label)
+        gls_entry_layout.addWidget(gls_entry_sub)
+        gls_entry_layout.addWidget(self.gls_entry_market_edge_radio)
+        gls_entry_layout.addWidget(self.gls_entry_range_distributed_radio)
+        gls_tc_layout.addWidget(gls_entry_container)
+        gls_panel_layout.addWidget(gls_tc_group)
+        # PSL panel (Per-Symbol Lot implementation)
+        self.psl_panel = QtWidgets.QWidget()
+        psl_panel_layout = QtWidgets.QVBoxLayout(self.psl_panel)
+        psl_panel_layout.setContentsMargins(0, 0, 0, 0)
+        psl_panel_layout.setSpacing(12)
+        psl_title = QtWidgets.QLabel("PSL — Per-Symbol Lot")
+        psl_title.setObjectName("title")
+        psl_subtitle = QtWidgets.QLabel("Set individual lot size for each symbol")
+        psl_subtitle.setObjectName("muted")
+        psl_panel_layout.addWidget(psl_title)
+        psl_panel_layout.addWidget(psl_subtitle)
+        # PSL search bar (identical to GLS)
+        self.psl_search = QtWidgets.QLineEdit()
+        self.psl_search.setPlaceholderText("Search symbols...")
+        psl_panel_layout.addWidget(self.psl_search)
+
+        # Manual fast-path: request EA to re-push broker symbols immediately.
+        self.psl_refresh_symbols_btn = QtWidgets.QPushButton("Refresh Symbols")
+        self.psl_refresh_symbols_btn.setEnabled(False)
+        psl_refresh_row = QtWidgets.QWidget()
+        psl_refresh_row_layout = QtWidgets.QHBoxLayout(psl_refresh_row)
+        psl_refresh_row_layout.setContentsMargins(0, 0, 0, 0)
+        psl_refresh_row_layout.setSpacing(8)
+        psl_refresh_row_layout.addStretch()
+        psl_refresh_row_layout.addWidget(self.psl_refresh_symbols_btn)
+        psl_panel_layout.addWidget(psl_refresh_row)
+        # PSL status label
+        self.psl_status_label = QtWidgets.QLabel("⚠️ PSL not configured yet")
+        self.psl_status_label.setObjectName("muted")
+        psl_panel_layout.addWidget(self.psl_status_label)
+        # PSL symbol-lot table
+        self.psl_scroll = QtWidgets.QScrollArea()
+        self.psl_scroll.setWidgetResizable(True)
+        self.psl_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.psl_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.psl_scroll.setMinimumHeight(300)
+        self.psl_container = QtWidgets.QWidget()
+        self.psl_layout = QtWidgets.QVBoxLayout(self.psl_container)
+        self.psl_layout.setContentsMargins(6, 6, 6, 6)
+        self.psl_layout.setSpacing(8)
+        self.psl_scroll.setWidget(self.psl_container)
+        psl_panel_layout.addWidget(self.psl_scroll)
+        # Dictionary to store lot inputs: {symbol: QLineEdit}
+        self._psl_lot_inputs: Dict[str, QtWidgets.QLineEdit] = {}
+        # PSL-specific Telegram Trade Control (isolated widgets)
+        psl_tc_group = QtWidgets.QGroupBox("Telegram Trade Control (PSL)")
+        psl_tc_layout = QtWidgets.QVBoxLayout(psl_tc_group)
+        psl_tc_layout.setSpacing(8)
+
+        self.psl_allow_close_checkbox = QtWidgets.QCheckBox("Allow Close Trades from Telegram")
+        self.psl_allow_close_checkbox.setChecked(False)
+        self.psl_allow_close_checkbox.setEnabled(False)
+
+        self.psl_allow_breakeven_checkbox = QtWidgets.QCheckBox("Allow Breakeven from Telegram")
+        self.psl_allow_breakeven_checkbox.setChecked(False)
+        self.psl_allow_breakeven_checkbox.setEnabled(False)
+
+        self.psl_allow_secure_half_checkbox = QtWidgets.QCheckBox("Allow Secure-Half (TP Ladder Management)")
+        self.psl_allow_secure_half_checkbox.setChecked(False)
+        self.psl_allow_secure_half_checkbox.setEnabled(False)
+
+        psl_tc_layout.addWidget(self.psl_allow_close_checkbox)
+        psl_tc_layout.addWidget(self.psl_allow_breakeven_checkbox)
+        psl_tc_layout.addWidget(self.psl_allow_secure_half_checkbox)
+
+        self.psl_allow_multiple_checkbox = QtWidgets.QCheckBox("Allow Multiple Signals Per Symbol")
+        self.psl_allow_multiple_checkbox.setChecked(False)
+        self.psl_allow_multiple_checkbox.setEnabled(False)
+        psl_allow_multiple_desc = QtWidgets.QLabel(
+            "If OFF, the EA will ignore new signals for a symbol that already has an active signal.\nIf ON, the EA will allow multiple signals on the same symbol."
+        )
+        psl_allow_multiple_desc.setObjectName("muted")
+        psl_tc_layout.addWidget(self.psl_allow_multiple_checkbox)
+        psl_tc_layout.addWidget(psl_allow_multiple_desc)
+
+        # Trade Scheduler (broker/server time) — placed immediately after Allow Multiple Signals Per Symbol
+        psl_sched_title = QtWidgets.QLabel("Trade Scheduler")
+        psl_sched_title.setObjectName("title")
+        psl_tc_layout.addWidget(psl_sched_title)
+        self.psl_scheduler_active_checkbox = QtWidgets.QCheckBox("Scheduler Active")
+        self.psl_scheduler_active_checkbox.setChecked(bool(getattr(self, "scheduler_active", False)))
+        self.psl_scheduler_active_checkbox.setEnabled(False)
+        psl_tc_layout.addWidget(self.psl_scheduler_active_checkbox)
+        psl_sched_note = QtWidgets.QLabel("Times are in broker server time")
+        psl_sched_note.setObjectName("muted")
+        psl_tc_layout.addWidget(psl_sched_note)
+
+        self.psl_scheduler_fields_container = QtWidgets.QWidget()
+        psl_sched_fields_layout = QtWidgets.QVBoxLayout(self.psl_scheduler_fields_container)
+        psl_sched_fields_layout.setContentsMargins(0, 0, 0, 0)
+        psl_sched_fields_layout.setSpacing(8)
+
+        # NOTE: Do not use a strict HH:MM regex validator here.
+        # Qt will block intermediate typing like "23:" which makes it feel like
+        # you can only enter hours. We validate strictly on Save instead.
+
+        pause_group2 = QtWidgets.QGroupBox("Trade Pause")
+        pause_layout2 = QtWidgets.QGridLayout(pause_group2)
+        pause_layout2.setHorizontalSpacing(10)
+        pause_layout2.setVerticalSpacing(8)
+        pause_layout2.addWidget(QtWidgets.QLabel("Pause Day"), 0, 0)
+        self.psl_scheduler_pause_day = QtWidgets.QComboBox()
+        self._populate_dow_combo(self.psl_scheduler_pause_day)
+        pause_layout2.addWidget(self.psl_scheduler_pause_day, 0, 1)
+        pause_layout2.addWidget(QtWidgets.QLabel("Pause Time"), 1, 0)
+        pause_time_row2 = QtWidgets.QWidget()
+        pause_time_row2_layout = QtWidgets.QHBoxLayout(pause_time_row2)
+        pause_time_row2_layout.setContentsMargins(0, 0, 0, 0)
+        pause_time_row2_layout.setSpacing(6)
+        self.psl_scheduler_pause_hour = QtWidgets.QComboBox()
+        self._populate_hour_combo(self.psl_scheduler_pause_hour)
+        self.psl_scheduler_pause_minute = QtWidgets.QComboBox()
+        self._populate_minute_combo(self.psl_scheduler_pause_minute)
+        pause_time_row2_layout.addWidget(self.psl_scheduler_pause_hour)
+        pause_time_row2_layout.addWidget(QtWidgets.QLabel(":"))
+        pause_time_row2_layout.addWidget(self.psl_scheduler_pause_minute)
+        pause_time_row2_layout.addStretch()
+        pause_layout2.addWidget(pause_time_row2, 1, 1)
+        pause_desc2 = QtWidgets.QLabel("When triggered: close ALL active EA trades, delete ALL pending EA orders, and pause trading.")
+        pause_desc2.setObjectName("muted")
+        pause_desc2.setWordWrap(True)
+        pause_layout2.addWidget(pause_desc2, 2, 0, 1, 2)
+        psl_sched_fields_layout.addWidget(pause_group2)
+
+        resume_group2 = QtWidgets.QGroupBox("Trade Resume")
+        resume_layout2 = QtWidgets.QGridLayout(resume_group2)
+        resume_layout2.setHorizontalSpacing(10)
+        resume_layout2.setVerticalSpacing(8)
+        resume_layout2.addWidget(QtWidgets.QLabel("Resume Day"), 0, 0)
+        self.psl_scheduler_resume_day = QtWidgets.QComboBox()
+        self._populate_dow_combo(self.psl_scheduler_resume_day)
+        resume_layout2.addWidget(self.psl_scheduler_resume_day, 0, 1)
+        resume_layout2.addWidget(QtWidgets.QLabel("Resume Time"), 1, 0)
+        resume_time_row2 = QtWidgets.QWidget()
+        resume_time_row2_layout = QtWidgets.QHBoxLayout(resume_time_row2)
+        resume_time_row2_layout.setContentsMargins(0, 0, 0, 0)
+        resume_time_row2_layout.setSpacing(6)
+        self.psl_scheduler_resume_hour = QtWidgets.QComboBox()
+        self._populate_hour_combo(self.psl_scheduler_resume_hour)
+        self.psl_scheduler_resume_minute = QtWidgets.QComboBox()
+        self._populate_minute_combo(self.psl_scheduler_resume_minute)
+        resume_time_row2_layout.addWidget(self.psl_scheduler_resume_hour)
+        resume_time_row2_layout.addWidget(QtWidgets.QLabel(":"))
+        resume_time_row2_layout.addWidget(self.psl_scheduler_resume_minute)
+        resume_time_row2_layout.addStretch()
+        resume_layout2.addWidget(resume_time_row2, 1, 1)
+        resume_desc2 = QtWidgets.QLabel("When triggered: resume EA trading normally and accept new signals.")
+        resume_desc2.setObjectName("muted")
+        resume_desc2.setWordWrap(True)
+        resume_layout2.addWidget(resume_desc2, 2, 0, 1, 2)
+        psl_sched_fields_layout.addWidget(resume_group2)
+
+        psl_tc_layout.addWidget(self.psl_scheduler_fields_container)
+
+        # Mark trade-control state dirty whenever user interacts (PSL widgets)
+        for cb in (
+            self.psl_allow_close_checkbox,
+            self.psl_allow_breakeven_checkbox,
+            self.psl_allow_secure_half_checkbox,
+            self.psl_allow_multiple_checkbox,
+        ):
+            cb.toggled.connect(self._mark_trade_control_dirty)
+
+        # Scheduler dirty tracking (PSL widgets)
+        try:
+            self.psl_scheduler_active_checkbox.toggled.connect(self._on_scheduler_ui_changed)
+            self.psl_scheduler_pause_day.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.psl_scheduler_pause_hour.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.psl_scheduler_pause_minute.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.psl_scheduler_resume_day.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.psl_scheduler_resume_hour.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+            self.psl_scheduler_resume_minute.currentIndexChanged.connect(self._on_scheduler_ui_changed)
+        except Exception:
+            pass
+
+        # PSL Entry Strategy controls
+        psl_entry_container = QtWidgets.QWidget()
+        psl_entry_layout = QtWidgets.QVBoxLayout(psl_entry_container)
+        psl_entry_layout.setContentsMargins(0, 0, 0, 0)
+        psl_entry_layout.setSpacing(6)
+        psl_entry_label = QtWidgets.QLabel("Entry Strategy")
+        psl_entry_label.setObjectName("title")
+        psl_entry_sub = QtWidgets.QLabel("Select how to place pending orders for range signals:")
+        psl_entry_sub.setObjectName("muted")
+        self.psl_entry_market_edge_radio = QtWidgets.QRadioButton("Market Entry + Last Range Order")
+        self.psl_entry_range_distributed_radio = QtWidgets.QRadioButton("Distributed Range Entry")
+        self.psl_entry_market_edge_radio.setChecked(True)
+        self.psl_entry_market_edge_radio.setEnabled(False)
+        self.psl_entry_range_distributed_radio.setEnabled(False)
+        psl_entry_layout.addWidget(psl_entry_label)
+        psl_entry_layout.addWidget(psl_entry_sub)
+        psl_entry_layout.addWidget(self.psl_entry_market_edge_radio)
+        psl_entry_layout.addWidget(self.psl_entry_range_distributed_radio)
+        psl_tc_layout.addWidget(psl_entry_container)
+
+        psl_panel_layout.addWidget(psl_tc_group)
+        # No separate PSL save button — uses shared Edit/Save buttons
+        psl_panel_layout.addStretch()
+        # Add both panels to settings (only one visible at a time)
+        settings_layout.addWidget(self.gls_panel)
+        settings_layout.addWidget(self.psl_panel)
+        # Default: show GLS, hide PSL
+        self.gls_panel.setVisible(True)
+        self.psl_panel.setVisible(False)
+
+        # Alias shared references to GLS widgets by default (switch on mode toggle)
+        self.allow_close_checkbox = self.gls_allow_close_checkbox
+        self.allow_breakeven_checkbox = self.gls_allow_breakeven_checkbox
+        self.allow_secure_half_checkbox = self.gls_allow_secure_half_checkbox
+        self.allow_multiple_checkbox = self.gls_allow_multiple_checkbox
+        self.entry_market_edge_radio = self.gls_entry_market_edge_radio
+        self.entry_range_distributed_radio = self.gls_entry_range_distributed_radio
+
+        # Scheduler shared references (mode-independent settings; widgets are duplicated per panel)
+        self.scheduler_active_checkbox = self.gls_scheduler_active_checkbox
+        self.scheduler_pause_day_combo = self.gls_scheduler_pause_day
+        self.scheduler_pause_hour_combo = self.gls_scheduler_pause_hour
+        self.scheduler_pause_minute_combo = self.gls_scheduler_pause_minute
+        self.scheduler_resume_day_combo = self.gls_scheduler_resume_day
+        self.scheduler_resume_hour_combo = self.gls_scheduler_resume_hour
+        self.scheduler_resume_minute_combo = self.gls_scheduler_resume_minute
+
+        try:
+            self._apply_scheduler_state_to_ui()
+        except Exception:
+            pass
+
+        # Connect entry radios for both GLS and PSL sets
+        try:
+            self.gls_entry_market_edge_radio.toggled.connect(self._on_entry_mode_changed)
+            self.gls_entry_range_distributed_radio.toggled.connect(self._on_entry_mode_changed)
+            self.psl_entry_market_edge_radio.toggled.connect(self._on_entry_mode_changed)
+            self.psl_entry_range_distributed_radio.toggled.connect(self._on_entry_mode_changed)
+        except Exception:
+            pass
+        
+        # Edit / Save controls: Edit (left) — Save Settings (right)
+        btn_row = QtWidgets.QWidget()
+        btn_row_layout = QtWidgets.QHBoxLayout(btn_row)
+        btn_row_layout.setContentsMargins(0, 0, 0, 0)
+        btn_row_layout.setSpacing(8)
+        self.edit_settings_btn = QtWidgets.QPushButton("Edit")
+        self.edit_settings_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.edit_settings_btn.setEnabled(False)  # Disabled by default until EA active
+        self.save_settings_btn = QtWidgets.QPushButton("Save Settings")
+        self.save_settings_btn.setObjectName("primary")
+        self.save_settings_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        btn_row_layout.addWidget(self.edit_settings_btn, alignment=QtCore.Qt.AlignLeft)
+        btn_row_layout.addStretch()
+        btn_row_layout.addWidget(self.save_settings_btn, alignment=QtCore.Qt.AlignRight)
+        settings_layout.addWidget(btn_row)
+        settings_layout.addStretch()
+        self.expert_page = QtWidgets.QWidget()
+        expert_layout = QtWidgets.QHBoxLayout(self.expert_page)
+        expert_layout.setSpacing(16)
+        expert_layout.setContentsMargins(0, 0, 0, 0)
+        left_panel = QtWidgets.QFrame()
+        left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_layout.setSpacing(16)
+
+        # --- UI-only platform/account indicator for Expert flow (small label, no title) ---
+        def _update_expert_context_indicator() -> None:
+            try:
+                idx = self.expert_stack.currentIndex()
+            except Exception:
+                idx = 0
+            platform_txt = (getattr(self, "platform", "") or "").upper() or "—"
+
+            # Page context rules:
+            # - Platform page: show nothing (user is choosing platform).
+            # - Account page: show only platform.
+            # - Credentials page: show platform + account selection.
+            if idx == 0:
+                text = ""
+            elif idx == 1:
+                text = f"Platform: {platform_txt}"
+            else:
+                acct = (getattr(self, "current_account_type", None) or "").lower()
+                if acct == "prop":
+                    acct_txt = "Prop"
+                elif acct == "normal":
+                    acct_txt = "Normal"
+                else:
+                    acct_txt = "—"
+                text = f"{platform_txt} – {acct_txt}"
+            try:
+                for attr in (
+                    "expert_platform_context_label",
+                    "expert_account_context_label",
+                    "expert_credential_context_label",
+                ):
+                    lbl = getattr(self, attr, None)
+                    if lbl is not None:
+                        lbl.setText(text)
+            except Exception:
+                pass
+
+        self._update_expert_context_indicator = _update_expert_context_indicator
+        self.expert_stack = QtWidgets.QStackedWidget()
+        self.expert_stack.setMinimumWidth(420)
+        left_layout.addWidget(self.expert_stack)
+        platform_page = QtWidgets.QWidget()
+        platform_layout = QtWidgets.QVBoxLayout(platform_page)
+        platform_layout.setSpacing(12)
+        self.platform_back = QtWidgets.QPushButton("⬅️ Back")
+        platform_top = QtWidgets.QHBoxLayout()
+        platform_top.setContentsMargins(0, 0, 0, 0)
+        platform_top.addWidget(self.platform_back, alignment=QtCore.Qt.AlignLeft)
+        platform_top.addStretch()
+        self.expert_platform_context_label = QtWidgets.QLabel("")
+        self.expert_platform_context_label.setObjectName("muted")
+        self.expert_platform_context_label.setStyleSheet("font-size: 12px;")
+        platform_top.addWidget(self.expert_platform_context_label, alignment=QtCore.Qt.AlignRight)
+        platform_layout.addLayout(platform_top)
+        platform_title = QtWidgets.QLabel("Connect Your Trading Platform")
+        platform_title.setObjectName("title")
+        platform_layout.addWidget(platform_title)
+        self.mt5_button = QtWidgets.QPushButton("🟦 MT5")
+        self.mt5_button.setObjectName("primary")
+        self.mt4_button = QtWidgets.QPushButton("⬜ MT4")
+        self.mt4_button.setObjectName("primary")
+        platform_layout.addWidget(self.mt5_button)
+        platform_layout.addWidget(self.mt4_button)
+        platform_layout.addStretch()
+        self.expert_stack.addWidget(platform_page)
+        account_page = QtWidgets.QWidget()
+        account_layout = QtWidgets.QVBoxLayout(account_page)
+        account_layout.setSpacing(12)
+        self.account_back = QtWidgets.QPushButton("⬅️ Back")
+        account_top = QtWidgets.QHBoxLayout()
+        account_top.setContentsMargins(0, 0, 0, 0)
+        account_top.addWidget(self.account_back, alignment=QtCore.Qt.AlignLeft)
+        account_top.addStretch()
+        self.expert_account_context_label = QtWidgets.QLabel("")
+        self.expert_account_context_label.setObjectName("muted")
+        self.expert_account_context_label.setStyleSheet("font-size: 12px;")
+        account_top.addWidget(self.expert_account_context_label, alignment=QtCore.Qt.AlignRight)
+        account_layout.addLayout(account_top)
+        account_title = QtWidgets.QLabel("Select Account Type")
+        account_title.setObjectName("title")
+        account_layout.addWidget(account_title)
+        self.prop_button = QtWidgets.QPushButton("🏦 Prop Account")
+        self.normal_button = QtWidgets.QPushButton("💼 Normal Account")
+        account_layout.addWidget(self.prop_button)
+        account_layout.addWidget(self.normal_button)
+        account_layout.addStretch()
+        self.expert_stack.addWidget(account_page)
+        credential_page = QtWidgets.QWidget()
+        credential_layout = QtWidgets.QVBoxLayout(credential_page)
+        credential_layout.setSpacing(12)
+        self.credential_back = QtWidgets.QPushButton("⬅️ Back")
+        cred_top = QtWidgets.QHBoxLayout()
+        cred_top.setContentsMargins(0, 0, 0, 0)
+        cred_top.addWidget(self.credential_back, alignment=QtCore.Qt.AlignLeft)
+        cred_top.addStretch()
+        self.expert_credential_context_label = QtWidgets.QLabel("")
+        self.expert_credential_context_label.setObjectName("muted")
+        self.expert_credential_context_label.setStyleSheet("font-size: 12px;")
+        cred_top.addWidget(self.expert_credential_context_label, alignment=QtCore.Qt.AlignRight)
+        credential_layout.addLayout(cred_top)
+        credential_title = QtWidgets.QLabel("FlameBot Credentials")
+        credential_title.setObjectName("title")
+        credential_layout.addWidget(credential_title)
+        self.credentials_card = QtWidgets.QFrame()
+        self.credentials_card.setObjectName("card")
+        card_layout = QtWidgets.QVBoxLayout(self.credentials_card)
+        card_layout.setSpacing(8)
+        self.active_profile_label = QtWidgets.QLabel("")
+        self.active_profile_label.setObjectName("muted")
+        self.flamebot_id_label = QtWidgets.QLabel(f"FlameBot ID: {self.flamebot_id}")
+        self.license_key_label = QtWidgets.QLabel("License Key: ")
+        self.flamebot_id_label.setStyleSheet("font-weight: 600;")
+        self.license_key_label.setStyleSheet("font-weight: 600;")
+        card_layout.addWidget(self.active_profile_label)
+        card_layout.addWidget(self.flamebot_id_label)
+        card_layout.addWidget(self.license_key_label)
+        credential_layout.addWidget(self.credentials_card)
+        credential_hint = QtWidgets.QLabel(
+            "Enter these details into the FlameBot EA to log in."
+        )
+        credential_hint.setObjectName("muted")
+        credential_hint.setWordWrap(True)
+        credential_layout.addWidget(credential_hint)
+        credential_buttons = QtWidgets.QHBoxLayout()
+        self.copy_id_btn = QtWidgets.QPushButton("📋 Copy ID")
+        self.copy_license_btn = QtWidgets.QPushButton("📋 Copy License Key")
+        credential_buttons.addWidget(self.copy_id_btn)
+        credential_buttons.addWidget(self.copy_license_btn)
+        credential_layout.addLayout(credential_buttons)
+        
+        # Log out EA button
+        self.clear_cached_btn = QtWidgets.QPushButton("🔌 Log out EA")
+        self.clear_cached_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.clear_cached_btn.setStyleSheet("background-color: rgba(255, 122, 47, 0.12); padding: 8px;")
+        credential_layout.addWidget(self.clear_cached_btn)
+
+        # Insert EA Status inside the FlameBot credentials area (not the right column)
+        status_panel = QtWidgets.QFrame()
+        status_panel.setObjectName("card")
+        status_layout = QtWidgets.QVBoxLayout(status_panel)
+        status_layout.setSpacing(10)
+        status_title = QtWidgets.QLabel("EA Status")
+        status_title.setObjectName("title")
+        status_layout.addWidget(status_title)
+        self.ea_status_message = QtWidgets.QLabel("")
+        self.ea_status_message.setWordWrap(True)
+        status_layout.addWidget(self.ea_status_message)
+        status_layout.addStretch()
+
+        credential_layout.addStretch()
+        self.expert_stack.addWidget(credential_page)
+        expert_layout.addWidget(left_panel, stretch=2)
+        # Put the EA Status back in the right column (side panel)
+        expert_layout.addWidget(status_panel, stretch=1)
+        # Show EA status only when credentials page is active
+        def _on_expert_page_changed(idx: int) -> None:
+            # expert_stack pages: 0=platform, 1=account, 2=credentials
+            try:
+                status_panel.setVisible(idx == 2)
+            except Exception:
+                pass
+        # initialize visibility
+        status_panel.setVisible(self.expert_stack.currentIndex() == 2)
+        self.expert_stack.currentChanged.connect(_on_expert_page_changed)
+        try:
+            self.expert_stack.currentChanged.connect(lambda _i: _update_expert_context_indicator())
+        except Exception:
+            pass
+        _update_expert_context_indicator()
+        self.content_stack.addWidget(self.expert_page)
+        # --- Settings Wizard (NEW) — stacked pages: platform -> account -> settings_form ---
+        # Page 0: platform selection — large heading + full-width primary buttons
+        platform_page = QtWidgets.QWidget()
+        platform_layout = QtWidgets.QVBoxLayout(platform_page)
+        platform_layout.setSpacing(12)
+        platform_layout.setContentsMargins(12, 12, 12, 12)
+        platform_title = QtWidgets.QLabel("Choose Your Trading Platform")
+        platform_title.setObjectName("title")
+        platform_layout.addWidget(platform_title)
+        self.wizard_mt5 = QtWidgets.QPushButton("🟦 MT5")
+        self.wizard_mt5.setObjectName("primary")
+        self.wizard_mt5.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.wizard_mt5.setMinimumHeight(40)
+        self.wizard_mt4 = QtWidgets.QPushButton("⬜ MT4")
+        self.wizard_mt4.setObjectName("primary")
+        self.wizard_mt4.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.wizard_mt4.setMinimumHeight(40)
+        platform_layout.addWidget(self.wizard_mt5)
+        platform_layout.addWidget(self.wizard_mt4)
+        platform_layout.addStretch()
+
+        # Page 1: account selection — large buttons matching Expert sizing
+        account_page = QtWidgets.QWidget()
+        account_layout = QtWidgets.QVBoxLayout(account_page)
+        account_layout.setSpacing(12)
+        account_layout.setContentsMargins(12, 12, 12, 12)
+        account_title = QtWidgets.QLabel("Select Account Type")
+        account_title.setObjectName("title")
+        account_layout.addWidget(account_title)
+        self.wizard_prop = QtWidgets.QPushButton("🏦 Prop Account")
+        self.wizard_prop.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.wizard_prop.setMinimumHeight(40)
+        self.wizard_normal = QtWidgets.QPushButton("💼 Normal Account")
+        self.wizard_normal.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.wizard_normal.setMinimumHeight(40)
+        account_layout.addWidget(self.wizard_prop)
+        account_layout.addWidget(self.wizard_normal)
+        account_layout.addStretch()
+
+        # Page 2: existing settings form (reuse `self.settings_page` as the form)
+        settings_form_page = QtWidgets.QWidget()
+        settings_form_layout = QtWidgets.QVBoxLayout(settings_form_page)
+        settings_form_layout.setContentsMargins(0, 0, 0, 0)
+        # Wrap the existing Settings form in a scroll area so content can be scrolled
+        settings_scroll = QtWidgets.QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        settings_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        settings_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        settings_scroll.setWidget(self.settings_page)
+        settings_form_layout.addWidget(settings_scroll)
+
+        # Build stacked widget and add pages
+        self.settings_wizard_stack = QtWidgets.QStackedWidget()
+        self.settings_wizard_stack.addWidget(platform_page)
+        self.settings_wizard_stack.addWidget(account_page)
+        self.settings_wizard_stack.addWidget(settings_form_page)
+
+        # --- UI-only platform/account indicator (small label, no title) ---
+        self.settings_context_label = QtWidgets.QLabel("")
+        self.settings_context_label.setObjectName("muted")
+        self.settings_context_label.setStyleSheet("font-size: 12px;")
+
+        def _update_settings_context_indicator() -> None:
+            try:
+                idx = self.settings_wizard_stack.currentIndex()
+            except Exception:
+                idx = 0
+            platform = getattr(self, "wizard_selected_platform", None) or getattr(self, "platform", None)
+            platform_txt = (platform or "").upper()
+            if not platform_txt:
+                platform_txt = "—"
+
+            # Page context rules:
+            # - Platform page: show nothing (user is choosing platform).
+            # - Account page: show only platform.
+            # - Settings page: show platform + account selection.
+            if idx == 0:
+                text = ""
+            elif idx == 1:
+                text = f"Platform: {platform_txt}"
+            else:
+                acct = getattr(self, "wizard_selected_account", None)
+                if acct == "prop":
+                    acct_txt = "Prop"
+                elif acct == "normal":
+                    acct_txt = "Normal"
+                else:
+                    acct_txt = "—"
+                text = f"{platform_txt} – {acct_txt}"
+            try:
+                self.settings_context_label.setText(text)
+            except Exception:
+                pass
+
+        # Keep a reference so other handlers can refresh when opening the wizard.
+        self._update_settings_context_indicator = _update_settings_context_indicator
+        try:
+            self.settings_wizard_stack.currentChanged.connect(lambda _i: _update_settings_context_indicator())
+        except Exception:
+            pass
+        _update_settings_context_indicator()
+
+        # Compose final settings container: minimal header (back) + stacked widget
+        self.settings_wizard = QtWidgets.QWidget()
+        wiz_outer = QtWidgets.QVBoxLayout(self.settings_wizard)
+        wiz_outer.setSpacing(8)
+        wiz_outer.setContentsMargins(0, 0, 0, 0)
+        # small back control (no step labels)
+        self.wizard_back = QtWidgets.QPushButton("Back")
+        self.wizard_back.setMaximumWidth(120)
+        hdr_row = QtWidgets.QHBoxLayout()
+        hdr_row.addWidget(self.wizard_back)
+        hdr_row.addStretch()
+        hdr_row.addWidget(self.settings_context_label, alignment=QtCore.Qt.AlignRight)
+        wiz_outer.addLayout(hdr_row)
+        wiz_outer.addWidget(self.settings_wizard_stack)
+
+        # Add the container to the main content stack
+        self.content_stack.addWidget(self.settings_wizard)
+
+        # --- Subscription page (UI only) ---
+        self.subscription_page = QtWidgets.QWidget()
+        subscription_layout = QtWidgets.QVBoxLayout(self.subscription_page)
+        subscription_layout.setSpacing(12)
+        subscription_header = QtWidgets.QLabel("Subscription")
+        subscription_header.setObjectName("title")
+        subscription_layout.addWidget(subscription_header)
+
+        subscription_tabs = QtWidgets.QWidget()
+        subscription_tabs_layout = QtWidgets.QHBoxLayout(subscription_tabs)
+        subscription_tabs_layout.setContentsMargins(0, 0, 0, 0)
+        subscription_tabs_layout.setSpacing(10)
+
+        self.subscription_method_btn = QtWidgets.QPushButton("Subscription Method")
+        self.subscription_method_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.subscription_method_btn.setCheckable(True)
+
+        self.subscription_status_btn = QtWidgets.QPushButton("Subscription Status")
+        self.subscription_status_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.subscription_status_btn.setCheckable(True)
+
+        subscription_tabs_layout.addWidget(self.subscription_method_btn)
+        subscription_tabs_layout.addWidget(self.subscription_status_btn)
+        subscription_tabs_layout.addStretch()
+        subscription_layout.addWidget(subscription_tabs)
+
+        self.subscription_stack = QtWidgets.QStackedWidget()
+        subscription_layout.addWidget(self.subscription_stack)
+
+        # Method view
+        method_page = QtWidgets.QWidget()
+        method_layout = QtWidgets.QVBoxLayout(method_page)
+        method_layout.setSpacing(10)
+        method_title = QtWidgets.QLabel("Subscription Method")
+        method_title.setObjectName("title")
+        method_layout.addWidget(method_title)
+
+        self.sub_bank_btn = QtWidgets.QPushButton("🏦 Bank Transfer")
+        self.sub_bank_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sub_bank_btn.setCheckable(True)
+        self.sub_card_btn = QtWidgets.QPushButton("💳 Bank Card")
+        self.sub_card_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sub_card_btn.setCheckable(True)
+        self.sub_crypto_btn = QtWidgets.QPushButton("₿ Crypto Transfer")
+        self.sub_crypto_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sub_crypto_btn.setCheckable(True)
+
+        method_layout.addWidget(self.sub_bank_btn)
+        method_layout.addWidget(self.sub_card_btn)
+        method_layout.addWidget(self.sub_crypto_btn)
+        method_layout.addStretch()
+
+        # Status view
+        status_page = QtWidgets.QWidget()
+        status_layout = QtWidgets.QVBoxLayout(status_page)
+        status_layout.setSpacing(10)
+        status_title = QtWidgets.QLabel("Subscription Status")
+        status_title.setObjectName("title")
+        status_layout.addWidget(status_title)
+
+        status_block = QtWidgets.QFrame()
+        status_block.setObjectName("card")
+        status_block_layout = QtWidgets.QVBoxLayout(status_block)
+        status_block_layout.setSpacing(6)
+        status_block_layout.addWidget(QtWidgets.QLabel("Status: Not Subscribed"))
+        status_block_layout.addWidget(QtWidgets.QLabel("Plan: —"))
+        status_block_layout.addWidget(QtWidgets.QLabel("Expiry: —"))
+        status_layout.addWidget(status_block)
+        status_layout.addStretch()
+
+        self.subscription_stack.addWidget(method_page)
+        self.subscription_stack.addWidget(status_page)
+
+        # Default selection
+        self.subscription_method_btn.setChecked(True)
+        self.subscription_status_btn.setChecked(False)
+        self.subscription_stack.setCurrentIndex(0)
+
+        # Exclusive selection groups
+        self.subscription_tab_group = QtWidgets.QButtonGroup(self)
+        self.subscription_tab_group.setExclusive(True)
+        self.subscription_tab_group.addButton(self.subscription_method_btn)
+        self.subscription_tab_group.addButton(self.subscription_status_btn)
+
+        self.subscription_method_group = QtWidgets.QButtonGroup(self)
+        self.subscription_method_group.setExclusive(True)
+        self.subscription_method_group.addButton(self.sub_bank_btn)
+        self.subscription_method_group.addButton(self.sub_card_btn)
+        self.subscription_method_group.addButton(self.sub_crypto_btn)
+        self.sub_bank_btn.setChecked(True)
+
+        self.content_stack.addWidget(self.subscription_page)
+
+        # Wiring: buttons set selection and navigate automatically
+        self.wizard_mt5.clicked.connect(lambda: self._on_wizard_platform_selected('mt5'))
+        self.wizard_mt4.clicked.connect(lambda: self._on_wizard_platform_selected('mt4'))
+        self.wizard_prop.clicked.connect(lambda: (setattr(self, 'wizard_selected_account', 'prop'), self._on_wizard_account_selected('prop')))
+        self.wizard_normal.clicked.connect(lambda: (setattr(self, 'wizard_selected_account', 'normal'), self._on_wizard_account_selected('normal')))
+        def _wizard_back():
+            idx = self.settings_wizard_stack.currentIndex()
+            if idx > 0:
+                self.settings_wizard_stack.setCurrentIndex(idx - 1)
+            else:
+                self.content_stack.setCurrentWidget(self.message_log_page)
+        self.wizard_back.clicked.connect(_wizard_back)
+        self.dashboard_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.dashboard_splitter.setHandleWidth(6)
+        self.dashboard_splitter.setChildrenCollapsible(False)
+        self.dashboard_splitter.setStyleSheet(
+            """
+            QSplitter::handle { background: rgba(0, 0, 0, 0.35); }
+            QSplitter::handle:hover { background: rgba(255, 255, 255, 0.35); }
+            """
+        )
+        self.sidebar.setMinimumWidth(230)
+        self.message_panel.setMinimumWidth(360)
+        self.dashboard_splitter.addWidget(self.sidebar)
+        self.dashboard_splitter.addWidget(self.message_panel)
+        self.dashboard_splitter.setStretchFactor(0, 1)
+        self.dashboard_splitter.setStretchFactor(1, 2)
+        self.dashboard_splitter.setSizes([300, 620])
+        self.dashboard_splitter.splitterMoved.connect(self._enforce_dashboard_limits)
+        dashboard_layout.addWidget(self.dashboard_splitter)
+        self.main_stack.addWidget(dashboard_page)
+        self.drawer_overlay = QtWidgets.QWidget(self)
+        self.drawer_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 90);")
+        self.drawer_overlay.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        self.drawer_overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+        self.drawer_overlay.hide()
+        self.drawer_overlay.installEventFilter(self)
+        self.drawer = QtWidgets.QFrame(self)
+        self.drawer.setFixedWidth(280)
+        self.drawer.setStyleSheet(
+            """
+            QFrame {
+                background-color: #1b1e23;
+                color: #f5f5f5;
+                border-top-right-radius: 12px;
+                border-bottom-right-radius: 12px;
+            }
+            QPushButton, QToolButton {
+                background: transparent;
+                color: #f5f5f5;
+                border: none;
+                text-align: left;
+                padding: 8px 10px;
+                font-size: 14px;
+            }
+            QPushButton:hover, QToolButton:hover { background: rgba(255, 255, 255, 0.06); }
+            QFrame#divider { background: rgba(255, 255, 255, 0.08); min-height: 1px; }
+            """
+        )
+        self.drawer_layout = QtWidgets.QVBoxLayout(self.drawer)
+        self.drawer_layout.setContentsMargins(12, 18, 12, 12)
+        self.drawer_layout.setSpacing(10)
+
+        profile_block = QtWidgets.QFrame()
+        profile_layout = QtWidgets.QHBoxLayout(profile_block)
+        profile_layout.setContentsMargins(8, 6, 8, 6)
+        profile_layout.setSpacing(10)
+
+        self.profile_avatar = QtWidgets.QLabel()
+        self.profile_avatar.setFixedSize(38, 38)
+        self.profile_avatar.setStyleSheet(
+            "border-radius: 19px; background-color: #2a2f38; color: #ffffff; font-weight: 700; font-size: 16px;"
+        )
+        self.profile_avatar.setAlignment(QtCore.Qt.AlignCenter)
+        self._update_profile_avatar()
+
+        text_col = QtWidgets.QVBoxLayout()
+        text_col.setSpacing(2)
+        self.profile_name = QtWidgets.QLabel(self.user_name)
+        self.profile_name.setStyleSheet("font-weight: 600;")
+        self.profile_phone = QtWidgets.QLabel(mask_phone(self.user_phone))
+        self.profile_phone.setObjectName("muted")
+        text_col.addWidget(self.profile_name)
+        text_col.addWidget(self.profile_phone)
+
+        profile_layout.addWidget(self.profile_avatar)
+        profile_layout.addLayout(text_col)
+        profile_layout.addStretch()
+        self.drawer_layout.addWidget(profile_block)
+
+        self.profile_btn = QtWidgets.QToolButton()
+        self.profile_btn.setText(" 🏠   Home")
+        self.profile_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.profile_btn.setEnabled(False)
+
+        self.settings_btn = QtWidgets.QToolButton()
+        self.settings_btn.setText(" ⚙️   Settings")
+        self.settings_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.settings_btn.setEnabled(False)
+
+        self.subscription_btn = QtWidgets.QToolButton()
+        self.subscription_btn.setText(" 💳   Subscription")
+        self.subscription_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.subscription_btn.setEnabled(False)
+
+        self.expert_btn = QtWidgets.QToolButton()
+        self.expert_btn.setText(" 🧠   Expert")
+        self.expert_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.expert_btn.setEnabled(False)
+
+        for btn in (self.profile_btn, self.expert_btn, self.settings_btn, self.subscription_btn):
+            btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+            btn.setIconSize(QtCore.QSize(18, 18))
+            btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            btn.setMinimumHeight(32)
+            self.drawer_layout.addWidget(btn)
+
+        appearance_frame = QtWidgets.QFrame()
+        appearance_layout = QtWidgets.QVBoxLayout(appearance_frame)
+        appearance_layout.setContentsMargins(8, 4, 8, 4)
+        appearance_layout.setSpacing(6)
+
+        appearance_label_row = QtWidgets.QHBoxLayout()
+        appearance_label_row.setSpacing(6)
+        appearance_title = QtWidgets.QLabel("Night Mode")
+        appearance_title.setStyleSheet("font-weight: 600;")
+        appearance_label_row.addWidget(appearance_title)
+        appearance_label_row.addStretch()
+
+        self.night_toggle = QtWidgets.QCheckBox()
+        self.night_toggle.setCursor(QtCore.Qt.PointingHandCursor)
+        self.night_toggle.setTristate(False)
+        self.night_toggle.setStyleSheet(
+            """
+            QCheckBox::indicator { width: 44px; height: 24px; }
+            QCheckBox::indicator:unchecked {
+                border-radius: 12px;
+                background-color: #3a3f48;
+            }
+            QCheckBox::indicator:checked {
+                border-radius: 12px;
+                background-color: #3fa55d;
+            }
+            QCheckBox::indicator:unchecked:before,
+            QCheckBox::indicator:checked:before {
+                position: relative;
+                left: 2px;
+                top: 2px;
+                width: 20px;
+                height: 20px;
+                border-radius: 10px;
+                background: white;
+            }
+            QCheckBox::indicator:checked:before { margin-left: 18px; }
+            """
+        )
+        appearance_label_row.addWidget(self.night_toggle)
+
+        appearance_layout.addLayout(appearance_label_row)
+
+        self.system_sync_btn = QtWidgets.QPushButton("Follow system")
+        self.system_sync_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.system_sync_btn.setStyleSheet(
+            "background: transparent; color: #8fa0b3; font-size: 12px; padding-left: 0;"
+        )
+        appearance_layout.addWidget(self.system_sync_btn)
+
+        self.drawer_layout.addWidget(appearance_frame)
+
+        self.logout_btn = QtWidgets.QPushButton("Logout")
+        self.logout_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.logout_btn.setStyleSheet(
+            "background: transparent; color: #f5f5f5; font-weight: 500; padding-left: 10px;"
+        )
+        self.drawer_layout.addWidget(self.logout_btn)
+
+        divider = QtWidgets.QFrame()
+        divider.setObjectName("divider")
+        divider.setFixedHeight(1)
+        self.drawer_layout.addWidget(divider)
+
+        self.about_btn = QtWidgets.QPushButton("About")
+        self.about_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.drawer_layout.addWidget(self.about_btn)
+        self.drawer_layout.addStretch()
+        self._drawer_open = False
+        self.drawer.hide()
+        self._apply_theme_selection(self.theme_mode)
+
+    def _init_toast(self) -> None:
+        self._toast = QtWidgets.QLabel(self)
+        self._toast.setVisible(False)
+        self._toast.setStyleSheet(
+            """
+            QLabel {
+                background-color: rgba(32, 32, 40, 230);
+                color: white;
+                border-radius: 10px;
+                padding: 8px 12px;
+                font-weight: 600;
+            }
+            """
+        )
+        self._toast.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self._toast_timer = QtCore.QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._toast.hide)
+
+        # Persistent network-status toast (same formatting as other toasts).
+        # This keeps connection state visible without spamming the Message Log.
+        self._net_toast = QtWidgets.QLabel(self)
+        self._net_toast.setVisible(False)
+        self._net_toast.setStyleSheet(self._toast.styleSheet())
+        self._net_toast.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+        # Network toast cycle (non-pinned): show/hide periodically while offline.
+        self._net_toast_text = ""
+        self._net_cycle_timer = QtCore.QTimer(self)
+        self._net_cycle_timer.setInterval(int(os.environ.get("FLAMEBOT_NET_TOAST_CYCLE_MS", "10000")))
+        self._net_cycle_timer.timeout.connect(self._toggle_net_toast)
+
+    def _toggle_net_toast(self) -> None:
+        try:
+            text = str(getattr(self, "_net_toast_text", "") or "").strip()
+            net = getattr(self, "_net_toast", None)
+            if net is None:
+                return
+            if not text:
+                try:
+                    if hasattr(self, "_net_cycle_timer") and self._net_cycle_timer.isActive():
+                        self._net_cycle_timer.stop()
+                except Exception:
+                    pass
+                net.hide()
+                self._position_toasts()
+                return
+
+            if net.isVisible():
+                net.hide()
+            else:
+                net.setText(text)
+                net.adjustSize()
+                net.show()
+            self._position_toasts()
+        except Exception:
+            pass
+
+    def _position_toasts(self) -> None:
+        margin = 16
+        gap = 8
+        y = margin
+
+        # Network toast sits above the normal toast.
+        try:
+            if getattr(self, "_net_toast", None) and self._net_toast.isVisible():
+                self._net_toast.adjustSize()
+                x = self.width() - self._net_toast.width() - margin
+                self._net_toast.move(max(0, x), y)
+                y += self._net_toast.height() + gap
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_toast", None) and self._toast.isVisible():
+                self._toast.adjustSize()
+                x = self.width() - self._toast.width() - margin
+                self._toast.move(max(0, x), y)
+        except Exception:
+            pass
+
+    def _show_toast(self, msg: str, duration_ms: int = 5000) -> None:
+        # During initialization, toast widget may not exist yet - print to console
+        if not hasattr(self, '_toast') or not hasattr(self, '_toast_timer'):
+            # Keep production console clean; only print if explicitly debugging.
+            if os.environ.get("FLAMEBOT_DEBUG", "0") == "1":
+                print(f"[TOAST] {msg}")
+            return
+
+        # User-visible wording: prefer "server" over "backend".
+        try:
+            import re
+
+            def _repl(m: "re.Match[str]") -> str:
+                w = m.group(0)
+                if w.isupper():
+                    return "SERVER"
+                if w[:1].isupper():
+                    return "Server"
+                return "server"
+
+            msg = re.sub(r"\bbackend\b", _repl, str(msg or ""), flags=re.IGNORECASE)
+        except Exception:
+            pass
+
+        # De-duplicate identical messages arriving in quick succession
+        try:
+            now = time.time()
+            if msg == getattr(self, "_toast_last_msg", "") and (now - float(getattr(self, "_toast_last_ts", 0.0))) < 1.2:
+                return
+            self._toast_last_msg = msg
+            self._toast_last_ts = now
+        except Exception:
+            pass
+        self._toast.setText(msg)
+        self._toast.adjustSize()
+        self._toast.show()
+        self._position_toasts()
+        self._toast_timer.start(duration_ms)
+
+    def _toggle_drawer(self, open_drawer: Optional[bool] = None) -> None:
+        target_state = not self._drawer_open if open_drawer is None else open_drawer
+        self._drawer_open = target_state
+        if self._drawer_open:
+            self.drawer_overlay.show()
+        else:
+            self.drawer_overlay.hide()
+        if not self.drawer.isVisible():
+            self.drawer.move(-self.drawer.width(), 0)
+        start_x = self.drawer.x() if self.drawer.isVisible() else -self.drawer.width()
+        end_x = 0 if self._drawer_open else -self.drawer.width()
+        self.drawer.show()
+        self.drawer_overlay.raise_()
+        self.drawer.raise_()
+        self.drawer_overlay.setGeometry(self.rect())
+        self.drawer.setGeometry(start_x, 0, self.drawer.width(), self.height())
+        self._drawer_anim = QtCore.QPropertyAnimation(self.drawer, b"pos", self)
+        self._drawer_anim.setDuration(180)
+        self._drawer_anim.setStartValue(QtCore.QPoint(start_x, 0))
+        self._drawer_anim.setEndValue(QtCore.QPoint(end_x, 0))
+        self._drawer_anim.start()
+
+    def _apply_theme_selection(self, mode: str) -> None:
+        if mode == "system":
+            self.night_toggle.blockSignals(True)
+            self.night_toggle.setChecked(self._is_dark_mode("system"))
+            self.night_toggle.blockSignals(False)
+            self.system_sync_btn.setText("Synced to system")
+        else:
+            self.night_toggle.blockSignals(True)
+            self.night_toggle.setChecked(mode == "dark")
+            self.night_toggle.blockSignals(False)
+            self.system_sync_btn.setText("Follow system")
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        try:
+            self._position_toasts()
+        except Exception:
+            pass
+        if getattr(self, "drawer_overlay", None):
+            self.drawer_overlay.setGeometry(self.rect())
+        if getattr(self, "drawer", None):
+            target_x = 0 if getattr(self, "_drawer_open", False) else -self.drawer.width()
+            self.drawer.setGeometry(target_x, 0, self.drawer.width(), self.height())
+        try:
+            overlay = getattr(self, "_theme_fade_overlay", None)
+            if overlay is not None:
+                overlay.setGeometry(self.rect())
+        except Exception:
+            pass
+        self._position_password_toggle()
+
+        # Keep the verification overlay centered when the main window is resized/restored.
+        try:
+            self._recenter_verification_dialog()
+        except Exception:
+            pass
+        # Reflow symbol grid on resize so columns adapt to new width
+        try:
+            if hasattr(self, "symbol_container") and getattr(self, "_symbol_list_updating", False) is False:
+                # Debounce heavy rebuild during live resize
+                self._symbol_resize_timer.start(120)
+        except Exception:
+            pass
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802
+        super().changeEvent(event)
+        try:
+            if event.type() == QtCore.QEvent.WindowStateChange:
+                QtCore.QTimer.singleShot(0, self._recenter_verification_dialog)
+        except Exception:
+            pass
+
+    def _recenter_verification_dialog(self) -> None:
+        dlg = getattr(self, "_verification_dialog", None)
+        if dlg is None:
+            return
+        try:
+            if not dlg.isVisible():
+                return
+        except Exception:
+            return
+        try:
+            if dlg.isMaximized() or dlg.isFullScreen():
+                return
+        except Exception:
+            pass
+        try:
+            if self.isMinimized():
+                return
+        except Exception:
+            pass
+
+        try:
+            geo = self.geometry()
+            x = int(geo.x() + (geo.width() - dlg.width()) / 2)
+            y = int(geo.y() + (geo.height() - dlg.height()) / 2)
+        except Exception:
+            return
+
+        # Clamp to the current screen so it doesn't end up off-screen.
+        try:
+            screen = None
+            try:
+                screen = QtWidgets.QApplication.screenAt(geo.center())
+            except Exception:
+                screen = None
+            if screen is None:
+                try:
+                    screen = QtWidgets.QApplication.primaryScreen()
+                except Exception:
+                    screen = None
+
+            if screen is not None:
+                avail = screen.availableGeometry()
+                max_x = int(avail.x() + max(0, avail.width() - dlg.width()))
+                max_y = int(avail.y() + max(0, avail.height() - dlg.height()))
+                x = min(max(int(avail.x()), x), max_x)
+                y = min(max(int(avail.y()), y), max_y)
+        except Exception:
+            pass
+
+        try:
+            dlg.move(int(x), int(y))
+        except Exception:
+            pass
+
+    def _configure_log_scroll(self) -> None:
+        bar = self.log.verticalScrollBar()
+        if bool(getattr(self, "dark_mode", False)):
+            handle = "rgba(255, 255, 255, 0.35)"
+            hover = "rgba(255, 255, 255, 0.55)"
+        else:
+            handle = "rgba(17, 24, 39, 0.18)"
+            hover = "rgba(17, 24, 39, 0.30)"
+        bar.setStyleSheet(
+            (
+                "QScrollBar:vertical {"
+                "width: 6px;"
+                "background: transparent;"
+                "margin: 0;"
+                "}"
+                "QScrollBar::handle:vertical {"
+                f"background: {handle};"
+                "border-radius: 3px;"
+                "min-height: 24px;"
+                "}"
+                "QScrollBar::handle:vertical:hover {"
+                f"background: {hover};"
+                "}"
+                "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+                "height: 0;"
+                "}"
+                "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
+                "background: transparent;"
+                "}"
+            )
+        )
+        QtWidgets.QScroller.grabGesture(
+            self.log.viewport(), QtWidgets.QScroller.LeftMouseButtonGesture
+        )
+        scroller = QtWidgets.QScroller.scroller(self.log.viewport())
+        props = QtWidgets.QScrollerProperties()
+        props.setScrollMetric(QtWidgets.QScrollerProperties.DecelerationFactor, 0.12)
+        props.setScrollMetric(
+            QtWidgets.QScrollerProperties.DragVelocitySmoothingFactor, 0.6
+        )
+        props.setScrollMetric(QtWidgets.QScrollerProperties.MaximumVelocity, 0.5)
+        props.setScrollMetric(
+            QtWidgets.QScrollerProperties.OvershootScrollDistanceFactor, 0.15
+        )
+        scroller.setScrollerProperties(props)
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
+        log_widget = getattr(self, "log", None)
+        if log_widget is not None and obj is log_widget.viewport():
+            bar = log_widget.verticalScrollBar()
+            if event.type() in (
+                QtCore.QEvent.Enter,
+                QtCore.QEvent.Wheel,
+                QtCore.QEvent.MouseButtonPress,
+            ):
+                log_widget.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+                bar.show()
+            elif event.type() == QtCore.QEvent.Leave:
+                log_widget.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+                bar.hide()
+
+        list_groups = getattr(self, "list_groups", None)
+        if list_groups is not None and obj is list_groups.viewport():
+            try:
+                if event.type() == QtCore.QEvent.MouseMove:
+                    pos = event.pos()
+                    item = list_groups.itemAt(pos)
+                    gid = int(item.data(QtCore.Qt.UserRole)) if item else None
+                    self._schedule_group_row_hover(gid)
+                elif event.type() == QtCore.QEvent.Wheel:
+                    # Telegram-like: don't treat wheel-scrolling as hover.
+                    # Otherwise the hover highlight appears to "move" while scrolling.
+                    self._set_group_row_hover(None)
+                elif event.type() == QtCore.QEvent.Leave:
+                    try:
+                        t = getattr(self, "_group_row_hover_timer", None)
+                        if t is not None and t.isActive():
+                            t.stop()
+                    except Exception:
+                        pass
+                    self._set_group_row_hover(None)
+            except Exception:
+                pass
+
+        drawer_overlay = getattr(self, "drawer_overlay", None)
+        if obj is drawer_overlay and event.type() == QtCore.QEvent.MouseButtonPress:
+            self._toggle_drawer(False)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _restyle_widget(self, widget: Optional[QtWidgets.QWidget]) -> None:
+        if widget is None:
+            return
+        try:
+            widget.style().polish(widget)
+        except Exception:
+            pass
+        try:
+            if not widget.isVisible():
+                return
+        except Exception:
+            pass
+        try:
+            widget.update()
+        except Exception:
+            pass
+
+    def _schedule_group_row_hover(self, gid: Optional[int]) -> None:
+        """Throttle hover updates to keep the list snappy on large group counts."""
+        try:
+            self._pending_group_row_hover_gid = gid
+        except Exception:
+            return
+
+        t = getattr(self, "_group_row_hover_timer", None)
+        if t is None:
+            try:
+                t = QtCore.QTimer(self)
+                t.setSingleShot(True)
+                t.setInterval(30)
+                t.timeout.connect(lambda: self._set_group_row_hover(getattr(self, "_pending_group_row_hover_gid", None)))
+                self._group_row_hover_timer = t
+            except Exception:
+                self._set_group_row_hover(gid)
+                return
+
+        try:
+            if not t.isActive():
+                t.start()
+        except Exception:
+            self._set_group_row_hover(gid)
+
+    def _set_group_row_selected(self, gid: Optional[int]) -> None:
+        try:
+            old = getattr(self, "_group_row_selected_gid", None)
+        except Exception:
+            old = None
+        if old == gid:
+            return
+
+        if old is not None:
+            w_old = getattr(self, "group_widgets", {}).get(old)
+            if w_old is not None:
+                try:
+                    w_old.setProperty("selected", False)
+                except Exception:
+                    pass
+                self._restyle_widget(w_old)
+
+        if gid is not None:
+            w_new = getattr(self, "group_widgets", {}).get(gid)
+            if w_new is not None:
+                try:
+                    w_new.setProperty("selected", True)
+                except Exception:
+                    pass
+                self._restyle_widget(w_new)
+
+        try:
+            self._group_row_selected_gid = gid
+        except Exception:
+            pass
+
+    def _set_group_row_hover(self, gid: Optional[int]) -> None:
+        try:
+            old = getattr(self, "_group_row_hover_gid", None)
+        except Exception:
+            old = None
+        if old == gid:
+            return
+
+        if old is not None:
+            w_old = getattr(self, "group_widgets", {}).get(old)
+            if w_old is not None:
+                try:
+                    w_old.setProperty("hover", False)
+                except Exception:
+                    pass
+                self._restyle_widget(w_old)
+
+        if gid is not None:
+            w_new = getattr(self, "group_widgets", {}).get(gid)
+            if w_new is not None:
+                try:
+                    w_new.setProperty("hover", True)
+                except Exception:
+                    pass
+                self._restyle_widget(w_new)
+
+        try:
+            self._group_row_hover_gid = gid
+        except Exception:
+            pass
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: N802
+        if event.key() == QtCore.Qt.Key_Escape and self._drawer_open:
+            self._toggle_drawer(False)
+            return
+        super().keyPressEvent(event)
+
+    def _connect_signals(self) -> None:
+        self.api_id.textChanged.connect(self._update_api_next_state)
+        self.api_hash.textChanged.connect(self._update_api_next_state)
+        self.btn_api_next.clicked.connect(self._go_to_phone_page)
+        self.btn_phone_back.clicked.connect(self._go_back_from_phone_page)
+        self.btn_code_back.clicked.connect(lambda: self.stack.setCurrentIndex(1))
+        self.country_button.pressed.connect(self._open_country_dialog)
+        self.phone.textChanged.connect(self._on_phone_text_changed)
+        self.btn_send.clicked.connect(self.on_send)
+        self.btn_login.clicked.connect(self.on_login)
+        self.list_groups.currentItemChanged.connect(self.on_group_selected)
+        self.group_search.textChanged.connect(self.on_filter_groups)
+        self.menu_button.clicked.connect(lambda: self._toggle_drawer())
+        self.night_toggle.toggled.connect(self._on_night_toggle)
+        self.system_sync_btn.clicked.connect(self._sync_with_system)
+        self.logout_btn.clicked.connect(self._perform_logout)
+        self.about_btn.clicked.connect(self._show_about)
+        self.profile_btn.clicked.connect(self._show_message_log)
+        # Sidebar wiring: Expert opens the original Expert flow; Settings
+        # opens the Settings page (backup behaviour).
+        self.expert_btn.clicked.connect(self._show_expert)
+        self.settings_btn.clicked.connect(self._show_settings_wizard)
+        self.subscription_btn.clicked.connect(self._show_subscription)
+        self.subscription_method_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(0))
+        self.subscription_status_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(1))
+        self.platform_back.clicked.connect(self._show_message_log)
+        self.mt5_button.clicked.connect(lambda: self._on_platform_selected('mt5'))
+        self.mt4_button.clicked.connect(lambda: self._on_platform_selected('mt4'))
+        self.account_back.clicked.connect(lambda: self.expert_stack.setCurrentIndex(0))
+        self.credential_back.clicked.connect(lambda: self.expert_stack.setCurrentIndex(1))
+        self.prop_button.clicked.connect(lambda: self._show_credentials("Prop"))
+        self.normal_button.clicked.connect(lambda: self._show_credentials("Normal"))
+        self.copy_id_btn.clicked.connect(self._copy_flamebot_id)
+        self.copy_license_btn.clicked.connect(self._copy_license_key)
+        self.clear_cached_btn.clicked.connect(self._logout_ea)
+        self.gls_checkbox.toggled.connect(self._on_gls_toggled)
+        self.psl_checkbox.toggled.connect(self._on_psl_toggled)
+        self.lot_default.toggled.connect(lambda checked: self._set_lot_mode("default", checked))
+        self.lot_custom.toggled.connect(lambda checked: self._set_lot_mode("custom", checked))
+        self.lot_custom_input.textChanged.connect(self._mark_lot_dirty)
+        # Entry mode changed → update state and mark lot dirty (persisted on Save)
+        if hasattr(self, "entry_market_edge_radio") and hasattr(self, "entry_range_distributed_radio"):
+            self.entry_market_edge_radio.toggled.connect(self._on_entry_mode_changed)
+            self.entry_range_distributed_radio.toggled.connect(self._on_entry_mode_changed)
+        self.symbol_default.toggled.connect(
+            lambda checked: self._set_symbol_mode("default", checked)
+        )
+        self.symbol_custom.toggled.connect(
+            lambda checked: self._set_symbol_mode("custom", checked)
+        )
+        self.symbol_search.textChanged.connect(lambda _t: self._symbol_filter_timer.start(120))
+        self.psl_search.textChanged.connect(self._refresh_psl_list)
+        # Manual refresh buttons (fast-path; does not replace polling)
+        try:
+            self.gls_refresh_symbols_btn.clicked.connect(lambda: self._request_symbols_refresh("gls"))
+        except Exception:
+            pass
+        try:
+            self.psl_refresh_symbols_btn.clicked.connect(lambda: self._request_symbols_refresh("psl"))
+        except Exception:
+            pass
+        # Checkbox handlers are connected when building the grid in _refresh_symbol_list
+        self.save_settings_btn.clicked.connect(self._save_all_settings)
+        self.edit_settings_btn.clicked.connect(self._toggle_edit_mode)
+        try:
+            if hasattr(self, "install_eas_btn") and self.install_eas_btn is not None:
+                self.install_eas_btn.clicked.connect(self._on_install_eas_clicked)
+        except Exception:
+            pass
+        # PSL uses the same Edit/Save buttons (mode-aware logic)
+        self._connect_worker_signals()
+
+    def _on_install_eas_clicked(self) -> None:
+        mt4_src, mt5_src = self._find_bundled_ea_files()
+        if mt4_src is None and mt5_src is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "EA files not found",
+                "Could not find the bundled EA files.\n\n"
+                "Make sure the 'eas' folder is next to FlameBot.exe (from the zip bundle).",
+            )
+            return
+
+        mt4_targets, mt5_targets = self._find_metaquotes_ea_targets()
+        if not mt4_targets and not mt5_targets:
+            # Cross-platform fallback: let the user pick the destination folder(s).
+            # This also covers Windows installs in non-standard locations.
+            sel_mt4, sel_mt5, overwrite = self._prompt_ea_install_targets_folder_picker(
+                has_mt4=(mt4_src is not None),
+                has_mt5=(mt5_src is not None),
+            )
+            if sel_mt4 is None and sel_mt5 is None:
+                return
+
+            results: List[str] = []
+            errors: List[str] = []
+            if mt4_src is not None and sel_mt4 is not None:
+                ok, msg = self._copy_ea_to_target(mt4_src, sel_mt4, overwrite=overwrite)
+                (results if ok else errors).append(msg)
+            if mt5_src is not None and sel_mt5 is not None:
+                ok, msg = self._copy_ea_to_target(mt5_src, sel_mt5, overwrite=overwrite)
+                (results if ok else errors).append(msg)
+
+            body = "\n".join([*results, *("" if not errors else ["", "Errors:", *errors])])
+            if errors:
+                QtWidgets.QMessageBox.warning(self, "EA installation completed (with errors)", body)
+            else:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "EA installed",
+                    (body + "\n\nRestart MT4/MT5 and attach the EA to a chart.").strip(),
+                )
+            return
+
+        # Default selection when there is exactly one target.
+        default_mt4 = mt4_targets[0] if len(mt4_targets) == 1 else None
+        default_mt5 = mt5_targets[0] if len(mt5_targets) == 1 else None
+
+        # If multiple targets exist, prompt the user to choose.
+        overwrite = False
+        if (len(mt4_targets) > 1) or (len(mt5_targets) > 1):
+            sel_mt4, sel_mt5, overwrite = self._prompt_ea_install_targets(
+                mt4_targets=mt4_targets,
+                mt5_targets=mt5_targets,
+                default_mt4=default_mt4,
+                default_mt5=default_mt5,
+            )
+            if sel_mt4 is None and sel_mt5 is None:
+                return
+        else:
+            sel_mt4, sel_mt5 = default_mt4, default_mt5
+
+        # Confirm overwrite if needed.
+        try:
+            if not overwrite:
+                to_overwrite: List[str] = []
+                if mt4_src is not None and sel_mt4 is not None:
+                    if (Path(sel_mt4) / Path(mt4_src).name).exists():
+                        to_overwrite.append(f"MT4: {Path(mt4_src).name}")
+                if mt5_src is not None and sel_mt5 is not None:
+                    if (Path(sel_mt5) / Path(mt5_src).name).exists():
+                        to_overwrite.append(f"MT5: {Path(mt5_src).name}")
+                if to_overwrite:
+                    resp = QtWidgets.QMessageBox.question(
+                        self,
+                        "EA already installed",
+                        "EA file(s) already exist:\n\n"
+                        + "\n".join(to_overwrite)
+                        + "\n\nDo you want to overwrite them?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    )
+                    if resp == QtWidgets.QMessageBox.Yes:
+                        overwrite = True
+        except Exception:
+            pass
+
+        results: List[str] = []
+        errors: List[str] = []
+
+        if mt4_src is not None and sel_mt4 is not None:
+            ok, msg = self._copy_ea_to_target(mt4_src, sel_mt4, overwrite=overwrite)
+            (results if ok else errors).append(msg)
+        elif mt4_src is not None and not mt4_targets:
+            results.append("MT4: No target folder found (skipped).")
+
+        if mt5_src is not None and sel_mt5 is not None:
+            ok, msg = self._copy_ea_to_target(mt5_src, sel_mt5, overwrite=overwrite)
+            (results if ok else errors).append(msg)
+        elif mt5_src is not None and not mt5_targets:
+            results.append("MT5: No target folder found (skipped).")
+
+        body = "\n".join([*results, *("" if not errors else ["", "Errors:", *errors])])
+        if errors:
+            QtWidgets.QMessageBox.warning(self, "EA installation completed (with errors)", body)
+        else:
+            QtWidgets.QMessageBox.information(
+                self,
+                "EA installed",
+                (body + "\n\nRestart MT4/MT5 and attach the EA to a chart.").strip(),
+            )
+
+    def _find_bundled_ea_files(self) -> Tuple[Optional[Path], Optional[Path]]:
+        mt4_rel = Path("eas") / "mt4" / "FLAMEBOTMT4 EA.ex4"
+        mt5_rel = Path("eas") / "mt5" / "FLAMEBOT MT5 EA.ex5"
+
+        candidates: List[Path] = []
+        # Packaged executable location (PyInstaller / frozen build)
+        try:
+            exe = str(getattr(sys, "executable", "") or "").strip()
+            if exe:
+                exe_root = Path(exe).resolve().parent
+                candidates.append(exe_root)
+                # PyInstaller onedir may place data under _internal/.
+                candidates.append(exe_root / "_internal")
+        except Exception:
+            pass
+        # Launch location
+        try:
+            argv0 = str(sys.argv[0] or "").strip()
+            if argv0:
+                argv_root = Path(argv0).resolve().parent
+                candidates.append(argv_root)
+                candidates.append(argv_root / "_internal")
+        except Exception:
+            pass
+        # Script location (repo/dev runs)
+        try:
+            # `text5.py` lives under `app/`; project root is parent.
+            candidates.append(Path(__file__).resolve().parent.parent)
+        except Exception:
+            pass
+        # Current working directory
+        try:
+            candidates.append(Path.cwd())
+        except Exception:
+            pass
+
+        found_mt4: Optional[Path] = None
+        found_mt5: Optional[Path] = None
+        for root in candidates:
+            try:
+                if found_mt4 is None:
+                    p4 = Path(root) / mt4_rel
+                    if p4.is_file():
+                        found_mt4 = p4
+                if found_mt5 is None:
+                    p5 = Path(root) / mt5_rel
+                    if p5.is_file():
+                        found_mt5 = p5
+                if found_mt4 is not None and found_mt5 is not None:
+                    break
+            except Exception:
+                continue
+
+        return found_mt4, found_mt5
+
+    def _find_metaquotes_ea_targets(self) -> Tuple[List[Path], List[Path]]:
+        mt4_targets: List[Path] = []
+        mt5_targets: List[Path] = []
+
+        appdata = str(os.environ.get("APPDATA", "") or "").strip()
+        if not appdata:
+            return mt4_targets, mt5_targets
+
+        base = Path(appdata) / "MetaQuotes" / "Terminal"
+        try:
+            if not base.is_dir():
+                return mt4_targets, mt5_targets
+        except Exception:
+            return mt4_targets, mt5_targets
+
+        def _add_unique(lst: List[Path], p: Path) -> None:
+            try:
+                p = Path(p)
+            except Exception:
+                return
+            try:
+                if not p.is_dir():
+                    return
+            except Exception:
+                return
+            try:
+                if p not in lst:
+                    lst.append(p)
+            except Exception:
+                pass
+
+        try:
+            terminal_dirs = [d for d in base.iterdir() if d.is_dir()]
+        except Exception:
+            terminal_dirs = []
+
+        for t in terminal_dirs:
+            # Be tolerant: some installs use Experts/, some use Experts/Advisors.
+            for rel in (
+                Path("MQL4") / "Experts" / "Advisors",
+                Path("MQL4") / "Experts",
+            ):
+                _add_unique(mt4_targets, t / rel)
+
+            for rel in (
+                Path("MQL5") / "Experts" / "Advisors",
+                Path("MQL5") / "Experts",
+            ):
+                _add_unique(mt5_targets, t / rel)
+
+        return mt4_targets, mt5_targets
+
+    def _prompt_ea_install_targets(
+        self,
+        *,
+        mt4_targets: List[Path],
+        mt5_targets: List[Path],
+        default_mt4: Optional[Path],
+        default_mt5: Optional[Path],
+    ) -> Tuple[Optional[Path], Optional[Path], bool]:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Install EAs")
+        dialog.setModal(True)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        info = QtWidgets.QLabel(
+            "Multiple MetaTrader data folders were found. Choose where to install the EA(s)."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QtWidgets.QFormLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        layout.addLayout(form)
+
+        mt4_combo = QtWidgets.QComboBox()
+        mt5_combo = QtWidgets.QComboBox()
+
+        def _fill(combo: QtWidgets.QComboBox, targets: List[Path], default: Optional[Path]) -> None:
+            combo.addItem("(skip)", None)
+            for p in targets:
+                combo.addItem(str(p), str(p))
+            if default is not None:
+                try:
+                    idx = combo.findData(str(default))
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
+                except Exception:
+                    pass
+
+        _fill(mt4_combo, mt4_targets, default_mt4)
+        _fill(mt5_combo, mt5_targets, default_mt5)
+
+        form.addRow("MT4 target", mt4_combo)
+        form.addRow("MT5 target", mt5_combo)
+
+        overwrite_cb = QtWidgets.QCheckBox("Overwrite if already installed")
+        layout.addWidget(overwrite_cb)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(btns)
+        btns.accepted.connect(dialog.accept)
+        btns.rejected.connect(dialog.reject)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None, None, False
+
+        def _sel(combo: QtWidgets.QComboBox) -> Optional[Path]:
+            try:
+                data = combo.currentData()
+            except Exception:
+                data = None
+            if not data:
+                return None
+            try:
+                return Path(str(data))
+            except Exception:
+                return None
+
+        return _sel(mt4_combo), _sel(mt5_combo), bool(overwrite_cb.isChecked())
+
+    def _prompt_ea_install_targets_folder_picker(
+        self, *, has_mt4: bool, has_mt5: bool
+    ) -> Tuple[Optional[Path], Optional[Path], bool]:
+        """Fallback picker when MetaTrader folders cannot be auto-detected.
+
+        Asks the user to choose the destination folder(s) (e.g. MQL4/Experts or
+        MQL5/Experts). Returns selected folders for MT4/MT5 and overwrite flag.
+        """
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Install EAs")
+        dialog.setModal(True)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setSpacing(10)
+
+        info = QtWidgets.QLabel(
+            "MetaTrader folders could not be found automatically.\n\n"
+            "Please select the destination folder(s) inside your MetaTrader Data Folder, e.g.:\n"
+            "- MT4: MQL4/Experts (or MQL4/Experts/Advisors)\n"
+            "- MT5: MQL5/Experts (or MQL5/Experts/Advisors)"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QtWidgets.QFormLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        layout.addLayout(form)
+
+        mt4_row = QtWidgets.QWidget()
+        mt4_row_layout = QtWidgets.QHBoxLayout(mt4_row)
+        mt4_row_layout.setContentsMargins(0, 0, 0, 0)
+        mt4_row_layout.setSpacing(8)
+        mt4_path = QtWidgets.QLineEdit()
+        mt4_path.setReadOnly(True)
+        mt4_browse = QtWidgets.QPushButton("Browse…")
+        mt4_browse.setEnabled(bool(has_mt4))
+        mt4_row_layout.addWidget(mt4_path)
+        mt4_row_layout.addWidget(mt4_browse)
+
+        mt5_row = QtWidgets.QWidget()
+        mt5_row_layout = QtWidgets.QHBoxLayout(mt5_row)
+        mt5_row_layout.setContentsMargins(0, 0, 0, 0)
+        mt5_row_layout.setSpacing(8)
+        mt5_path = QtWidgets.QLineEdit()
+        mt5_path.setReadOnly(True)
+        mt5_browse = QtWidgets.QPushButton("Browse…")
+        mt5_browse.setEnabled(bool(has_mt5))
+        mt5_row_layout.addWidget(mt5_path)
+        mt5_row_layout.addWidget(mt5_browse)
+
+        chosen: Dict[str, Optional[Path]] = {"mt4": None, "mt5": None}
+
+        def _pick(which: str) -> None:
+            start_dir = str(Path.home())
+            try:
+                if chosen.get(which) is not None:
+                    start_dir = str(chosen[which])
+            except Exception:
+                pass
+            folder = QtWidgets.QFileDialog.getExistingDirectory(dialog, "Select destination folder", start_dir)
+            if not folder:
+                return
+            try:
+                p = Path(str(folder))
+            except Exception:
+                return
+            chosen[which] = p
+            try:
+                if which == "mt4":
+                    mt4_path.setText(str(p))
+                else:
+                    mt5_path.setText(str(p))
+            except Exception:
+                pass
+
+        mt4_browse.clicked.connect(lambda: _pick("mt4"))
+        mt5_browse.clicked.connect(lambda: _pick("mt5"))
+
+        if has_mt4:
+            form.addRow("MT4 target", mt4_row)
+        if has_mt5:
+            form.addRow("MT5 target", mt5_row)
+
+        overwrite_cb = QtWidgets.QCheckBox("Overwrite if already installed")
+        layout.addWidget(overwrite_cb)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(btns)
+        btns.accepted.connect(dialog.accept)
+        btns.rejected.connect(dialog.reject)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None, None, False
+
+        return chosen.get("mt4"), chosen.get("mt5"), bool(overwrite_cb.isChecked())
+
+    def _copy_ea_to_target(self, src: Path, dest_dir: Path, *, overwrite: bool) -> Tuple[bool, str]:
+        try:
+            src = Path(src)
+            dest_dir = Path(dest_dir)
+        except Exception:
+            return False, "Invalid path(s)."
+
+        try:
+            if not src.is_file():
+                return False, f"Missing source EA: {src}"
+        except Exception:
+            return False, "Could not read EA source file."
+
+        try:
+            if not dest_dir.is_dir():
+                return False, f"Target folder not found: {dest_dir}"
+        except Exception:
+            return False, "Could not access target folder."
+
+        dst = dest_dir / src.name
+        try:
+            if dst.exists() and not overwrite:
+                return True, f"Skipped (already exists): {dst}"
+        except Exception:
+            # If we can't stat it, attempt copy anyway.
+            pass
+
+        try:
+            shutil.copy2(str(src), str(dst))
+            return True, f"Installed -> {dst}"
+        except Exception as e:
+            return False, f"Failed to install to {dst}: {e}"
+
+    def _connect_worker_signals(self) -> None:
+        """(Re)connect TelegramWorker signals to the UI.
+
+        This is separated from `_connect_signals()` so a restarted worker can be
+        re-wired without re-connecting the entire UI.
+        """
+        worker = getattr(self, "worker", None)
+        if worker is None:
+            return
+
+        # IMPORTANT: TelegramWorker is a QThread subclass; its signals may be
+        # emitted from the worker's asyncio thread while the QObject affinity
+        # remains on the GUI thread. Force queued delivery so UI work always
+        # executes on the main thread.
+        try:
+            worker.log_message.connect(self._log, QtCore.Qt.QueuedConnection)
+        except Exception:
+            pass
+        try:
+            worker.error.connect(self._on_worker_error, QtCore.Qt.QueuedConnection)
+        except Exception:
+            pass
+        try:
+            worker.login_result.connect(self._on_login_result, QtCore.Qt.QueuedConnection)
+        except Exception:
+            pass
+        try:
+            worker.groups_ready.connect(self.on_groups, QtCore.Qt.QueuedConnection)
+        except Exception:
+            pass
+        try:
+            worker.message_received.connect(self.on_message, QtCore.Qt.QueuedConnection)
+        except Exception:
+            pass
+        try:
+            worker.icon_ready.connect(self.on_icon_ready, QtCore.Qt.QueuedConnection)
+        except Exception:
+            pass
+        try:
+            worker.user_ready.connect(self.on_user_ready, QtCore.Qt.QueuedConnection)
+        except Exception:
+            pass
+
+    def _on_telegram_worker_finished(self) -> None:
+        """Called whenever the TelegramWorker thread exits.
+
+        If this wasn't a user-requested shutdown, automatically restart.
+        """
+        try:
+            if bool(getattr(self, "_closing", False)):
+                return
+        except Exception:
+            return
+
+        # If the app requested shutdown, do not restart.
+        try:
+            if bool(getattr(self.worker, "_shutdown_requested", False)):
+                return
+        except Exception:
+            pass
+
+        # If the worker survived for a while, reset backoff so a single blip
+        # doesn't cause long delays later.
+        try:
+            started_at = float(getattr(self, "_tg_worker_started_at_monotonic", 0.0) or 0.0)
+        except Exception:
+            started_at = 0.0
+        try:
+            if started_at > 0.0 and (float(time.monotonic()) - started_at) >= 60.0:
+                self._tg_worker_restart_attempts = 0
+        except Exception:
+            pass
+
+        # User-visible signal that syncing is down.
+        try:
+            self._log("Telegram sync stopped. Reconnecting…")
+        except Exception:
+            pass
+
+        self._schedule_telegram_worker_restart()
+
+    def _schedule_telegram_worker_restart(self) -> None:
+        try:
+            if bool(getattr(self, "_closing", False)):
+                return
+        except Exception:
+            return
+
+        t = getattr(self, "_tg_worker_restart_timer", None)
+        if t is None:
+            return
+        try:
+            if t.isActive():
+                return
+        except Exception:
+            pass
+
+        try:
+            attempts = int(getattr(self, "_tg_worker_restart_attempts", 0) or 0)
+        except Exception:
+            attempts = 0
+
+        # Bounded restart attempts to avoid runaway loops on persistent failures.
+        if attempts >= 8:
+            try:
+                self._log("Telegram sync is down. Please restart the app.")
+            except Exception:
+                pass
+            return
+
+        # Exponential backoff (1s, 2s, 4s, ... up to 60s).
+        try:
+            delay_ms = int(min(60000, 1000 * (2 ** attempts)))
+        except Exception:
+            delay_ms = 3000
+
+        try:
+            self._tg_worker_restart_attempts = attempts + 1
+        except Exception:
+            pass
+        try:
+            t.start(max(250, delay_ms))
+        except Exception:
+            pass
+
+    def _restart_telegram_worker_now(self) -> None:
+        try:
+            if bool(getattr(self, "_closing", False)):
+                return
+        except Exception:
+            return
+
+        old = getattr(self, "worker", None)
+        try:
+            if old is not None and hasattr(old, "isRunning") and old.isRunning():
+                return
+        except Exception:
+            pass
+
+        try:
+            if old is not None and hasattr(old, "deleteLater"):
+                old.deleteLater()
+        except Exception:
+            pass
+
+        # Recreate worker thread.
+        self.worker = TelegramWorker()
+        try:
+            self.worker.set_platform(getattr(self, "platform", "mt5"))
+        except Exception:
+            pass
+        try:
+            self.worker.set_telegram_ingest_secrets(getattr(self, "telegram_ingest_secrets", {"mt4": "", "mt5": ""}))
+        except Exception:
+            pass
+        try:
+            self.worker.set_registered_platforms(getattr(self, "flamebot_ids", {}) or {})
+        except Exception:
+            pass
+
+        # Lifecycle signals.
+        try:
+            self.worker.finished.connect(self._on_telegram_worker_finished, QtCore.Qt.QueuedConnection)
+        except Exception:
+            pass
+        try:
+            self.worker.auto_login_resolved.connect(self._on_startup_auto_login_resolved)
+        except Exception:
+            pass
+        try:
+            self.worker.auto_login_resolved.connect(self._on_deferred_auto_login_resolved)
+        except Exception:
+            pass
+
+        # UI signal wiring for the new worker.
+        try:
+            self._connect_worker_signals()
+        except Exception:
+            pass
+
+        try:
+            self.worker.start()
+        except Exception:
+            return
+
+        try:
+            self._tg_worker_started_at_monotonic = float(time.monotonic())
+        except Exception:
+            self._tg_worker_started_at_monotonic = 0.0
+
+        # Best-effort: resume Telegram reconnection, group fetch, and listening.
+        def _resume() -> None:
+            try:
+                if bool(getattr(self, "_closing", False)):
+                    return
+            except Exception:
+                return
+            try:
+                if getattr(self, "main_stack", None) is not None and self.main_stack.currentIndex() == 1:
+                    try:
+                        self.worker.start_auto_reconnect()
+                    except Exception:
+                        pass
+                    try:
+                        if not bool(getattr(self, "_groups_loaded", False)):
+                            self.worker.fetch_groups()
+                            self._schedule_groups_fetch_retry(1800)
+                    except Exception:
+                        pass
+                    try:
+                        states = getattr(self, "group_states", {}) or {}
+                        ids_to_resume = [gid for gid, st in states.items() if bool(getattr(st, "listening", False))]
+                        for gid in ids_to_resume:
+                            try:
+                                self.worker.start_listening(int(gid))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            QtCore.QTimer.singleShot(0, _resume)
+        except Exception:
+            _resume()
+
+    def _on_login_result(self, result: object) -> None:
+        """Handle ALL Telegram login outcomes using the standardized contract.
+
+        Contract shape:
+        {"success": bool, "status": str, "message": str}
+        """
+        try:
+            payload = result if isinstance(result, dict) else {}
+        except Exception:
+            payload = {}
+
+        status = str(payload.get("status") or "").upper()
+        success = bool(payload.get("success"))
+        message = str(payload.get("message") or "").strip()
+
+        # Any login step completion clears the busy state.
+        self._set_auth_busy(False)
+
+        if success and status == "CODE_SENT":
+            self.on_code_sent()
+            return
+
+        if (not success) and status in ("2FA_REQUIRED", "2FA", "TWO_FA_REQUIRED"):
+            # Show 2FA UI without leaking Telegram wording.
+            try:
+                self.password.setVisible(True)
+                self.password_toggle.show()
+                self._position_password_toggle()
+            except Exception:
+                pass
+            try:
+                # Keep subtitle for instructions, not error text.
+                self.subtitle_label.setText("Enter your 2FA password to continue.")
+            except Exception:
+                pass
+            # Also show the standardized outcome via the same path as login success.
+            try:
+                self._log(_generic_2fa_required_message())
+            except Exception:
+                pass
+            return
+
+        if success and status == "LOGIN_SUCCESS":
+            self.on_logged_in()
+            return
+
+        # Any failure (wrong code / banned / invalid / rpc/network) must be generic.
+        # Show it using the same user-facing notification mechanism as "Login successful".
+        try:
+            self._log(message or _generic_login_failed_message())
+        except Exception:
+            pass
+
+    def _update_api_next_state(self) -> None:
+        # Public builds may manage Telegram API credentials via telegram_app.json.
+        # If managed, keep Next enabled even though the inputs are hidden/disabled.
+        try:
+            if bool(getattr(self, "_tg_api_managed", False)):
+                self.btn_api_next.setEnabled(True)
+                return
+        except Exception:
+            pass
+        api_ok = bool(self.api_id.text().strip())
+        hash_ok = bool(self.api_hash.text().strip())
+        self.btn_api_next.setEnabled(api_ok and hash_ok)
+
+    def _go_back_from_phone_page(self) -> None:
+        # If credentials are managed, do not navigate back to the disabled API page.
+        try:
+            if bool(getattr(self, "_tg_api_managed", False)):
+                self.stack.setCurrentIndex(1)
+                return
+        except Exception:
+            pass
+        self.stack.setCurrentIndex(0)
+
+    def _go_to_phone_page(self) -> None:
+        self.stack.setCurrentIndex(1)
+        self.subtitle_label.setText("Now confirm your country and phone number.")
+        if not self.phone.text().strip():
+            self._suppress_phone_sync = True
+            self.phone.setText("+")
+            self._suppress_phone_sync = False
+        self._sync_country_from_phone()
+
+    def _open_country_dialog(self) -> None:
+        if self._country_dialog_open:
+            return
+        self._country_dialog_open = True
+        try:
+            dialog = CountrySelectDialog(self.countries, self)
+            if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                selected = dialog.selected_country()
+                if selected:
+                    self._apply_country_selection(selected, set_phone=True)
+        finally:
+            self._country_dialog_open = False
+
+    def _apply_country_selection(self, country: dict, *, set_phone: bool) -> None:
+        if not country:
+            return
+        self._current_country = country
+        label = self._format_country_label(country)
+        self.country_button.setText(label)
+        code = str(country.get("dial_code", ""))
+        if code:
+            self.phone_example.setText(f"Example: {code} 810 000 0000")
+        if set_phone and code:
+            self._suppress_phone_sync = True
+            self.phone.setText(f"{code} ")
+            self._suppress_phone_sync = False
+
+    def _clear_country_selection(self) -> None:
+        self._current_country = None
+        self.country_button.setText("Select country")
+
+    def _format_country_label(self, country: dict) -> str:
+        flag = str(country.get("flag", "")).strip()
+        name = str(country.get("name", "")).strip()
+        if flag and name:
+            return f"{flag} {name}"
+        return name or "Select country"
+
+    def _find_country_for_phone(self, phone_text: str) -> Optional[dict]:
+        digits = re.sub(r"\D", "", phone_text or "")
+        if not digits:
+            return None
+        for country in self._countries_by_dial:
+            dial = str(country.get("dial_code", ""))
+            dial_digits = re.sub(r"\D", "", dial)
+            if dial_digits and digits.startswith(dial_digits):
+                return country
+        return None
+
+    def _sync_country_from_phone(self) -> None:
+        match = self._find_country_for_phone(self.phone.text().strip())
+        if match:
+            if self._current_country != match:
+                self._apply_country_selection(match, set_phone=False)
+        else:
+            self._clear_country_selection()
+
+    def _on_phone_text_changed(self, text: str) -> None:
+        if self._suppress_phone_sync:
+            return
+        if not text:
+            self._suppress_phone_sync = True
+            self.phone.setText("+")
+            self._suppress_phone_sync = False
+            self._clear_country_selection()
+            return
+        if not text.startswith("+"):
+            self._suppress_phone_sync = True
+            self.phone.setText("+" + text)
+            self._suppress_phone_sync = False
+            text = self.phone.text()
+        self._sync_country_from_phone()
+        if self._current_country:
+            code = str(self._current_country.get("dial_code", ""))
+            if code and text.startswith(code) and not text.startswith(code + " "):
+                rest = text[len(code):].lstrip()
+                self._suppress_phone_sync = True
+                self.phone.setText(f"{code} {rest}" if rest else f"{code} ")
+                self._suppress_phone_sync = False
+
+    def on_send(self) -> None:
+        try:
+            api_id, api_hash = self._get_effective_telegram_api_credentials()
+            phone_text = self.phone.text().strip()
+        except Exception:
+            self._error("Invalid API ID.")
+            return
+        if not api_hash:
+            self._error("API hash is required.")
+            return
+        # Guard against placeholder-only values like "+".
+        try:
+            phone_digits = re.sub(r"\D", "", phone_text or "")
+        except Exception:
+            phone_digits = ""
+        if (not phone_text) or (not phone_digits):
+            self._error("Phone number is required.")
+            return
+
+        # If the user selected a country but typed a local number with leading 0,
+        # rewrite it to a full international number (e.g., 079.. -> +44 79..).
+        try:
+            cc = getattr(self, "_current_country", None)
+            dial = str((cc or {}).get("dial_code", "") or "").strip()
+            if dial and dial.startswith("+"):
+                # Common case after our input-normalizer: local numbers become "+0...".
+                if phone_text.startswith("+0") and not phone_text.startswith(dial):
+                    rest = phone_text[2:].lstrip()
+                    phone_text = f"{dial} {rest}" if rest else f"{dial} "
+                    try:
+                        self._suppress_phone_sync = True
+                        self.phone.setText(phone_text)
+                    finally:
+                        self._suppress_phone_sync = False
+        except Exception:
+            pass
+        if not self._is_online():
+            self._show_connection_lost(during_request=False)
+            return
+
+        # HARD boundary: starting a new auth flow (account switch) must behave
+        # like a cold start. Keep the wizard inputs intact.
+        try:
+            # Do NOT call worker.logout() here: it runs async and can race with
+            # a new send_code/login, breaking group fetching.
+            self.reset_user_state(preserve_telegram_session=True, full_ui_reset=False)
+        except Exception:
+            pass
+        # This is an auth switch boundary; clear Telegram identity in the UI.
+        try:
+            self.telegram_id = ""
+        except Exception:
+            pass
+        try:
+            self.telegram_phone = ""
+        except Exception:
+            pass
+        try:
+            self.worker.set_telegram_id("")
+        except Exception:
+            pass
+        # Reset any dragged layout (splitter) to defaults for the next account.
+        try:
+            if hasattr(self, "dashboard_splitter") and self.dashboard_splitter is not None:
+                self.dashboard_splitter.setSizes([300, 620])
+        except Exception:
+            pass
+        # Clear per-account group UI hints.
+        try:
+            if isinstance(getattr(self, "settings", None), dict):
+                self.settings.pop("last_group_id", None)
+                self.settings.pop("unread", None)
+        except Exception:
+            pass
+        try:
+            # Clear local icons/message caches tied to the previous account.
+            self._purge_local_telegram_cache()
+        except Exception:
+            pass
+
+        self._set_auth_busy(True)
+        self._log(f"Using phone: {phone_text}")
+        self.worker.send_code(api_id, api_hash, phone_text)
+
+    def on_code_sent(self) -> None:
+        self._set_auth_busy(False)
+        self._log("Code sent. Check Telegram.")
+        self.stack.setCurrentIndex(2)
+        self.password.clear()
+        self.password.setVisible(False)
+        self.password_toggle.hide()
+        self.subtitle_label.setText("Enter the login code sent to your Telegram.")
+
+    def on_login(self) -> None:
+        code = self.code.text().strip()
+        password = self.password.text().strip()
+        if not code and not password:
+            self._error("Enter the code or password.")
+            return
+        if not self._is_online():
+            self._show_connection_lost(during_request=False)
+            return
+        self._set_auth_busy(True)
+        self.worker.login(code, password)
+
+    def on_password_required(self) -> None:
+        self._set_auth_busy(False)
+        self.password.setVisible(True)
+        self.password_toggle.show()
+        self._position_password_toggle()
+        self.subtitle_label.setText("Enter your 2FA password to continue.")
+
+    def on_logged_in(self) -> None:
+        self._set_auth_busy(False)
+        self._log("Login successful.")
+        self.worker.start_auto_reconnect()
+        self.subtitle_label.setText("Select a group below and start listening for signals.")
+        self.main_stack.setCurrentIndex(1)
+        self.loading_label.setVisible(True)
+        self._groups_loaded = False
+        # Telegram group loading should NOT depend on backend connectivity.
+        # `_is_online()` is driven by the app's network state manager and may
+        # report offline even when Telegram is reachable, which blocks groups.
+        try:
+            self.worker.fetch_groups()
+        except Exception:
+            pass
+        self.password.setVisible(False)
+        self.password_toggle.hide()
+        self.menu_button.show()
+        self.profile_btn.setEnabled(True)
+        self.settings_btn.setEnabled(True)
+        self.subscription_btn.setEnabled(True)
+        self.expert_btn.setEnabled(True)
+        self._show_message_log()
+        try:
+            # Telegram-like: show empty state until the user selects a chat.
+            self.current_group_id = None
+            self._render_message_log_for_group(None)
+        except Exception:
+            pass
+
+        # Best-effort: start following the local NDJSON file for live UI updates.
+        try:
+            self._start_ndjson_follow()
+        except Exception:
+            pass
+        
+        # CRITICAL: Conditional startup - do NOT start polling until
+        # user has been authenticated and configuration is verified
+        # This is handled in on_user_ready after _fetch_user_app_state
+
+    def _has_backend_registration(self, *, platform: str, account_type: str) -> bool:
+        """Return True if we already have what we need to use the backend.
+
+        This gates the bot deep-link verification so it runs only for first-time
+        users (or after logout/account switch).
+        """
+        try:
+            p = (platform or "").lower()
+            if p not in {"mt4", "mt5"}:
+                p = "mt5"
+        except Exception:
+            p = "mt5"
+
+        try:
+            acct = (account_type or "").lower()
+            if acct not in {"prop", "normal"}:
+                acct = "prop"
+        except Exception:
+            acct = "prop"
+
+        try:
+            fid = str((getattr(self, "flamebot_ids", {}) or {}).get(p, "") or "").strip()
+        except Exception:
+            fid = ""
+        if not fid or fid == "FB-XXXXXXX":
+            return False
+
+        try:
+            sec = str((getattr(self, "telegram_ingest_secrets", {}) or {}).get(p, "") or "").strip()
+        except Exception:
+            sec = ""
+        if not sec:
+            return False
+
+        try:
+            lic = str(((getattr(self, "licenses_by_platform", {}) or {}).get(p, {}) or {}).get(acct, "") or "").strip()
+        except Exception:
+            lic = ""
+        if not lic:
+            return False
+
+        return True
+
+    def _has_backend_identity(self, *, platform: str) -> bool:
+        """Return True if we have backend identity for `platform`.
+
+        Identity = flamebot_id + telegram_ingest_secret. This is intentionally
+        lighter-weight than `_has_backend_registration`, because a missing
+        license for another account type should not force Telegram verification.
+        """
+        try:
+            p = (platform or "").lower()
+            if p not in {"mt4", "mt5"}:
+                p = "mt5"
+        except Exception:
+            p = "mt5"
+
+        try:
+            fid = str((getattr(self, "flamebot_ids", {}) or {}).get(p, "") or "").strip()
+        except Exception:
+            fid = ""
+        if not fid or fid == "FB-XXXXXXX":
+            return False
+
+        try:
+            sec = str((getattr(self, "telegram_ingest_secrets", {}) or {}).get(p, "") or "").strip()
+        except Exception:
+            sec = ""
+        if not sec:
+            return False
+
+        return True
+
+    def on_user_ready(self, name: str, phone: str, telegram_id: str) -> None:
+        # `telegram_id` is the numeric Telegram user id (string). Use this
+        # as the authoritative identity when calling /register.
+        self.user_name = name or "Telegram User"
+        self.user_phone = phone or ""
+        self.profile_name.setText(self.user_name)
+        self.profile_phone.setText(mask_phone(self.user_phone))
+        self._update_profile_avatar()
+        # Keep phone for display but prefer numeric Telegram ID for auth.
+        self.telegram_phone = phone or ""
+        self.telegram_id = str(telegram_id) if telegram_id else ""
+        
+        # Set telegram_id on worker for signal forwarding
+        if self.telegram_id:
+            self.worker.set_telegram_id(self.telegram_id)
+
+        # If user logged into a different Telegram account than last time,
+        # force fresh backend verification by clearing stored backend creds.
+        try:
+            saved = str(getattr(self, "_saved_telegram_id", "") or "").strip()
+        except Exception:
+            saved = ""
+        if saved and self.telegram_id and saved != self.telegram_id:
+            try:
+                self.flamebot_ids = {"mt4": "", "mt5": ""}
+                self.licenses_by_platform = {"mt4": {}, "mt5": {}}
+                self.telegram_ingest_secrets = {"mt4": "", "mt5": ""}
+                self.flamebot_id = ""
+                self.licenses = {}
+                self.telegram_ingest_secret = ""
+            except Exception:
+                pass
+            try:
+                self._saved_telegram_id = str(self.telegram_id)
+                self._save_settings(immediate=True)
+            except Exception:
+                pass
+
+        # Start lightweight polling early so EA status/lock state updates quickly.
+        # Full settings hydration remains gated by `_can_poll_backend()`.
+        try:
+            if hasattr(self, "backend_timer") and (not self.backend_timer.isActive()):
+                self.backend_timer.start()
+        except Exception:
+            pass
+        try:
+            self._poll_backend_state_all_platforms()
+        except Exception:
+            pass
+
+        # Returning users should NOT be asked to re-verify with the bot.
+        try:
+            platform_key = (getattr(self, "platform", None) or "mt5")
+            account_key = (getattr(self, "current_account_type", None) or "prop")
+            if self._has_backend_registration(platform=platform_key, account_type=account_key):
+                if self.telegram_id and not str(getattr(self, "_saved_telegram_id", "") or "").strip():
+                    try:
+                        self._saved_telegram_id = str(self.telegram_id)
+                        self._save_settings(immediate=True)
+                    except Exception:
+                        pass
+                try:
+                    self._fetch_user_app_state()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+        # Backend registration must be non-blocking and respect connectivity.
+        # If the network is down, we defer and recover silently when online returns.
+        try:
+            self._schedule_backend_register(self.telegram_id)
+        except Exception:
+            self._dev_log("schedule_register_failed")
+
+    def on_groups(self, groups: list) -> None:
+        # If we already have the same group order, do not clear/rebuild the UI.
+        # Multiple fetches can race (reconnect + retry), causing flicker.
+        try:
+            new_order: List[int] = []
+            for row in (groups or []):
+                try:
+                    new_order.append(int(row[1]))
+                except Exception:
+                    continue
+            if bool(getattr(self, "_groups_loaded", False)) and list(getattr(self, "group_order", []) or []) == new_order:
+                try:
+                    self.groups_cache = groups
+                except Exception:
+                    pass
+                try:
+                    self.loading_label.setVisible(False)
+                except Exception:
+                    pass
+                # Stop any reconnect retry loop once groups arrive.
+                try:
+                    self._groups_retry_count = 0
+                except Exception:
+                    pass
+                try:
+                    t = getattr(self, "_groups_retry_timer", None)
+                    if t is not None and t.isActive():
+                        t.stop()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+        # Cancel any in-flight incremental builds.
+        try:
+            self._group_build_inflight = False
+        except Exception:
+            pass
+        try:
+            t = getattr(self, "_group_build_timer", None)
+            if t is not None and t.isActive():
+                t.stop()
+        except Exception:
+            pass
+
+        self.list_groups.clear()
+        self.group_states = {}
+        self.group_widgets = {}
+        self.groups_cache = groups
+        try:
+            self.group_order = [int(row[1]) for row in (groups or [])]
+        except Exception:
+            self.group_order = []
+        self._group_items = {}
+        self._group_search_index = {}
+        self.loading_label.setVisible(False)
+        self._groups_loaded = True
+        # Stop any reconnect retry loop once groups arrive.
+        try:
+            self._groups_retry_count = 0
+        except Exception:
+            pass
+        try:
+            t = getattr(self, "_groups_retry_timer", None)
+            if t is not None and t.isActive():
+                t.stop()
+        except Exception:
+            pass
+        unread_map = self.settings.get("unread", {}) or {}
+        target_group_id = self.settings.get("last_group_id")
+        try:
+            saved_listening_ids = self.settings.get("listening_ids", []) or []
+        except Exception:
+            saved_listening_ids = []
+        try:
+            saved_listening_set = {int(x) for x in saved_listening_ids}
+        except Exception:
+            saved_listening_set = set()
+
+        try:
+            cap = int(getattr(self, "_chat_history_max_messages", 200) or 0)
+        except Exception:
+            cap = 200
+        for row in (groups or []):
+            try:
+                name, gid, icon_path, username = row  # type: ignore[misc]
+            except Exception:
+                try:
+                    name, gid, icon_path = row
+                except Exception:
+                    continue
+                username = None
+            unread = int(unread_map.get(str(gid), unread_map.get(gid, 0)) or 0)
+            self.group_states[gid] = GroupState(
+                name=name,
+                gid=gid,
+                icon_path=icon_path,
+                username=str(username or "").strip().lstrip("@"),
+                listening=(gid in saved_listening_set),
+                unread=unread,
+                messages=(deque(maxlen=cap) if cap > 0 else deque()),
+            )
+
+        # Precompute search index for ALL groups up-front so filtering works
+        # even before all row widgets have been built.
+        try:
+            for gid in self.group_order:
+                try:
+                    state = self.group_states.get(gid)
+                    if not state:
+                        continue
+
+                    name_norm = _normalize_search_text(getattr(state, "name", "") or "")
+                    name_compact = name_norm.replace(" ", "") if name_norm else ""
+
+                    user_raw = str(getattr(state, "username", "") or "").strip().lstrip("@")
+                    user_norm = _normalize_search_text(user_raw) if user_raw else ""
+                    user_at_norm = _normalize_search_text("@" + user_raw) if user_raw else ""
+                    user_compact = user_norm.replace(" ", "") if user_norm else ""
+                    user_at_compact = user_at_norm.replace(" ", "") if user_at_norm else ""
+                    user_link_norm = _normalize_search_text(f"t.me/{user_raw}") if user_raw else ""
+                    user_link_compact = user_link_norm.replace(" ", "") if user_link_norm else ""
+
+                    self._group_search_index[state.gid] = (
+                        f"{name_norm} {name_compact} {user_norm} {user_compact} {user_at_norm} "
+                        f"{user_at_compact} {user_link_norm} {user_link_compact} {state.gid}"
+                    ).strip()
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Restore recent local message history so users can see last messages
+        # after closing/reopening the app.
+        try:
+            self._restore_local_message_history(max_lines=2000)
+        except Exception:
+            pass
+
+        # Resume listening for groups that were ON before the app was closed.
+        # Best-effort: worker will no-op if not ready yet.
+        try:
+            if saved_listening_set:
+                ids_to_resume = [gid for gid in self.group_order if gid in saved_listening_set]
+                QtCore.QTimer.singleShot(0, lambda: [self.worker.start_listening(g) for g in ids_to_resume])
+        except Exception:
+            pass
+
+        # Build list incrementally to keep UI responsive.
+        self._begin_group_list_build(filter_text=self.group_search.text(), target_gid=target_group_id)
+
+    def _format_chat_log_line(self, sender: str, text: str, timestamp: str) -> str:
+        s = str(sender or "Unknown")
+        t = str(timestamp or "").strip()
+        body = str(text or "")
+        if t:
+            return f"📩TS={t} [{s}] {body}".strip()
+        return f"📩 [{s}] {body}".strip()
+
+    def _cancel_chat_render(self) -> None:
+        try:
+            t = getattr(self, "_chat_render_timer", None)
+            if t is not None and t.isActive():
+                t.stop()
+        except Exception:
+            pass
+        try:
+            self._chat_render_gid = None
+            self._chat_render_items = []
+            self._chat_render_index = 0
+        except Exception:
+            pass
+
+    def _add_chat_render_chunk(self, *, count: int = 40, deadline: Optional[float] = None) -> None:
+        log_widget = getattr(self, "log", None)
+        if log_widget is None:
+            self._cancel_chat_render()
+            return
+
+        try:
+            gid = getattr(self, "_chat_render_gid", None)
+            items = getattr(self, "_chat_render_items", []) or []
+            idx = int(getattr(self, "_chat_render_index", 0) or 0)
+        except Exception:
+            self._cancel_chat_render()
+            return
+
+        if gid is None or idx >= len(items):
+            self._cancel_chat_render()
+            try:
+                self._restore_scroll_anchor_for_group(int(gid))
+            except Exception:
+                try:
+                    log_widget._scroll_to_bottom()
+                except Exception:
+                    pass
+            try:
+                QtCore.QTimer.singleShot(60, lambda: setattr(self, "_suspend_scroll_tracking", False))
+            except Exception:
+                try:
+                    self._suspend_scroll_tracking = False
+                except Exception:
+                    pass
+            return
+
+        added = 0
+        bubble_title = ""
+        try:
+            state = (getattr(self, "group_states", {}) or {}).get(int(gid))
+            bubble_title = str(getattr(state, "name", "") or "")
+        except Exception:
+            bubble_title = ""
+
+        try:
+            log_widget.setUpdatesEnabled(False)
+        except Exception:
+            pass
+        try:
+            while idx < len(items) and added < max(1, int(count or 0)):
+                if deadline is not None:
+                    try:
+                        if time.perf_counter() >= float(deadline):
+                            break
+                    except Exception:
+                        pass
+                try:
+                    sender, text, ts, outgoing, *rest = items[idx]
+                    date_key = str(rest[0] or "") if rest else ""
+                    log_widget.appendMessage(
+                        bubble_title,
+                        str(text or ""),
+                        str(ts or ""),
+                        bool(outgoing),
+                        date_key=date_key,
+                    )
+                except Exception:
+                    pass
+                idx += 1
+                added += 1
+        finally:
+            try:
+                log_widget.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+        try:
+            self._chat_render_index = idx
+        except Exception:
+            pass
+
+        # Continue later if there is still work.
+        if idx < len(items):
+            try:
+                t = getattr(self, "_chat_render_timer", None)
+                if t is None:
+                    t = QtCore.QTimer(self)
+                    t.setSingleShot(True)
+                    t.timeout.connect(lambda: self._add_chat_render_chunk(count=40, deadline=(time.perf_counter() + 0.008)))
+                    self._chat_render_timer = t
+                if not t.isActive():
+                    t.start(0)
+            except Exception:
+                pass
+        else:
+            self._cancel_chat_render()
+            try:
+                self._restore_scroll_anchor_for_group(int(gid))
+            except Exception:
+                try:
+                    log_widget._scroll_to_bottom()
+                except Exception:
+                    pass
+            try:
+                QtCore.QTimer.singleShot(60, lambda: setattr(self, "_suspend_scroll_tracking", False))
+            except Exception:
+                try:
+                    self._suspend_scroll_tracking = False
+                except Exception:
+                    pass
+
+    def _render_message_log_for_group(self, gid: Optional[int]) -> None:
+        log_widget = getattr(self, "log", None)
+        if log_widget is None:
+            return
+
+        try:
+            self._suspend_scroll_tracking = True
+        except Exception:
+            pass
+
+        # Stop any in-flight incremental render from a previous group.
+        try:
+            self._cancel_chat_render()
+        except Exception:
+            pass
+
+        # Switch the panel between empty-state and chat log.
+        try:
+            stack = getattr(self, "message_log_stack", None)
+            if stack is not None:
+                stack.setCurrentIndex(1 if gid else 0)
+        except Exception:
+            pass
+
+        if not gid:
+            try:
+                log_widget.clear()
+            except Exception:
+                pass
+            try:
+                self.group_title.setText("Message Log")
+                self.group_subtitle.setText("")
+            except Exception:
+                pass
+            try:
+                self._suspend_scroll_tracking = False
+            except Exception:
+                pass
+            return
+
+        state = (getattr(self, "group_states", {}) or {}).get(int(gid))
+        if not state:
+            return
+
+        # If the user last left this chat scrolled up, avoid auto-scrolling
+        # while we rebuild the widget list.
+        try:
+            log_widget._user_near_bottom = bool(int(getattr(state, "scroll_anchor", 0) or 0) <= 0)
+        except Exception:
+            pass
+
+        bubble_title = ""
+        try:
+            bubble_title = str(getattr(state, "name", "") or "")
+        except Exception:
+            bubble_title = ""
+
+        try:
+            self.group_title.setText(str(getattr(state, "name", "") or "Message Log"))
+            self.group_subtitle.setText("Listening" if bool(getattr(state, "listening", False)) else "Not listening")
+        except Exception:
+            pass
+
+        try:
+            items = list(getattr(state, "messages", []) or [])
+        except Exception:
+            items = []
+
+        # Default to synchronous render (history is bounded, usually small).
+        # Only use incremental rendering when history is unusually large.
+        try:
+            incremental_threshold = int(os.environ.get("FLAMEBOT_UI_INCREMENTAL_RENDER_THRESHOLD", "500") or 500)
+        except Exception:
+            incremental_threshold = 500
+
+        if len(items) <= max(50, incremental_threshold):
+            try:
+                log_widget.setUpdatesEnabled(False)
+            except Exception:
+                pass
+            try:
+                log_widget.clear()
+                for sender, text, ts, outgoing, *rest in items:
+                    try:
+                        date_key = str(rest[0] or "") if rest else ""
+                        log_widget.appendMessage(
+                            bubble_title,
+                            str(text or ""),
+                            str(ts or ""),
+                            bool(outgoing),
+                            date_key=date_key,
+                        )
+                    except Exception:
+                        continue
+            finally:
+                try:
+                    log_widget.setUpdatesEnabled(True)
+                except Exception:
+                    pass
+            try:
+                self._restore_scroll_anchor_for_group(int(gid))
+            except Exception:
+                try:
+                    log_widget._scroll_to_bottom()
+                except Exception:
+                    pass
+            try:
+                QtCore.QTimer.singleShot(60, lambda: setattr(self, "_suspend_scroll_tracking", False))
+            except Exception:
+                try:
+                    self._suspend_scroll_tracking = False
+                except Exception:
+                    pass
+            return
+
+        # Incremental render for very large histories.
+        try:
+            log_widget.clear()
+        except Exception:
+            pass
+        try:
+            self._chat_render_gid = int(gid)
+            self._chat_render_items = items
+            self._chat_render_index = 0
+        except Exception:
+            return
+        try:
+            self._add_chat_render_chunk(count=50, deadline=(time.perf_counter() + 0.010))
+        except Exception:
+            pass
+
+    def _restore_local_message_history(self, *, max_lines: int = 2000) -> None:
+        try:
+            gids = set(int(x) for x in (getattr(self, "group_states", {}) or {}).keys())
+        except Exception:
+            gids = set()
+        if not gids:
+            return
+
+        path = Path(SIGNALS_NDJSON_FILE)
+        try:
+            lines = _tail_lines_utf8(path, max_lines=int(max_lines or 0))
+        except Exception:
+            lines = []
+        if not lines:
+            return
+
+        for line in lines:
+            s = (line or "").strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                continue
+            try:
+                chat_id = int(obj.get("chat_id", 0) or 0)
+            except Exception:
+                continue
+            if chat_id not in gids:
+                continue
+            state = self.group_states.get(chat_id)
+            if not state:
+                continue
+
+            try:
+                sender = str(obj.get("sender", "") or "")
+            except Exception:
+                sender = ""
+            try:
+                text = str(obj.get("text", "") or "")
+            except Exception:
+                text = ""
+
+            tg_ts = 0
+            try:
+                tg_ts = int(obj.get("tg_ts", 0) or 0)
+            except Exception:
+                tg_ts = 0
+
+            tg_time = ""
+            try:
+                tg_time = str(obj.get("tg_time", "") or "").strip()
+            except Exception:
+                tg_time = ""
+
+            date_key = ""
+            if tg_ts and int(tg_ts) > 0:
+                try:
+                    date_key = _format_local_ymd_from_utc_epoch(int(tg_ts))
+                except Exception:
+                    date_key = ""
+
+            # Prefer epoch-derived local time (robust across restarts/DST).
+            if tg_ts and int(tg_ts) > 0:
+                try:
+                    tg_time_epoch = _format_local_hhmmss_from_utc_epoch(int(tg_ts))
+                except Exception:
+                    tg_time_epoch = ""
+                if tg_time_epoch:
+                    tg_time = tg_time_epoch
+
+            if not tg_time:
+                try:
+                    recv_time = str(obj.get("recv_time", obj.get("time", "")) or "")
+                except Exception:
+                    recv_time = ""
+                # recv_time is typically "YYYY-MM-DD HH:MM:SS".
+                if len(recv_time) >= 8:
+                    tg_time = recv_time[-8:]
+
+                if not date_key:
+                    try:
+                        date_key = _extract_ymd_from_recv_time(recv_time)
+                    except Exception:
+                        date_key = ""
+
+            if not tg_time:
+                try:
+                    tg_time = datetime.now().strftime("%H:%M:%S")
+                except Exception:
+                    tg_time = ""
+
+            # Saved history doesn't currently store outgoing flag; default to incoming.
+            outgoing = False
+            try:
+                outgoing = bool(obj.get("outgoing", False))
+            except Exception:
+                outgoing = False
+
+            try:
+                state.messages.append((sender, text, tg_time, outgoing, date_key))
+            except Exception:
+                pass
+
+    def _restore_message_log_from_ndjson(self) -> None:
+        # Restore chat bubbles into the Message Log panel.
+        # Best-effort and idempotent: only run once per app session.
+        try:
+            if bool(getattr(self, "_message_log_restored", False)):
+                return
+            self._message_log_restored = True
+        except Exception:
+            return
+
+        log_widget = getattr(self, "log", None)
+        if log_widget is None:
+            return
+
+        # Avoid duplicating if the log already has content.
+        try:
+            layout = getattr(log_widget, "_layout", None)
+            if layout is not None and int(layout.count()) > 1:
+                return
+        except Exception:
+            pass
+
+        try:
+            cap = int(getattr(log_widget, "_max_bubbles", 500) or 0)
+        except Exception:
+            cap = 500
+        if cap <= 0:
+            return
+
+        path = Path(SIGNALS_NDJSON_FILE)
+        try:
+            lines = _tail_lines_utf8(path, max_lines=int(cap))
+        except Exception:
+            lines = []
+        if not lines:
+            return
+
+        try:
+            log_widget.setUpdatesEnabled(False)
+        except Exception:
+            pass
+
+        try:
+            for line in lines:
+                s = (line or "").strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+
+                try:
+                    sender = str(obj.get("sender", "") or "")
+                except Exception:
+                    sender = ""
+                try:
+                    text = str(obj.get("text", "") or "")
+                except Exception:
+                    text = ""
+
+                tg_ts = 0
+                try:
+                    tg_ts = int(obj.get("tg_ts", 0) or 0)
+                except Exception:
+                    tg_ts = 0
+
+                tg_time = ""
+                try:
+                    tg_time = str(obj.get("tg_time", "") or "").strip()
+                except Exception:
+                    tg_time = ""
+
+                use_tg_ts_prefix = False
+                bracket_ts = ""
+
+                # Prefer epoch-derived local time (robust across restarts/DST).
+                if tg_ts and int(tg_ts) > 0:
+                    try:
+                        tg_time_epoch = _format_local_hhmmss_from_utc_epoch(int(tg_ts))
+                    except Exception:
+                        tg_time_epoch = ""
+                    if tg_time_epoch:
+                        tg_time = tg_time_epoch
+                        use_tg_ts_prefix = True
+
+                # If we have a stored Telegram time string, use it as Telegram time.
+                # (Older ndjson entries may have tg_time but no tg_ts.)
+                if not use_tg_ts_prefix and tg_time:
+                    try:
+                        if re.match(r"^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$", tg_time):
+                            use_tg_ts_prefix = True
+                    except Exception:
+                        pass
+
+                # Otherwise, fall back to stored receive-time as a neutral bracket timestamp
+                # (not labeled as Telegram send-time).
+                if not use_tg_ts_prefix:
+                    try:
+                        recv_time = str(obj.get("recv_time", obj.get("time", "")) or "")
+                    except Exception:
+                        recv_time = ""
+                    if len(recv_time) >= 8:
+                        bracket_ts = recv_time[-8:]
+
+                if use_tg_ts_prefix:
+                    msg = f"📩TS={tg_time} [{sender}] {text}".strip()
+                elif bracket_ts:
+                    msg = f"[{bracket_ts}] 📩 [{sender}] {text}".strip()
+                else:
+                    msg = f"📩 [{sender}] {text}".strip()
+                try:
+                    log_widget.appendPlainText(msg)
+                except Exception:
+                    continue
+        finally:
+            try:
+                log_widget.setUpdatesEnabled(True)
+            except Exception:
+                pass
+            try:
+                log_widget._scroll_to_bottom()
+            except Exception:
+                pass
+
+    def _select_group_by_id(self, gid: int) -> None:
+        for index in range(self.list_groups.count()):
+            item = self.list_groups.item(index)
+            if item.data(QtCore.Qt.UserRole) == gid:
+                self.list_groups.setCurrentItem(item)
+                break
+
+    def on_group_selected(self, current: Optional[QtWidgets.QListWidgetItem]) -> None:
+        if not current:
+            return
+        gid = current.data(QtCore.Qt.UserRole)
+        state = self.group_states.get(gid)
+        if not state:
+            return
+        try:
+            prev_gid = getattr(self, "current_group_id", None)
+        except Exception:
+            prev_gid = None
+        try:
+            if prev_gid and int(prev_gid) != int(gid):
+                self._save_scroll_anchor_for_group(int(prev_gid))
+        except Exception:
+            pass
+
+        self.current_group_id = gid
+        try:
+            self._set_group_row_selected(int(gid))
+        except Exception:
+            pass
+        state.unread = 0
+        self._update_group_widget(state)
+        # Make selection feel instant: update highlight immediately, then render.
+        try:
+            QtCore.QTimer.singleShot(0, lambda _gid=gid: self._render_message_log_for_group(_gid))
+        except Exception:
+            try:
+                self._render_message_log_for_group(gid)
+            except Exception:
+                pass
+        self._save_settings()
+
+    def _save_scroll_anchor_for_group(self, gid: int) -> None:
+        log_widget = getattr(self, "log", None)
+        if log_widget is None:
+            return
+        state = (getattr(self, "group_states", {}) or {}).get(int(gid))
+        if not state:
+            return
+        try:
+            sb = log_widget.verticalScrollBar()
+            anchor = int(sb.maximum() - sb.value())
+        except Exception:
+            anchor = 0
+        try:
+            state.scroll_anchor = max(0, int(anchor))
+        except Exception:
+            pass
+
+    def _on_log_scrolled(self) -> None:
+        # Ignore scroll events while we are rebuilding the message list,
+        # otherwise we overwrite the saved anchor for this chat.
+        try:
+            if bool(getattr(self, "_suspend_scroll_tracking", False)):
+                return
+        except Exception:
+            pass
+        try:
+            gid = getattr(self, "current_group_id", None)
+        except Exception:
+            gid = None
+        if not gid:
+            return
+        try:
+            self._save_scroll_anchor_for_group(int(gid))
+        except Exception:
+            pass
+
+    def _restore_scroll_anchor_for_group(self, gid: int) -> None:
+        log_widget = getattr(self, "log", None)
+        if log_widget is None:
+            return
+        state = (getattr(self, "group_states", {}) or {}).get(int(gid))
+        if not state:
+            return
+
+        try:
+            anchor = int(getattr(state, "scroll_anchor", 0) or 0)
+        except Exception:
+            anchor = 0
+
+        def apply_restore() -> None:
+            try:
+                sb = log_widget.verticalScrollBar()
+                maxv = int(sb.maximum())
+                sb.blockSignals(True)
+                try:
+                    if anchor <= 0:
+                        try:
+                            log_widget.scroll_to_bottom(force=True)
+                        except Exception:
+                            sb.setValue(maxv)
+                        return
+                    sb.setValue(max(0, maxv - int(anchor)))
+                finally:
+                    sb.blockSignals(False)
+
+                try:
+                    log_widget._on_scroll_changed()
+                except Exception:
+                    pass
+            except Exception:
+                return
+
+        try:
+            # Apply twice: once ASAP, once after layout/scrollbar range settles.
+            QtCore.QTimer.singleShot(0, apply_restore)
+            QtCore.QTimer.singleShot(40, apply_restore)
+        except Exception:
+            apply_restore()
+
+    def on_group_listen_toggled(self, gid: int, checked: bool) -> None:
+        state = self.group_states.get(gid)
+        if not state:
+            return
+        if checked:
+            state.listening = True
+            state.unread = 0
+            # Manual toggle should NOT backfill messages sent while OFF.
+            self.worker.start_listening(gid, catch_up=False)
+        else:
+            state.listening = False
+            state.unread = 0
+            self.worker.stop_listening(gid)
+        self._update_group_widget(state)
+        try:
+            if getattr(self, "current_group_id", None) == gid:
+                try:
+                    self.group_subtitle.setText(
+                        "Listening" if bool(getattr(state, "listening", False)) else "Not listening"
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._save_settings()
+
+    def _perform_logout(self) -> None:
+        self.reset_user_state()
+
+    def reset_user_state(self, *, preserve_telegram_session: bool = False, full_ui_reset: bool = True) -> None:
+        """HARD reset ALL user-scoped state.
+
+        Non-negotiable invariant:
+        - Any auth change (logout / account switch / new login) MUST behave like a cold start.
+        - No EA/groups/settings/cache/poll/background task from the previous user may persist.
+        """
+        # Stop UI drawer interactions early.
+        try:
+            self._toggle_drawer(False)
+        except Exception:
+            pass
+
+        # Cancel any Telethon listeners immediately (safe even when preserving session).
+        try:
+            self.worker.stop_listening()
+        except Exception:
+            pass
+
+        # Cancel background tasks/timers.
+        try:
+            if hasattr(self, "backend_timer") and self.backend_timer.isActive():
+                self.backend_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_group_filter_timer") and self._group_filter_timer.isActive():
+                self._group_filter_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_settings_save_timer") and self._settings_save_timer.isActive():
+                self._settings_save_timer.stop()
+        except Exception:
+            pass
+
+        # Invalidate any in-flight async polls so their results cannot apply after reset.
+        try:
+            self._backend_poll_expected_seq_by_platform = {"mt4": -1, "mt5": -1}
+            self._backend_poll_inflight_by_platform = {"mt4": False, "mt5": False}
+            self._backend_poll_pending_auth_by_platform = {"mt4": None, "mt5": None}
+        except Exception:
+            pass
+        try:
+            self._app_state_expected_seq = -1
+            self._app_state_inflight = False
+        except Exception:
+            pass
+
+        # Clear ALL in-memory caches/stores (MUST be absolute).
+        try:
+            getattr(self, "_cached_poll_responses_by_platform", {}).clear()
+        except Exception:
+            pass
+        try:
+            getattr(self, "_platform_ui_state", {}).clear()
+        except Exception:
+            pass
+        try:
+            getattr(self, "_platform_settings_hydrated", {}).clear()
+        except Exception:
+            pass
+        for attr in ("_settings_hydration_pending", "_context_hydrated_at", "_last_good_config_by_ctx", "_context_state_by_ctx"):
+            try:
+                getattr(self, attr, {}).clear()
+            except Exception:
+                pass
+        try:
+            self._backend_presence_by_context = {"lot": {}, "symbol": {}, "psl": {}}
+        except Exception:
+            pass
+        try:
+            self._last_polled_creds = None
+        except Exception:
+            pass
+
+        # Reset poll schedule timestamps so the next user hydrates immediately.
+        try:
+            for p in ("mt4", "mt5"):
+                if p not in self._last_poll_by_platform:
+                    continue
+                for k in list(self._last_poll_by_platform[p].keys()):
+                    self._last_poll_by_platform[p][k] = 0.0
+        except Exception:
+            pass
+
+        # Clear group UI state.
+        try:
+            self._groups_loaded = False
+            self._pending_register_context = None
+        except Exception:
+            pass
+
+        # Reset any user-dragged layout (e.g., splitter widths) on real auth switches.
+        # Closing and reopening the app rebuilds the UI and restores defaults; logout
+        # should do the same.
+        if not preserve_telegram_session:
+            try:
+                if hasattr(self, "dashboard_splitter") and self.dashboard_splitter is not None:
+                    self.dashboard_splitter.setSizes([300, 620])
+            except Exception:
+                pass
+        try:
+            # Clear persisted per-account group UI hints on true auth switches.
+            if not preserve_telegram_session and isinstance(getattr(self, "settings", None), dict):
+                self.settings.pop("last_group_id", None)
+                self.settings.pop("unread", None)
+        except Exception:
+            pass
+        try:
+            self.current_group_id = None
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "group_search"):
+                self.group_search.clear()
+        except Exception:
+            pass
+        try:
+            self._pending_group_filter_text = ""
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "list_groups"):
+                self.list_groups.clear()
+        except Exception:
+            pass
+        try:
+            self.group_states = {}
+            self.group_widgets = {}
+            self.groups_cache = []
+            self.group_order = []
+            self._group_items = {}
+            self._group_search_index = {}
+        except Exception:
+            pass
+
+        # Clear user identity + credentials (in memory).
+        try:
+            self.flamebot_ids = {"mt4": "", "mt5": ""}
+            self.licenses_by_platform = {"mt4": {"prop": "", "normal": ""}, "mt5": {"prop": "", "normal": ""}}
+            self.flamebot_id = ""
+            self.licenses = {"prop": "", "normal": ""}
+        except Exception:
+            pass
+        try:
+            self.worker.set_registered_platforms(getattr(self, "flamebot_ids", {"mt4": "", "mt5": ""}))
+        except Exception:
+            pass
+
+        # Reset EA/settings state.
+        try:
+            self.ea_states = {
+                "mt4": {"prop": {"ea_active": False}, "normal": {"ea_active": False}},
+                "mt5": {"prop": {"ea_active": False}, "normal": {"ea_active": False}},
+            }
+        except Exception:
+            pass
+        try:
+            self.ea_active = False
+            self._ea_active_account = None
+        except Exception:
+            pass
+        try:
+            self.user_execution_mode = None
+            self.user_symbol_mode = None
+            self.user_has_configuration = False
+        except Exception:
+            pass
+        try:
+            self._lot_user_dirty = False
+            self._symbol_user_dirty = False
+            self._trade_control_user_dirty = False
+            self._psl_user_dirty = False
+        except Exception:
+            pass
+        try:
+            self.lot_mode = "default"
+            self.custom_lot = None
+            self.lot_configured = False
+            self.symbol_mode = "default"
+            self.available_symbols = []
+            self.symbols_allowed = []
+            self.symbol_configured = False
+            self.psl_configured = False
+            self.per_symbol_lots = {}
+        except Exception:
+            pass
+
+        # Logout/disconnect telegram session if requested.
+        if not preserve_telegram_session:
+            try:
+                self.worker.logout()
+            except Exception:
+                pass
+            try:
+                self.telegram_phone = ""
+            except Exception:
+                pass
+            try:
+                self.telegram_id = ""
+            except Exception:
+                pass
+            try:
+                self._saved_telegram_id = ""
+            except Exception:
+                pass
+
+        # UI refresh: lock settings until rehydrated.
+        try:
+            self._update_ea_status_panel()
+            self._update_settings_lock_state()
+            self._update_edit_button_state()
+        except Exception:
+            pass
+
+        if full_ui_reset:
+            # Prevent any startup-style auto-login attempts after explicit logout.
+            try:
+                self._startup_auto_login_attempted = True
+            except Exception:
+                pass
+            try:
+                self._set_auth_busy(False)
+            except Exception:
+                pass
+            try:
+                self._set_network_status("")
+            except Exception:
+                pass
+            try:
+                self.log.clear()
+                self.group_title.setText("Message Log")
+                self.group_subtitle.setText("")
+                if bool(getattr(self, "_tg_api_managed", False)):
+                    self.subtitle_label.setText("Connect your Telegram account in two simple steps.")
+                    self.stack.setCurrentIndex(1)
+                else:
+                    self.subtitle_label.setText("Connect your Telegram account in three simple steps.")
+                    self.stack.setCurrentIndex(0)
+                self.main_stack.setCurrentIndex(0)
+            except Exception:
+                pass
+            # Reset wizard inputs so the user can start fresh (change account/phone).
+            try:
+                if not bool(getattr(self, "_tg_api_managed", False)):
+                    self.api_id.clear()
+                    self.api_hash.clear()
+                self.phone.clear()
+                self.phone.setText("+")
+                self._clear_country_selection()
+            except Exception:
+                pass
+            try:
+                self.code.clear()
+                self.password.clear()
+                self.password.setVisible(False)
+                self.password_toggle.hide()
+            except Exception:
+                pass
+            try:
+                self.user_name = "Telegram User"
+                self.user_phone = ""
+                self.profile_name.setText(self.user_name)
+                self.profile_phone.setText(mask_phone(self.user_phone))
+                self._update_profile_avatar()
+            except Exception:
+                pass
+            try:
+                self.profile_btn.setEnabled(False)
+                self.settings_btn.setEnabled(False)
+                self.subscription_btn.setEnabled(False)
+                self.expert_btn.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                self.menu_button.hide()
+            except Exception:
+                pass
+            try:
+                self._purge_local_telegram_cache()
+            except Exception:
+                pass
+
+            # Re-apply managed Telegram app config after reset so the wizard
+            # remains on the phone page and credentials stay protected.
+            try:
+                self._apply_managed_telegram_app_config()
+            except Exception:
+                pass
+            try:
+                self._save_settings(immediate=True)
+            except Exception:
+                pass
+            try:
+                self.raise_()
+                self.activateWindow()
+            except Exception:
+                pass
+            try:
+                self.api_id.setFocus()
+            except Exception:
+                pass
+
+    def _purge_local_telegram_cache(self) -> None:
+        """Clear local Telegram-related caches so next login is fresh.
+
+        This is intentionally local-only (no backend dependency).
+        """
+        # Remove cached group avatars/icons (account-specific).
+        try:
+            if ICON_CACHE.exists():
+                shutil.rmtree(ICON_CACHE, ignore_errors=True)
+        except Exception:
+            pass
+
+        # Remove any local signal/message log that may contain previous account data.
+        try:
+            # Legacy format
+            legacy = Path("signals.json")
+            if legacy.exists():
+                legacy.unlink()
+        except Exception:
+            pass
+
+        try:
+            # Current NDJSON format + rotated backups
+            nd = Path(SIGNALS_NDJSON_FILE)
+            for p in [nd] + list(Path.cwd().glob(str(nd.name) + ".*")):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Remove persisted Telegram cursors (last seen message ids).
+        try:
+            p = Path(TG_CURSORS_FILE)
+            for q in [p] + list(p.parent.glob(p.name + ".*")):
+                try:
+                    if q.exists():
+                        q.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Remove durable backend outbox (account/session-specific).
+        try:
+            p = Path(BACKEND_OUTBOX_FILE)
+            for q in [p] + list(p.parent.glob(p.name + ".*")):
+                try:
+                    if q.exists():
+                        q.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # NOTE: Do NOT delete Telethon session files here.
+        # Session cleanup is handled by the worker during logout. Deleting
+        # sessions from the UI thread can race with immediate re-login.
+
+    def _show_about(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("About")
+        set_windows_native_titlebar_dark(dialog, bool(getattr(self, "dark_mode", False)))
+        dialog.setModal(True)
+        dialog.setFixedSize(280, 178)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(8)
+
+        title = QtWidgets.QLabel("FlameBot Telegram Copier")
+        title.setStyleSheet("font-weight: 700; font-size: 15px;")
+        version = QtWidgets.QLabel("Version: v1.0")
+        build_mode = QtWidgets.QLabel(
+            "Build: Packaged (.exe/.app)" if bool(getattr(sys, "frozen", False)) else "Build: Source (python)"
+        )
+        powered = QtWidgets.QLabel("Powered by FlameTech")
+        powered.setObjectName("muted")
+
+        build_mode.setObjectName("muted")
+
+        for widget in (title, version, build_mode, powered):
+            widget.setAlignment(QtCore.Qt.AlignCenter)
+            layout.addWidget(widget)
+
+        layout.addStretch()
+        dialog.exec_()
+
+    def on_filter_groups(self, text: str) -> None:
+        # Debounce to avoid rebuilding/updating the list on every keystroke
+        self._pending_group_filter_text = text
+        try:
+            self._group_filter_timer.start()
+        except Exception:
+            self._refresh_group_list(text)
+
+    def _apply_pending_group_filter(self) -> None:
+        try:
+            self._refresh_group_list(getattr(self, "_pending_group_filter_text", ""))
+        except Exception:
+            pass
+
+    def on_message(
+        self, chat_id: int, sender: str, text: str, timestamp: str, outgoing: bool
+    ) -> None:
+        self._ingest_message(chat_id, sender, text, timestamp, outgoing, save_settings=True)
+
+    def _seen_key_hit(self, chat_id: int, key: str) -> bool:
+        """Return True if message key was already ingested recently."""
+        try:
+            cid = int(chat_id)
+        except Exception:
+            cid = chat_id
+
+        entry = None
+        try:
+            entry = self._seen_message_keys_by_chat.get(cid)
+        except Exception:
+            entry = None
+
+        if not entry:
+            s: set = set()
+            q: deque = deque(maxlen=800)
+            self._seen_message_keys_by_chat[cid] = (s, q)
+            entry = (s, q)
+
+        s, q = entry
+        if key in s:
+            return True
+        s.add(key)
+        q.append(key)
+        # Opportunistic clean-up if something drifted.
+        try:
+            if len(s) > (len(q) + 50):
+                self._seen_message_keys_by_chat[cid] = (set(q), q)
+        except Exception:
+            pass
+        return False
+
+    def _ingest_message(
+        self,
+        chat_id: int,
+        sender: str,
+        text: str,
+        timestamp: str,
+        outgoing: bool,
+        *,
+        date_key: str = "",
+        save_settings: bool = True,
+    ) -> None:
+        state = self.group_states.get(chat_id)
+        if not state:
+            return
+
+        # De-dup across worker signal and NDJSON follow.
+        try:
+            key = (
+                f"{int(chat_id)}\n{str(sender or '')}\n{str(text or '')}\n"
+                f"{str(timestamp or '')}\n{int(bool(outgoing))}\n{str(date_key or '')}"
+            )
+        except Exception:
+            key = str(time.time())
+        try:
+            if self._seen_key_hit(int(chat_id), str(key)):
+                return
+        except Exception:
+            pass
+
+        # Ensure messages buffer is bounded and deque-backed.
+        try:
+            cap = int(getattr(self, "_chat_history_max_messages", 200) or 0)
+        except Exception:
+            cap = 200
+        try:
+            msgs = getattr(state, "messages", None)
+        except Exception:
+            msgs = None
+        if not isinstance(msgs, deque):
+            try:
+                existing = list(msgs or [])
+            except Exception:
+                existing = []
+            try:
+                state.messages = deque(existing, maxlen=(cap if cap > 0 else None))  # type: ignore[assignment]
+            except Exception:
+                state.messages = deque(existing)  # type: ignore[assignment]
+
+        try:
+            # If cap was changed at runtime, ensure maxlen matches.
+            if cap > 0 and getattr(state.messages, "maxlen", None) != cap:
+                state.messages = deque(list(state.messages), maxlen=cap)  # type: ignore[assignment]
+        except Exception:
+            pass
+
+        try:
+            state.messages.append((sender, text, timestamp, outgoing, str(date_key or "").strip()))
+        except Exception:
+            return
+
+        if self.current_group_id == chat_id:
+            state.unread = 0
+            # If an incremental render is in-flight for this chat, avoid
+            # appending older history after a new message.
+            try:
+                if getattr(self, "_chat_render_gid", None) == int(chat_id):
+                    self._cancel_chat_render()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "log"):
+                    # Match the desired UI: bubble header shows the chat's real title.
+                    # (Sender is still stored in state.messages for history.)
+                    bubble_title = str(getattr(state, "name", "") or "")
+                    self.log.appendMessage(
+                        bubble_title,
+                        text,
+                        timestamp,
+                        bool(outgoing),
+                        date_key=str(date_key or "").strip(),
+                    )
+            except Exception:
+                pass
+        else:
+            try:
+                state.unread += 1
+            except Exception:
+                pass
+
+        self._update_group_widget(state)
+        if save_settings:
+            self._save_settings()
+
+    def _start_ndjson_follow(self) -> None:
+        try:
+            t = getattr(self, "_ndjson_follow_timer", None)
+            if t is not None and t.isActive():
+                return
+        except Exception:
+            pass
+
+        try:
+            t = QtCore.QTimer(self)
+            t.setSingleShot(False)
+            t.setInterval(450)
+            t.timeout.connect(self._follow_ndjson_tick)
+            self._ndjson_follow_timer = t
+            t.start()
+        except Exception:
+            self._ndjson_follow_timer = None
+
+    def _follow_ndjson_tick(self) -> None:
+        path = Path(SIGNALS_NDJSON_FILE)
+        try:
+            if not path.exists():
+                return
+        except Exception:
+            return
+
+        try:
+            size = int(path.stat().st_size)
+        except Exception:
+            size = 0
+
+        # Handle rotations/truncation.
+        try:
+            if int(getattr(self, "_ndjson_follow_offset", 0) or 0) > size:
+                self._ndjson_follow_offset = 0
+        except Exception:
+            self._ndjson_follow_offset = 0
+
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(int(getattr(self, "_ndjson_follow_offset", 0) or 0))
+                chunk = handle.read(64_000)
+                self._ndjson_follow_offset = int(handle.tell())
+        except Exception:
+            return
+
+        if not chunk:
+            return
+
+        try:
+            data = str(getattr(self, "_ndjson_follow_partial", "") or "") + str(chunk)
+        except Exception:
+            data = str(chunk)
+
+        # Only process complete lines; keep remainder for next tick.
+        if "\n" in data:
+            parts = data.split("\n")
+            lines = parts[:-1]
+            try:
+                self._ndjson_follow_partial = parts[-1]
+            except Exception:
+                self._ndjson_follow_partial = ""
+        else:
+            try:
+                self._ndjson_follow_partial = data
+            except Exception:
+                self._ndjson_follow_partial = ""
+            return
+
+        for line in lines:
+            s = (line or "").strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                continue
+
+            try:
+                chat_id = int(obj.get("chat_id", 0) or 0)
+            except Exception:
+                continue
+            if not chat_id:
+                continue
+            if chat_id not in (getattr(self, "group_states", {}) or {}):
+                continue
+
+            try:
+                sender = str(obj.get("sender", "") or "")
+            except Exception:
+                sender = ""
+            try:
+                text = str(obj.get("text", "") or "")
+            except Exception:
+                text = ""
+            try:
+                timestamp = str(obj.get("tg_time", "") or "").strip()
+            except Exception:
+                timestamp = ""
+
+            tg_ts = 0
+            try:
+                tg_ts = int(obj.get("tg_ts", 0) or 0)
+            except Exception:
+                tg_ts = 0
+            date_key = ""
+            if tg_ts and int(tg_ts) > 0:
+                try:
+                    date_key = _format_local_ymd_from_utc_epoch(int(tg_ts))
+                except Exception:
+                    date_key = ""
+            if not date_key:
+                try:
+                    recv_time = str(obj.get("recv_time", obj.get("time", "")) or "")
+                except Exception:
+                    recv_time = ""
+                try:
+                    date_key = _extract_ymd_from_recv_time(recv_time)
+                except Exception:
+                    date_key = ""
+            try:
+                outgoing = bool(obj.get("outgoing", False))
+            except Exception:
+                outgoing = False
+
+            self._ingest_message(chat_id, sender, text, timestamp, outgoing, date_key=date_key, save_settings=False)
+
+    def on_icon_ready(self, chat_id: int, icon_path: str) -> None:
+        state = self.group_states.get(chat_id)
+        if not state:
+            return
+        state.icon_path = icon_path
+        self._update_group_icon(chat_id, icon_path)
+
+    def _refresh_group_list(self, filter_text: str = "") -> None:
+        # Build row widgets once, then filter by hiding items.
+        term = _normalize_search_text(filter_text)
+        current_id = getattr(self, "current_group_id", None)
+
+        # If an incremental build is in-flight, restart it using the filter so
+        # results appear immediately (do not wait to build every row in order).
+        try:
+            if bool(getattr(self, "_group_build_inflight", False)):
+                try:
+                    t = getattr(self, "_group_build_timer", None)
+                    if t is not None and t.isActive():
+                        t.stop()
+                except Exception:
+                    pass
+                try:
+                    self._group_build_inflight = False
+                except Exception:
+                    pass
+                self._begin_group_list_build(filter_text=filter_text, target_gid=current_id)
+                return
+        except Exception:
+            pass
+
+        # Ensure we have a stable order and cached items
+        if not hasattr(self, "group_order"):
+            self.group_order = list(self.group_states.keys())
+        if not hasattr(self, "_group_items"):
+            self._group_items = {}
+        if not hasattr(self, "_group_search_index"):
+            self._group_search_index = {}
+
+        # If the list was previously built as a filtered subset, we must rebuild
+        # when the term changes (including clearing) because we may not have row
+        # widgets for every gid.
+        try:
+            build_mode = str(getattr(self, "_group_list_build_mode", "full") or "full")
+        except Exception:
+            build_mode = "full"
+        try:
+            built_term = str(getattr(self, "_group_list_filter_term", "") or "")
+        except Exception:
+            built_term = ""
+        if build_mode == "filtered" and term != built_term:
+            self._begin_group_list_build(filter_text=filter_text, target_gid=current_id)
+            return
+        if build_mode == "full":
+            try:
+                if len(getattr(self, "_group_items", {}) or {}) < len(getattr(self, "group_order", []) or []):
+                    self._begin_group_list_build(filter_text=filter_text, target_gid=current_id)
+                    return
+            except Exception:
+                pass
+
+        needs_build = (not self._group_items) or (self.list_groups.count() == 0 and bool(self.group_states))
+
+        if needs_build:
+            # Use incremental build to avoid UI stalls; when a filter term is
+            # provided we only build matching rows.
+            self._begin_group_list_build(filter_text=filter_text, target_gid=current_id)
+            return
+
+        # Apply filter by hiding/showing items (fast)
+        first_visible: Optional[int] = None
+        self.list_groups.setUpdatesEnabled(False)
+        try:
+            for gid in self.group_order:
+                item = self._group_items.get(gid)
+                if not item:
+                    continue
+                hay = self._group_search_index.get(gid, "")
+                visible = (not term) or (term in hay)
+                item.setHidden(not visible)
+                if visible and first_visible is None:
+                    first_visible = gid
+        finally:
+            self.list_groups.setUpdatesEnabled(True)
+
+        # IMPORTANT UX: Searching must NOT auto-select/open chats.
+        # Only change selection when filter is empty (normal browsing).
+        if term:
+            return
+
+        # Keep selection stable when clearing search.
+        try:
+            if current_id and current_id in self._group_items and not self._group_items[current_id].isHidden():
+                # Avoid emitting signals if already selected.
+                try:
+                    cur_item = self.list_groups.currentItem()
+                except Exception:
+                    cur_item = None
+                if cur_item is not self._group_items[current_id]:
+                    self.list_groups.setCurrentItem(self._group_items[current_id])
+            elif first_visible is not None and first_visible in self._group_items:
+                # Only select a default when nothing is selected.
+                try:
+                    if self.list_groups.currentItem() is None:
+                        self.list_groups.setCurrentItem(self._group_items[first_visible])
+                except Exception:
+                    pass
+            else:
+                self.list_groups.clearSelection()
+        except Exception:
+            pass
+
+    def _begin_group_list_build(self, *, filter_text: str = "", target_gid: Optional[int] = None) -> None:
+        """Incrementally build group list widgets to avoid UI freezing."""
+        try:
+            self.list_groups.setUpdatesEnabled(False)
+            self.list_groups.clear()
+        except Exception:
+            pass
+
+        try:
+            self.group_widgets = {}
+            self._group_items = {}
+        except Exception:
+            pass
+
+        # Keep the full search index across rebuilds.
+        try:
+            if not hasattr(self, "_group_search_index"):
+                self._group_search_index = {}
+        except Exception:
+            self._group_search_index = {}
+
+        try:
+            self._group_build_term = _normalize_search_text(filter_text)
+        except Exception:
+            self._group_build_term = ""
+
+        # Track what this list represents so future filtering behaves correctly.
+        try:
+            self._group_list_filter_term = str(self._group_build_term or "")
+            self._group_list_build_mode = ("filtered" if bool(self._group_list_filter_term) else "full")
+        except Exception:
+            pass
+        self._group_build_target_gid = target_gid if target_gid in getattr(self, "group_states", {}) else None
+
+        # When filtering, build ONLY matching gids so results appear immediately.
+        try:
+            group_order = list(getattr(self, "group_order", []) or [])
+        except Exception:
+            group_order = []
+
+        pending: List[int] = []
+        term = str(getattr(self, "_group_build_term", "") or "")
+        if not term:
+            pending = group_order
+        else:
+            for gid in group_order:
+                try:
+                    hay = str((getattr(self, "_group_search_index", {}) or {}).get(gid, "") or "")
+                except Exception:
+                    hay = ""
+                if not hay:
+                    try:
+                        st = (getattr(self, "group_states", {}) or {}).get(gid)
+                        name_norm = _normalize_search_text(getattr(st, "name", "") or "") if st else ""
+                        name_compact = name_norm.replace(" ", "") if name_norm else ""
+
+                        user_raw = str(getattr(st, "username", "") or "").strip().lstrip("@") if st else ""
+                        user_norm = _normalize_search_text(user_raw) if user_raw else ""
+                        user_at_norm = _normalize_search_text("@" + user_raw) if user_raw else ""
+                        user_compact = user_norm.replace(" ", "") if user_norm else ""
+                        user_at_compact = user_at_norm.replace(" ", "") if user_at_norm else ""
+                        user_link_norm = _normalize_search_text(f"t.me/{user_raw}") if user_raw else ""
+                        user_link_compact = user_link_norm.replace(" ", "") if user_link_norm else ""
+
+                        hay = (
+                            f"{name_norm} {name_compact} {user_norm} {user_compact} {user_at_norm} "
+                            f"{user_at_compact} {user_link_norm} {user_link_compact} {gid}"
+                        ).strip()
+                        try:
+                            self._group_search_index[gid] = hay
+                        except Exception:
+                            pass
+                    except Exception:
+                        hay = ""
+                if term and (term in hay):
+                    pending.append(gid)
+
+        try:
+            self._group_build_pending_gids = deque(pending)
+        except Exception:
+            self._group_build_pending_gids = deque()
+
+        self._group_build_inflight = True
+        try:
+            # Build the first chunk immediately while updates are disabled.
+            # This avoids a visible blank/flicker between clear() and the first rows.
+            try:
+                budget_ms = int(os.environ.get("FLAMEBOT_GROUP_BUILD_BUDGET_MS", "8"))
+            except Exception:
+                budget_ms = 8
+            budget_ms = max(2, min(40, budget_ms))
+            self._add_group_rows_chunk(30, deadline=(time.perf_counter() + (budget_ms / 1000.0)))
+        except Exception:
+            pass
+        finally:
+            try:
+                self.list_groups.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+        # Continue building remaining rows via timer.
+        try:
+            if not self._group_build_pending_gids:
+                self._group_build_inflight = False
+                self._finalize_group_list_build()
+                return
+            t = getattr(self, "_group_build_timer", None)
+            if t is None:
+                # Fallback: build immediately (old behavior).
+                self._group_build_inflight = False
+                self._refresh_group_list(filter_text)
+                return
+            t.start(0)
+        except Exception:
+            self._group_build_inflight = False
+            self._refresh_group_list(filter_text)
+
+    def _add_group_rows_chunk(self, count: int, *, deadline: Optional[float] = None) -> None:
+        """Add up to `count` group rows to the list (uses current filter term)."""
+        if not bool(getattr(self, "_group_build_inflight", False)):
+            return
+        try:
+            term = str(getattr(self, "_group_build_term", "") or "")
+        except Exception:
+            term = ""
+
+        for _ in range(max(0, int(count or 0))):
+            if deadline is not None:
+                try:
+                    if time.perf_counter() >= float(deadline):
+                        break
+                except Exception:
+                    pass
+            if not self._group_build_pending_gids:
+                break
+            try:
+                gid = self._group_build_pending_gids.popleft()
+            except Exception:
+                break
+            state = self.group_states.get(gid)
+            if not state:
+                continue
+            item = QtWidgets.QListWidgetItem()
+            widget = self._build_group_row(state)
+            item.setSizeHint(widget.sizeHint())
+            item.setData(QtCore.Qt.UserRole, state.gid)
+            try:
+                hay = self._group_search_index.get(state.gid, "")
+                if not hay:
+                    name_norm = _normalize_search_text(getattr(state, "name", "") or "")
+                    name_compact = name_norm.replace(" ", "") if name_norm else ""
+
+                    user_raw = str(getattr(state, "username", "") or "").strip().lstrip("@")
+                    user_norm = _normalize_search_text(user_raw) if user_raw else ""
+                    user_at_norm = _normalize_search_text("@" + user_raw) if user_raw else ""
+                    user_compact = user_norm.replace(" ", "") if user_norm else ""
+                    user_at_compact = user_at_norm.replace(" ", "") if user_at_norm else ""
+                    user_link_norm = _normalize_search_text(f"t.me/{user_raw}") if user_raw else ""
+                    user_link_compact = user_link_norm.replace(" ", "") if user_link_norm else ""
+
+                    self._group_search_index[state.gid] = (
+                        f"{name_norm} {name_compact} {user_norm} {user_compact} {user_at_norm} "
+                        f"{user_at_compact} {user_link_norm} {user_link_compact} {state.gid}"
+                    ).strip()
+                    hay = self._group_search_index[state.gid]
+                visible = (not term) or (term in hay)
+                item.setHidden(not visible)
+            except Exception:
+                pass
+            self.list_groups.addItem(item)
+            self.list_groups.setItemWidget(item, widget)
+            self.group_widgets[state.gid] = widget
+            self._group_items[state.gid] = item
+
+    def _continue_group_list_build(self) -> None:
+        if not bool(getattr(self, "_group_build_inflight", False)):
+            return
+
+        # Add rows per tick, but time-budget the work to keep UI responsive.
+        chunk_size = 60
+        try:
+            budget_ms = int(os.environ.get("FLAMEBOT_GROUP_BUILD_BUDGET_MS", "8"))
+        except Exception:
+            budget_ms = 8
+        budget_ms = max(2, min(40, budget_ms))
+        deadline = time.perf_counter() + (budget_ms / 1000.0)
+        try:
+            self.list_groups.setUpdatesEnabled(False)
+            self._add_group_rows_chunk(chunk_size, deadline=deadline)
+        finally:
+            try:
+                self.list_groups.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+        # Continue building until done.
+        if self._group_build_pending_gids:
+            try:
+                t = getattr(self, "_group_build_timer", None)
+                if t is not None:
+                    t.start(0)
+            except Exception:
+                pass
+            return
+
+        # Finished.
+        self._group_build_inflight = False
+        try:
+            self._finalize_group_list_build()
+        except Exception:
+            pass
+
+    def _finalize_group_list_build(self) -> None:
+        # Telegram-like UX:
+        # - If the user already selected a group while the list was loading,
+        #   do NOT reset the message panel back to the empty-state.
+        # - If no group has been selected, keep the empty-state.
+        try:
+            selected_gid = getattr(self, "current_group_id", None)
+        except Exception:
+            selected_gid = None
+
+        if selected_gid and int(selected_gid) in (getattr(self, "group_states", {}) or {}):
+            gid = int(selected_gid)
+            # Keep selection highlight in sync (best-effort).
+            try:
+                item = (getattr(self, "_group_items", {}) or {}).get(gid)
+                if item is not None and not item.isHidden():
+                    self.list_groups.setCurrentItem(item)
+            except Exception:
+                pass
+            try:
+                self._set_group_row_selected(gid)
+            except Exception:
+                pass
+            return
+
+        # No selected group: keep empty-state and no selection.
+        try:
+            self.list_groups.clearSelection()
+        except Exception:
+            pass
+        try:
+            self.current_group_id = None
+        except Exception:
+            pass
+        try:
+            self._set_group_row_selected(None)
+        except Exception:
+            pass
+        try:
+            self._render_message_log_for_group(None)
+        except Exception:
+            pass
+
+        try:
+            if self.groups_cache:
+                self._log("Groups loaded. Click 🎤 to listen.")
+        except Exception:
+            pass
+
+    def _build_group_row(self, state: GroupState) -> QtWidgets.QWidget:
+        container = QtWidgets.QFrame()
+        container.setObjectName("group_row")
+        container.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        try:
+            container.setProperty("selected", False)
+            container.setProperty("hover", False)
+        except Exception:
+            pass
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+        icon_lbl = QtWidgets.QLabel()
+        icon_lbl.setFixedSize(34, 34)
+        icon_pix = self._circle_icon(state.icon_path, 34)
+        if icon_pix:
+            icon_lbl.setPixmap(icon_pix)
+        text_block = QtWidgets.QVBoxLayout()
+        text_block.setSpacing(2)
+        name_lbl = QtWidgets.QLabel(state.name)
+        name_lbl.setStyleSheet("font-weight: 600;")
+        subtitle_lbl = ElidedLabel("")
+        subtitle_lbl.setObjectName("muted")
+        try:
+            subtitle_lbl.setTextFormat(QtCore.Qt.PlainText)
+        except Exception:
+            pass
+        try:
+            subtitle_lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        except Exception:
+            pass
+        preview = self._last_preview(state)
+        if preview:
+            subtitle_lbl.setText(preview)
+        text_block.addWidget(name_lbl)
+        text_block.addWidget(subtitle_lbl)
+        spacer = QtWidgets.QSpacerItem(
+            10, 10, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum
+        )
+        timestamp_lbl = QtWidgets.QLabel(self._last_timestamp(state))
+        timestamp_lbl.setObjectName("muted")
+        badge = QtWidgets.QLabel()
+        badge.setStyleSheet(
+            "background-color: #ff7a2f; color: white; border-radius: 9px; padding: 2px 7px;"
+        )
+        badge.setVisible(state.unread > 0)
+        badge.setText(str(state.unread))
+        headset = QtWidgets.QToolButton()
+        headset.setObjectName("listen_toggle")
+        headset.setCheckable(True)
+        headset.setText("🎧" if state.listening else "🎤")
+        headset.setCursor(QtCore.Qt.PointingHandCursor)
+        headset.setChecked(state.listening)
+        headset.setToolTip(
+            "Listening… click to stop"
+            if state.listening
+            else "Click to start listening for signals"
+        )
+        headset.clicked.connect(
+            lambda checked, gid=state.gid: self.on_group_listen_toggled(gid, checked)
+        )
+        self._color_headset_button(headset, state.listening)
+        layout.addWidget(icon_lbl)
+        layout.addLayout(text_block)
+        layout.addItem(spacer)
+        layout.addWidget(timestamp_lbl)
+        layout.addWidget(badge)
+        layout.addWidget(headset)
+        container.setLayout(layout)
+        container._flame_widgets = {  # type: ignore[attr-defined]
+            "badge": badge,
+            "headset": headset,
+            "name": name_lbl,
+            "subtitle": subtitle_lbl,
+            "timestamp": timestamp_lbl,
+            "icon": icon_lbl,
+        }
+        return container
+
+    def _color_headset_button(self, button: QtWidgets.QToolButton, active: bool) -> None:
+        color = "#ff7a2f" if active else "#888888"
+        button.setStyleSheet(f"color: {color}; font-size: 20px; background: transparent;")
+
+    def _enforce_dashboard_limits(self, *args) -> None:
+        if not hasattr(self, "dashboard_splitter"):
+            return
+        sizes = self.dashboard_splitter.sizes()
+        total = sum(sizes)
+        min_left = 230
+        min_right = 320
+        if sizes[0] < min_left:
+            self.dashboard_splitter.setSizes([min_left, max(min_right, total - min_left)])
+        elif sizes[1] < min_right:
+            self.dashboard_splitter.setSizes([max(min_left, total - min_right), min_right])
+
+    def _update_group_icon(self, gid: int, icon_path: str) -> None:
+        widget = self.group_widgets.get(gid)
+        if not widget:
+            return
+        refs = getattr(widget, "_flame_widgets", {})
+        icon_lbl: QtWidgets.QLabel = refs.get("icon")
+        if icon_lbl:
+            pix = self._circle_icon(icon_path, 34)
+            if pix:
+                icon_lbl.setPixmap(pix)
+                icon_lbl.update()
+
+    def _update_group_widget(self, state: GroupState) -> None:
+        widget = self.group_widgets.get(state.gid)
+        if not widget:
+            return
+        refs = getattr(widget, "_flame_widgets", {})
+        badge: QtWidgets.QLabel = refs.get("badge")
+        headset: QtWidgets.QToolButton = refs.get("headset")
+        subtitle: QtWidgets.QLabel = refs.get("subtitle")
+        name_lbl: QtWidgets.QLabel = refs.get("name")
+        timestamp_lbl: QtWidgets.QLabel = refs.get("timestamp")
+        if name_lbl:
+            name_lbl.setText(state.name)
+            try:
+                name_norm = _normalize_search_text(getattr(state, "name", "") or "")
+                name_compact = name_norm.replace(" ", "") if name_norm else ""
+
+                user_raw = str(getattr(state, "username", "") or "").strip().lstrip("@")
+                user_norm = _normalize_search_text(user_raw) if user_raw else ""
+                user_at_norm = _normalize_search_text("@" + user_raw) if user_raw else ""
+                user_compact = user_norm.replace(" ", "") if user_norm else ""
+                user_at_compact = user_at_norm.replace(" ", "") if user_at_norm else ""
+                user_link_norm = _normalize_search_text(f"t.me/{user_raw}") if user_raw else ""
+                user_link_compact = user_link_norm.replace(" ", "") if user_link_norm else ""
+
+                self._group_search_index[state.gid] = (
+                    f"{name_norm} {name_compact} {user_norm} {user_compact} {user_at_norm} "
+                    f"{user_at_compact} {user_link_norm} {user_link_compact} {state.gid}"
+                ).strip()
+            except Exception:
+                pass
+        if subtitle:
+            preview = self._last_preview(state)
+            subtitle.setText(preview or "")
+        if timestamp_lbl:
+            timestamp_lbl.setText(self._last_timestamp(state))
+        if badge:
+            badge.setText(str(state.unread))
+            badge.setVisible(state.unread > 0)
+        if headset:
+            headset.blockSignals(True)
+            headset.setChecked(state.listening)
+            headset.setText("🎧" if state.listening else "🎤")
+            headset.setToolTip(
+                "Listening… click to stop"
+                if state.listening
+                else "Click to start listening for signals"
+            )
+            self._color_headset_button(headset, state.listening)
+            headset.blockSignals(False)
+
+    def _last_preview(self, state: GroupState) -> str:
+        if state.messages:
+            sender, text, *_ = state.messages[-1]
+            try:
+                t = str(text or "")
+            except Exception:
+                t = ""
+
+            # Telegram-like single-line preview: collapse whitespace/newlines.
+            try:
+                t = re.sub(r"\s+", " ", t).strip()
+            except Exception:
+                t = t.replace("\n", " ").strip()
+
+            return t
+        return ""
+
+    def _last_timestamp(self, state: GroupState) -> str:
+        if state.messages:
+            try:
+                raw = str(state.messages[-1][2] or "")
+            except Exception:
+                raw = ""
+            try:
+                return raw[:5] if len(raw) >= 5 else raw
+            except Exception:
+                return raw
+        return ""
+
+    def _circle_icon(self, icon_path: Optional[str], size: int) -> Optional[QtGui.QPixmap]:
+        target_path = Path(icon_path) if icon_path else None
+        if not target_path or not target_path.exists():
+            return None
+
+        # Guard against corrupt/truncated JPEGs in the cache, which can print
+        # noisy libjpeg warnings to stderr on every decode attempt.
+        try:
+            suf = str(target_path.suffix or "").lower()
+        except Exception:
+            suf = ""
+        if suf in {".jpg", ".jpeg"} and not _is_complete_jpeg_file(target_path):
+            try:
+                target_path.unlink()
+            except Exception:
+                pass
+            return None
+
+        # Cache by (path, size, mtime_ns) to avoid repeated load/scale/paint.
+        try:
+            st = target_path.stat()
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        except Exception:
+            mtime_ns = 0
+        cache_key = (str(target_path), int(size), int(mtime_ns))
+        cache = getattr(self, "_icon_cache", None)
+        if cache is not None:
+            try:
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    try:
+                        cache.move_to_end(cache_key)
+                    except Exception:
+                        pass
+                    return cached
+            except Exception:
+                pass
+        pix = QtGui.QPixmap(str(target_path))
+        if pix.isNull():
+            return None
+        scaled = pix.scaled(
+            size,
+            size,
+            QtCore.Qt.KeepAspectRatioByExpanding,
+            QtCore.Qt.SmoothTransformation,
+        )
+        canvas = QtGui.QPixmap(size, size)
+        canvas.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(canvas)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setBrush(QtGui.QBrush(scaled))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawEllipse(0, 0, size, size)
+        painter.end()
+
+        if cache is not None:
+            try:
+                cache[cache_key] = canvas
+                try:
+                    cache.move_to_end(cache_key)
+                except Exception:
+                    pass
+                max_items = int(getattr(self, "_icon_cache_max", 512) or 512)
+                while max_items > 0 and len(cache) > max_items:
+                    try:
+                        cache.popitem(last=False)
+                    except Exception:
+                        break
+            except Exception:
+                pass
+        return canvas
+
+    def _position_password_toggle(self) -> None:
+        if not hasattr(self, "password") or not hasattr(self, "password_toggle"):
+            return
+        frame_width = self.password.style().pixelMetric(QtWidgets.QStyle.PM_DefaultFrameWidth)
+        toggle_size = self.password_toggle.sizeHint()
+        self.password.setTextMargins(0, 0, toggle_size.width() + frame_width, 0)
+        self.password_toggle.move(
+            self.password.rect().right() - toggle_size.width() - frame_width,
+            (self.password.rect().bottom() - toggle_size.height()) // 2,
+        )
+
+    def _toggle_password_visibility(self) -> None:
+        show_password = self.password_toggle.isChecked()
+        self.password.setEchoMode(
+            QtWidgets.QLineEdit.Normal if show_password else QtWidgets.QLineEdit.Password
+        )
+        self.password_toggle.setText("👁" if show_password else "👁‍🗨")
+        self.password.setFocus()
+
+    def _on_gls_toggled(self, checked: bool) -> None:
+        if checked:
+            # CRITICAL: Cancel PSL edit mode if active (prevent state bleed)
+            if getattr(self, "psl_edit_mode", False):
+                self._exit_psl_edit_mode(revert=True)
+
+            # Ensure mutual exclusivity before resolving active mode
+            self.psl_checkbox.blockSignals(True)
+            self.psl_checkbox.setChecked(False)
+            self.psl_checkbox.blockSignals(False)
+
+            # Point shared references to GLS widgets
+            self.allow_close_checkbox = self.gls_allow_close_checkbox
+            self.allow_breakeven_checkbox = self.gls_allow_breakeven_checkbox
+            self.allow_secure_half_checkbox = self.gls_allow_secure_half_checkbox
+            self.allow_multiple_checkbox = self.gls_allow_multiple_checkbox
+            self.entry_market_edge_radio = self.gls_entry_market_edge_radio
+            self.entry_range_distributed_radio = self.gls_entry_range_distributed_radio
+
+            self.scheduler_active_checkbox = self.gls_scheduler_active_checkbox
+            self.scheduler_pause_day_combo = self.gls_scheduler_pause_day
+            self.scheduler_pause_hour_combo = self.gls_scheduler_pause_hour
+            self.scheduler_pause_minute_combo = self.gls_scheduler_pause_minute
+            self.scheduler_resume_day_combo = self.gls_scheduler_resume_day
+            self.scheduler_resume_hour_combo = self.gls_scheduler_resume_hour
+            self.scheduler_resume_minute_combo = self.gls_scheduler_resume_minute
+
+            # Persist current PSL Trade Control view-state, then load GLS state
+            try:
+                self._store_trade_control_state_for_mode("psl")
+                self._load_trade_control_state_for_mode(self._active_settings_mode())
+            except Exception:
+                pass
+
+            # Show GLS panel
+            self.gls_panel.setVisible(True)
+            self.psl_panel.setVisible(False)
+            # Update button state to reflect GLS edit mode
+            self._update_edit_button_state()
+            # Reapply trade control state for GLS widgets
+            self._apply_trade_control_state_to_ui()
+            try:
+                self._apply_scheduler_state_to_ui()
+            except Exception:
+                pass
+        elif not self.psl_checkbox.isChecked():
+            # If unchecking GLS and PSL isn't checked, re-check GLS
+            self.gls_checkbox.blockSignals(True)
+            self.gls_checkbox.setChecked(True)
+            self.gls_checkbox.blockSignals(False)
+
+    def _on_psl_toggled(self, checked: bool) -> None:
+        if checked:
+            # CRITICAL: Cancel GLS edit mode if active (prevent state bleed)
+            if getattr(self, "gls_edit_mode", False):
+                self._exit_edit_mode(revert=True)
+
+            # Ensure mutual exclusivity before resolving active mode
+            self.gls_checkbox.blockSignals(True)
+            self.gls_checkbox.setChecked(False)
+            self.gls_checkbox.blockSignals(False)
+
+            # Point shared references to PSL widgets
+            self.allow_close_checkbox = self.psl_allow_close_checkbox
+            self.allow_breakeven_checkbox = self.psl_allow_breakeven_checkbox
+            self.allow_secure_half_checkbox = self.psl_allow_secure_half_checkbox
+            self.allow_multiple_checkbox = self.psl_allow_multiple_checkbox
+            self.entry_market_edge_radio = self.psl_entry_market_edge_radio
+            self.entry_range_distributed_radio = self.psl_entry_range_distributed_radio
+
+            self.scheduler_active_checkbox = self.psl_scheduler_active_checkbox
+            self.scheduler_pause_day_combo = self.psl_scheduler_pause_day
+            self.scheduler_pause_hour_combo = self.psl_scheduler_pause_hour
+            self.scheduler_pause_minute_combo = self.psl_scheduler_pause_minute
+            self.scheduler_resume_day_combo = self.psl_scheduler_resume_day
+            self.scheduler_resume_hour_combo = self.psl_scheduler_resume_hour
+            self.scheduler_resume_minute_combo = self.psl_scheduler_resume_minute
+
+            # Persist current GLS Trade Control view-state, then load PSL state
+            try:
+                self._store_trade_control_state_for_mode("gls")
+                self._load_trade_control_state_for_mode(self._active_settings_mode())
+            except Exception:
+                pass
+
+            # Show PSL panel
+            self.gls_panel.setVisible(False)
+            self.psl_panel.setVisible(True)
+            # Build PSL symbol list when switching to PSL
+            self._refresh_psl_list()
+            # Update button state to reflect PSL edit mode
+            self._update_edit_button_state()
+            # Ensure PSL widgets obey lock state (newly-built controls)
+            self._update_settings_lock_state()
+            # Reapply trade control state for PSL widgets
+            self._apply_trade_control_state_to_ui()
+            try:
+                self._apply_scheduler_state_to_ui()
+            except Exception:
+                pass
+        elif not self.gls_checkbox.isChecked():
+            # If unchecking PSL and GLS isn't checked, re-check PSL
+            self.psl_checkbox.blockSignals(True)
+            self.psl_checkbox.setChecked(True)
+            self.psl_checkbox.blockSignals(False)
+
+    def _active_settings_mode(self) -> str:
+        """Return the currently selected settings mode: 'gls' or 'psl'.
+
+        IMPORTANT: Use the selector controls only; edit mode must never affect
+        which mode is considered active.
+        """
+        try:
+            if getattr(self, "psl_checkbox", None) and self.psl_checkbox.isChecked():
+                return "psl"
+        except Exception:
+            pass
+        return "gls"
+
+    def _store_trade_control_state_for_mode(self, mode: str) -> None:
+        """Store current live Trade Control + entry_mode into the per-mode cache."""
+        if not hasattr(self, "_trade_control_by_mode"):
+            return
+        mode_key = (mode or "gls").lower()
+        if mode_key not in ("gls", "psl"):
+            mode_key = "gls"
+        self._trade_control_by_mode[mode_key] = {
+            "allow_message_close": bool(getattr(self, "allow_message_close", False)),
+            "allow_message_breakeven": bool(getattr(self, "allow_message_breakeven", False)),
+            "allow_secure_half": bool(getattr(self, "allow_secure_half", False)),
+            "allow_multiple_signals_per_symbol": bool(getattr(self, "allow_multiple_signals_per_symbol", False)),
+            "entry_mode": getattr(self, "entry_mode", None),
+        }
+
+    def _load_trade_control_state_for_mode(self, mode: str, *, use_saved: bool = False) -> None:
+        """Load a mode's Trade Control + entry_mode into live fields and update UI widgets."""
+        mode_key = (mode or "gls").lower()
+        if mode_key not in ("gls", "psl"):
+            mode_key = "gls"
+        # Track active execution mode so downstream UI logic knows which mode is being viewed
+        try:
+            self.user_execution_mode = mode_key
+        except Exception:
+            pass
+        data = None
+        if use_saved and hasattr(self, "_saved_trade_control_by_mode"):
+            data = self._saved_trade_control_by_mode.get(mode_key)
+        if data is None and hasattr(self, "_trade_control_by_mode"):
+            data = self._trade_control_by_mode.get(mode_key)
+        if not data:
+            return
+
+        self.allow_message_close = bool(data.get("allow_message_close", False))
+        self.allow_message_breakeven = bool(data.get("allow_message_breakeven", False))
+        self.allow_secure_half = bool(data.get("allow_secure_half", False))
+        self.allow_multiple_signals_per_symbol = bool(data.get("allow_multiple_signals_per_symbol", False))
+        self.entry_mode = data.get("entry_mode")
+        self._apply_trade_control_state_to_ui()
+
+    def _apply_trade_control_state_to_ui(self) -> None:
+        """Apply Trade Control + entry_mode to GLS/PSL widgets without cross-updating state."""
+        try:
+            gls_data = getattr(self, "_trade_control_by_mode", {}).get("gls", {})
+            psl_data = getattr(self, "_trade_control_by_mode", {}).get("psl", {})
+        except Exception:
+            gls_data = {}
+            psl_data = {}
+
+        def _set_checkbox(widget, value: bool) -> None:
+            try:
+                if widget is not None:
+                    widget.blockSignals(True)
+                    widget.setChecked(bool(value))
+                    widget.blockSignals(False)
+            except Exception:
+                pass
+
+        # GLS widgets
+        _set_checkbox(getattr(self, "gls_allow_close_checkbox", None), bool(gls_data.get("allow_message_close", False)))
+        _set_checkbox(getattr(self, "gls_allow_breakeven_checkbox", None), bool(gls_data.get("allow_message_breakeven", False)))
+        _set_checkbox(getattr(self, "gls_allow_secure_half_checkbox", None), bool(gls_data.get("allow_secure_half", False)))
+        _set_checkbox(getattr(self, "gls_allow_multiple_checkbox", None), bool(gls_data.get("allow_multiple_signals_per_symbol", False)))
+
+        # PSL widgets
+        _set_checkbox(getattr(self, "psl_allow_close_checkbox", None), bool(psl_data.get("allow_message_close", False)))
+        _set_checkbox(getattr(self, "psl_allow_breakeven_checkbox", None), bool(psl_data.get("allow_message_breakeven", False)))
+        _set_checkbox(getattr(self, "psl_allow_secure_half_checkbox", None), bool(psl_data.get("allow_secure_half", False)))
+        _set_checkbox(getattr(self, "psl_allow_multiple_checkbox", None), bool(psl_data.get("allow_multiple_signals_per_symbol", False)))
+
+        # Entry mode radios (per mode)
+        try:
+            gls_entry = gls_data.get("entry_mode")
+            if gls_entry in ("market_edge", "range_distributed"):
+                if hasattr(self, "gls_entry_market_edge_radio") and hasattr(self, "gls_entry_range_distributed_radio"):
+                    self.gls_entry_market_edge_radio.setChecked(gls_entry == "market_edge")
+                    self.gls_entry_range_distributed_radio.setChecked(gls_entry == "range_distributed")
+        except Exception:
+            pass
+        try:
+            psl_entry = psl_data.get("entry_mode")
+            if psl_entry in ("market_edge", "range_distributed"):
+                if hasattr(self, "psl_entry_market_edge_radio") and hasattr(self, "psl_entry_range_distributed_radio"):
+                    self.psl_entry_market_edge_radio.setChecked(psl_entry == "market_edge")
+                    self.psl_entry_range_distributed_radio.setChecked(psl_entry == "range_distributed")
+        except Exception:
+            pass
+
+    def _recompute_configured_flags_from_backend(self) -> None:
+        """Compute configured/not-configured with hydration TTL and last-good cache."""
+        try:
+            ctx = self._context_key()
+        except Exception:
+            ctx = None
+
+        try:
+            has_lot_record = bool(getattr(self, "_backend_presence_by_context", {}).get("lot", {}).get(ctx, False)) if ctx else False
+            has_symbol_record = bool(getattr(self, "_backend_presence_by_context", {}).get("symbol", {}).get(ctx, False)) if ctx else False
+            has_psl_record = bool(getattr(self, "_backend_presence_by_context", {}).get("psl", {}).get(ctx, False)) if ctx else False
+        except Exception:
+            has_lot_record = False
+            has_symbol_record = False
+            has_psl_record = False
+
+        try:
+            lot_mode = (getattr(self, "_saved_lot_mode", None) or "default")
+            lot_value = getattr(self, "_saved_custom_lot", None)
+            if isinstance(lot_value, str) and not lot_value.strip():
+                lot_value = None
+            saved_lot_configured = bool(has_lot_record and (lot_mode == "default" or (lot_mode == "custom" and lot_value is not None)))
+
+            sym_mode = (getattr(self, "_saved_symbol_mode", None) or "default")
+            allowed = getattr(self, "_saved_symbols_allowed", None) or []
+            if not isinstance(allowed, list):
+                allowed = []
+            saved_symbol_configured = bool(has_symbol_record and (sym_mode == "default" or (sym_mode == "custom" and len(allowed) > 0)))
+
+            psl = getattr(self, "_saved_per_symbol_lots", None) or {}
+            if not isinstance(psl, dict):
+                psl = {}
+            psl_flag = bool(getattr(self, "_saved_psl_configured", False))
+            saved_psl_configured = bool(has_psl_record and (psl_flag or len(psl.keys()) > 0))
+
+            # If backend indicates PSL is the active execution mode, GLS should display as not configured
+            exec_mode = None
+            try:
+                exec_mode = (getattr(self, "user_execution_mode", None) or "").strip().lower()
+            except Exception:
+                exec_mode = None
+            if exec_mode == "psl":
+                saved_lot_configured = False
+                saved_symbol_configured = False
+        except Exception:
+            saved_lot_configured = getattr(self, "_saved_lot_configured", False)
+            saved_symbol_configured = getattr(self, "_saved_symbol_configured", False)
+            saved_psl_configured = getattr(self, "_saved_psl_configured", False)
+
+        # Enforce GLS as not configured when PSL is the active execution mode
+        try:
+            if exec_mode == "psl":
+                saved_lot_configured = False
+                saved_symbol_configured = False
+        except Exception:
+            pass
+
+        self._saved_lot_configured = saved_lot_configured
+        self._saved_symbol_configured = saved_symbol_configured
+        self._saved_psl_configured = saved_psl_configured
+
+        # UI status must reflect ONLY backend-saved state; if current UI matches saved,
+        # allow configured to remain true.
+        lot_matches = self._current_lot_matches_saved()
+        sym_matches = self._current_symbols_match_saved()
+        psl_matches = self._current_psl_matches_saved()
+
+        effective_lot_cfg = bool(saved_lot_configured) and lot_matches
+        effective_sym_cfg = bool(saved_symbol_configured) and sym_matches
+        effective_psl_cfg = bool(saved_psl_configured) and psl_matches
+
+        # Keep dirty flags aligned with whether UI matches backend.
+        try:
+            self._lot_user_dirty = not lot_matches
+            self._symbol_user_dirty = not sym_matches
+            self._psl_user_dirty = not psl_matches
+        except Exception:
+            pass
+
+        try:
+            self.lot_configured = bool(effective_lot_cfg)
+            self.symbol_configured = bool(effective_sym_cfg)
+            self.psl_configured = bool(effective_psl_cfg)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "lot_status_label"):
+                self.lot_status_label.setText(
+                    "✅ Lot configured" if effective_lot_cfg else "⚠️ Lot not configured yet"
+                )
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "symbol_status_label"):
+                self.symbol_status_label.setText(
+                    "✅ Symbols configured" if effective_sym_cfg else "⚠️ Symbols not configured yet"
+                )
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "psl_status_label"):
+                if effective_psl_cfg:
+                    n = 0
+                    try:
+                        n = len((getattr(self, "_saved_per_symbol_lots", None) or {}).keys())
+                    except Exception:
+                        n = 0
+                    self.psl_status_label.setText(f"✅ PSL configured ({n} symbols)")
+                else:
+                    self.psl_status_label.setText("⚠️ PSL not configured yet")
+        except Exception:
+            pass
+        try:
+            is_edge = (getattr(self, "entry_mode", None) or "market_edge") == "market_edge"
+            if hasattr(self, "entry_market_edge_radio") and hasattr(self, "entry_range_distributed_radio"):
+                self.entry_market_edge_radio.blockSignals(True)
+                self.entry_range_distributed_radio.blockSignals(True)
+                self.entry_market_edge_radio.setChecked(bool(is_edge))
+                self.entry_range_distributed_radio.setChecked(bool(not is_edge))
+                self.entry_market_edge_radio.blockSignals(False)
+                self.entry_range_distributed_radio.blockSignals(False)
+        except Exception:
+            pass
+
+    def _render_config_status_labels(self) -> None:
+        """Render configured/loading labels using cached flags and hydration pending state."""
+        try:
+            ctx = self._context_key()
+        except Exception:
+            ctx = None
+
+        # Safety: ensure we never remain stuck in loading forever.
+        try:
+            self._recover_stuck_settings_hydration(ctx)
+        except Exception:
+            pass
+
+        # UI-only loading placeholder when EA is not connected or backend is still hydrating.
+        show_loading = False
+        blocked = False
+        try:
+            platform = (getattr(self, "platform", None) or "mt5").lower()
+            try:
+                self._recover_stuck_backend_poll(platform)
+            except Exception:
+                pass
+            unlocked = self._is_settings_unlocked(platform)
+            blocked = not bool(unlocked)
+            pending = bool(getattr(self, "_settings_hydration_pending", {}).get(ctx, False)) if ctx else False
+            inflight = bool(getattr(self, "_backend_poll_inflight_by_platform", {}).get(platform, False))
+            hydrated_at = None
+            try:
+                hydrated_at = getattr(self, "_context_hydrated_at", {}).get(ctx) if ctx else None
+            except Exception:
+                hydrated_at = None
+            # Loading when EA not connected, or when hydration/polling is ongoing and
+            # we do not yet have a stable hydration timestamp.
+            # IMPORTANT: do NOT show "Loading" just because EA is locked; that can
+            # last indefinitely and looks like a hang.
+            show_loading = bool(pending) or (bool(inflight) and not hydrated_at)
+        except Exception:
+            show_loading = False
+            blocked = False
+
+        lot_cfg = bool(getattr(self, "_saved_lot_configured", False))
+        sym_cfg = bool(getattr(self, "_saved_symbol_configured", False))
+        psl_cfg = bool(getattr(self, "_saved_psl_configured", False))
+
+        # UI status must reflect ONLY backend-saved state; if current UI matches saved,
+        # allow configured to remain true.
+        lot_matches = self._current_lot_matches_saved()
+        sym_matches = self._current_symbols_match_saved()
+        psl_matches = self._current_psl_matches_saved()
+        lot_cfg = bool(lot_cfg) and lot_matches
+        sym_cfg = bool(sym_cfg) and sym_matches
+        psl_cfg = bool(psl_cfg) and psl_matches
+        try:
+            self._lot_user_dirty = not lot_matches
+            self._symbol_user_dirty = not sym_matches
+            self._psl_user_dirty = not psl_matches
+        except Exception:
+            pass
+
+        exec_mode = None
+        try:
+            exec_mode = (getattr(self, "user_execution_mode", None) or "").strip().lower()
+        except Exception:
+            exec_mode = None
+        if exec_mode == "psl":
+            lot_cfg = False
+            sym_cfg = False
+
+        # Enforce GLS as not configured when PSL is the active execution mode
+        try:
+            if exec_mode == "psl":
+                lot_cfg = False
+                sym_cfg = False
+        except Exception:
+            pass
+
+        try:
+            self.lot_configured = bool(lot_cfg)
+            self.symbol_configured = bool(sym_cfg)
+            self.psl_configured = bool(psl_cfg)
+        except Exception:
+            pass
+
+        if show_loading:
+            try:
+                if hasattr(self, "lot_status_label"):
+                    self.lot_status_label.setText("⏳ Loading settings…")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "symbol_status_label"):
+                    self.symbol_status_label.setText("⏳ Loading settings…")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "psl_status_label"):
+                    self.psl_status_label.setText("⏳ Loading settings…")
+            except Exception:
+                pass
+        elif blocked:
+            try:
+                if hasattr(self, "lot_status_label"):
+                    self.lot_status_label.setText("🔒 Login EA to unlock")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "symbol_status_label"):
+                    self.symbol_status_label.setText("🔒 Login EA to unlock")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "psl_status_label"):
+                    self.psl_status_label.setText("🔒 Login EA to unlock")
+            except Exception:
+                pass
+        else:
+            try:
+                if hasattr(self, "lot_status_label"):
+                    self.lot_status_label.setText("✅ Lot configured" if lot_cfg else "⚠️ Lot not configured yet")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "symbol_status_label"):
+                    self.symbol_status_label.setText("✅ Symbols configured" if sym_cfg else "⚠️ Symbols not configured yet")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "psl_status_label"):
+                    if psl_cfg:
+                        n = 0
+                        try:
+                            n = len((getattr(self, "_saved_per_symbol_lots", None) or {}).keys())
+                        except Exception:
+                            n = 0
+                        self.psl_status_label.setText(f"✅ PSL configured ({n} symbols)")
+                    else:
+                        self.psl_status_label.setText("⚠️ PSL not configured yet")
+            except Exception:
+                pass
+
+        # Maintain entry mode radio alignment
+        try:
+            is_edge = (getattr(self, "entry_mode", None) or "market_edge") == "market_edge"
+            if hasattr(self, "entry_market_edge_radio") and hasattr(self, "entry_range_distributed_radio"):
+                self.entry_market_edge_radio.blockSignals(True)
+                self.entry_range_distributed_radio.blockSignals(True)
+                self.entry_market_edge_radio.setChecked(bool(is_edge))
+                self.entry_range_distributed_radio.setChecked(bool(not is_edge))
+                self.entry_market_edge_radio.blockSignals(False)
+                self.entry_range_distributed_radio.blockSignals(False)
+        except Exception:
+            pass
+
+    def _recover_stuck_backend_poll(self, platform: str) -> None:
+        """Reset stuck per-platform backend poll inflight flags.
+
+        A seq mismatch can legitimately happen during resets/switches; we only
+        reset if the inflight poll is still the currently expected seq and has
+        exceeded BACKEND_POLL_STUCK_SEC.
+        """
+        try:
+            platform = (platform or "mt5").lower()
+        except Exception:
+            platform = "mt5"
+        if platform not in {"mt4", "mt5"}:
+            platform = "mt5"
+
+        try:
+            inflight = bool(getattr(self, "_backend_poll_inflight_by_platform", {}).get(platform, False))
+        except Exception:
+            inflight = False
+        if not inflight:
+            return
+
+        try:
+            started_seq, started_at = getattr(self, "_backend_poll_started_meta_by_platform", {}).get(platform, (0, 0.0))
+            expected = int(getattr(self, "_backend_poll_expected_seq_by_platform", {}).get(platform, 0))
+        except Exception:
+            return
+
+        # If we have an inflight flag but no start metadata, seed it so we can recover.
+        if float(started_at or 0.0) <= 0:
+            try:
+                self._backend_poll_started_meta_by_platform[platform] = (int(expected or 0), float(time.time()))
+            except Exception:
+                pass
+            return
+
+        # Only recover if the inflight poll corresponds to the latest expected seq.
+        if int(started_seq or 0) != int(expected or 0):
+            return
+
+        if float(started_at or 0.0) <= 0:
+            return
+
+        age = time.time() - float(started_at)
+        if age <= float(BACKEND_POLL_STUCK_SEC or 25.0):
+            return
+
+        try:
+            self._dev_log("backend_poll_stuck_reset", f"{platform} seq={started_seq} age={age:.1f}s")
+        except Exception:
+            pass
+
+        try:
+            self._backend_poll_inflight_by_platform[platform] = False
+        except Exception:
+            pass
+        try:
+            self._backend_poll_expected_seq_by_platform[platform] = -1
+        except Exception:
+            pass
+        try:
+            self._backend_poll_started_meta_by_platform[platform] = (0, 0.0)
+        except Exception:
+            pass
+
+        # If a pending request was queued while stuck, run it once.
+        pending = None
+        try:
+            pending = getattr(self, "_backend_poll_pending_auth_by_platform", {}).get(platform)
+        except Exception:
+            pending = None
+        if pending:
+            try:
+                self._backend_poll_pending_auth_by_platform[platform] = None
+            except Exception:
+                pass
+            try:
+                self._schedule_backend_poll(pending)
+            except Exception:
+                pass
+
+    def _recover_stuck_settings_hydration(self, ctx: Optional[str]) -> None:
+        """Clear a hydration pending flag if it has been pending too long."""
+        if not ctx:
+            return
+        try:
+            pending = bool(getattr(self, "_settings_hydration_pending", {}).get(ctx, False))
+        except Exception:
+            pending = False
+        if not pending:
+            return
+        try:
+            started_at = float(getattr(self, "_settings_hydration_started_at", {}).get(ctx, 0.0) or 0.0)
+        except Exception:
+            started_at = 0.0
+        if started_at <= 0:
+            # Pending set without timestamp (e.g., logout flow). Seed timestamp so
+            # watchdog can clear it.
+            try:
+                self._settings_hydration_started_at[ctx] = float(time.time())
+            except Exception:
+                pass
+            return
+        age = time.time() - started_at
+        if age <= float(HYDRATION_PENDING_STUCK_SEC or 40.0):
+            return
+
+        try:
+            self._dev_log("hydration_pending_timeout", f"ctx={ctx} age={age:.1f}s")
+        except Exception:
+            pass
+
+        try:
+            self._settings_hydration_pending[ctx] = False
+        except Exception:
+            pass
+        try:
+            self._settings_hydration_started_at.pop(ctx, None)
+        except Exception:
+            pass
+
+    def _update_edit_button_state(self) -> None:
+        """Update Edit/Save button state based on active mode (GLS or PSL) and EA registration.
+        
+        CRITICAL RULES:
+        - Edit button DISABLED if EA not registered/active
+        - Edit button enabled only when EA is active
+        - Shows Edit/Cancel based on current edit mode
+        - Force-exit edit mode if EA becomes inactive
+        """
+        # RULE 2: single source of truth (EA active + FlameBot ID + account match)
+        platform = (getattr(self, "platform", None) or "mt5").lower()
+        ea_registered_and_active = self._is_settings_unlocked(platform)
+        
+        # CRITICAL: If EA not active, FORCE button to Edit and disable it
+        if not ea_registered_and_active:
+            # Force-exit any edit mode
+            self.gls_edit_mode = False
+            self.psl_edit_mode = False
+            # Force button to "Edit", disable it, and make it visually unclickable
+            self.edit_settings_btn.setText("Edit")
+            self.edit_settings_btn.setEnabled(False)
+            self.edit_settings_btn.setStyleSheet("opacity: 0.5;")  # Visually grayed out
+            return
+        
+        # EA is active - show proper state based on edit mode
+        mode = self._active_settings_mode()
+        if mode == "gls":
+            # GLS mode - reflect GLS edit state
+            if self.gls_edit_mode:
+                self.edit_settings_btn.setText("Cancel")
+                self.edit_settings_btn.setEnabled(True)  # Always allow cancel
+                self.edit_settings_btn.setStyleSheet("")  # Clear any grayed out style
+            else:
+                self.edit_settings_btn.setText("Edit")
+                self.edit_settings_btn.setEnabled(True)
+                self.edit_settings_btn.setStyleSheet("")  # Clear any grayed out style
+        elif mode == "psl":
+            # PSL mode - reflect PSL edit state
+            if self.psl_edit_mode:
+                self.edit_settings_btn.setText("Cancel")
+                self.edit_settings_btn.setEnabled(True)  # Always allow cancel
+                self.edit_settings_btn.setStyleSheet("")  # Clear any grayed out style
+            else:
+                self.edit_settings_btn.setText("Edit")
+                self.edit_settings_btn.setEnabled(True)
+                self.edit_settings_btn.setStyleSheet("")  # Clear any grayed out style
+
+    def _refresh_psl_list(self) -> None:
+        """Build PSL symbol-lot table using backend symbols and PSL lots only."""
+
+        # During app shutdown, Qt can still deliver queued events/timer ticks.
+        # Never rebuild dynamic widget trees while tearing down.
+        try:
+            if bool(getattr(self, "_closing", False)):
+                return
+        except Exception:
+            return
+        try:
+            if QtCore.QCoreApplication.closingDown():
+                return
+        except Exception:
+            pass
+
+        # Clear existing widgets and checkboxes
+        if hasattr(self, '_psl_checkboxes'):
+            for cb in self._psl_checkboxes.values():
+                cb.setParent(None)
+        for widget in list(self._psl_lot_inputs.values()):
+            widget.setParent(None)
+        
+        self._psl_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
+        self._psl_lot_inputs.clear()
+        
+        while self.psl_layout.count():
+            item = self.psl_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+        
+        # Determine editability (PSL widgets are dynamic, so compute upfront)
+        in_edit_mode = getattr(self, "psl_edit_mode", False)
+        platform = (getattr(self, "platform", None) or "mt5").lower()
+        unlocked = self._is_settings_unlocked(platform)
+        psl_can_edit = bool(in_edit_mode and unlocked)
+
+        # Resolve configured lots from saved snapshot first, then live state.
+        try:
+            configured_lots = dict(getattr(self, "_saved_per_symbol_lots", {}) or {})
+        except Exception:
+            configured_lots = {}
+        if not configured_lots:
+            try:
+                configured_lots = dict(self.per_symbol_lots or {})
+            except Exception:
+                configured_lots = {}
+        psl_configured = bool(getattr(self, "_saved_psl_configured", False) or configured_lots)
+        if bool(getattr(self, "_psl_user_dirty", False)):
+            psl_configured = False
+
+        try:
+            all_symbols = list(self.available_symbols or [])
+        except Exception:
+            all_symbols = []
+
+        # BASE LIST: PSL uses backend-provided symbols only (never GLS selections).
+        if all_symbols:
+            base_list = sorted(all_symbols)
+        elif configured_lots:
+            # Fallback to configured PSL lots if broker list unavailable
+            try:
+                base_list = sorted(list(configured_lots.keys()))
+            except Exception:
+                base_list = list(configured_lots.keys())
+        else:
+            base_list = []
+        if not base_list:
+            placeholder = QtWidgets.QLabel("No symbols available yet")
+            placeholder.setObjectName("muted")
+            self.psl_layout.addWidget(placeholder)
+            self.psl_layout.addStretch()
+            return
+
+        # Status label reflects configuration only (never hides symbols)
+        try:
+            self.psl_status_label.setText(
+                "✅ PSL configured" if psl_configured else "⚠️ PSL not configured yet"
+            )
+        except Exception:
+            pass
+        
+        # Apply search filter (identical to GLS behavior)
+        query = self.psl_search.text().strip().lower()
+        filtered_base = [s for s in base_list if not query or query in s.lower()]
+
+        # Visibility rules:
+        # - Not configured & not editing: show all allowed symbols, unchecked, lot=0.0, disabled
+        # - Editing: show all allowed symbols, editable, pre-check configured ones
+        # - Configured & not editing: show ONLY saved PSL symbols with their lots, view-only
+        if in_edit_mode:
+            symbols_to_show = filtered_base
+        elif psl_configured:
+            symbols_to_show = [s for s in filtered_base if s in configured_lots]
+        else:
+            symbols_to_show = filtered_base
+
+        if not symbols_to_show:
+            placeholder = QtWidgets.QLabel("No symbols found.")
+            placeholder.setObjectName("muted")
+            self.psl_layout.addWidget(placeholder)
+            self.psl_layout.addStretch()
+            return
+        
+        # Multi-column grid layout: 3 symbols per row
+        SYMBOLS_PER_ROW = 3
+        grid_widget = QtWidgets.QWidget()
+        grid_layout = QtWidgets.QGridLayout(grid_widget)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setHorizontalSpacing(16)
+        grid_layout.setVerticalSpacing(8)
+        
+        for idx, symbol in enumerate(symbols_to_show):
+            row_idx = idx // SYMBOLS_PER_ROW
+            col_idx = idx % SYMBOLS_PER_ROW
+            
+            # Container for this symbol's widgets
+            item_widget = QtWidgets.QWidget()
+            item_layout = QtWidgets.QHBoxLayout(item_widget)
+            item_layout.setContentsMargins(0, 0, 0, 0)
+            item_layout.setSpacing(6)
+            
+            checkbox = QtWidgets.QCheckBox()
+            if in_edit_mode:
+                is_selected = bool(symbol in configured_lots)
+                checkbox.setChecked(is_selected)
+                checkbox.setEnabled(psl_can_edit)
+            elif psl_configured:
+                # View saved set only; keep view-only
+                is_selected = bool(symbol in configured_lots)
+                checkbox.setChecked(is_selected)
+                checkbox.setEnabled(False)
+            else:
+                # Not configured: show all allowed, disabled/unchecked
+                is_selected = False
+                checkbox.setChecked(False)
+                checkbox.setEnabled(False)
+            item_layout.addWidget(checkbox)
+
+            symbol_label = QtWidgets.QLabel(symbol)
+            symbol_label.setMinimumWidth(70)
+            item_layout.addWidget(symbol_label)
+
+            if psl_configured or in_edit_mode:
+                lot_value = configured_lots.get(symbol, None)
+            else:
+                lot_value = None
+
+            # In edit mode, only prefill saved values; otherwise start empty
+            if in_edit_mode:
+                if lot_value is None:
+                    lot_text = ""
+                else:
+                    try:
+                        lot_text = f"{float(lot_value):.2f}"
+                    except Exception:
+                        lot_text = ""
+            else:
+                # View mode: show saved value if configured, else empty
+                if lot_value is None:
+                    lot_text = ""
+                else:
+                    try:
+                        lot_text = f"{float(lot_value):.2f}"
+                    except Exception:
+                        lot_text = ""
+
+            lot_input = QtWidgets.QLineEdit(lot_text)
+            lot_input.setPlaceholderText("0.01")
+            lot_input.setValidator(QtGui.QDoubleValidator(0.01, 1000.0, 2))
+            lot_input.setMaximumWidth(70)
+            lot_input.setMinimumWidth(60)
+            if in_edit_mode:
+                lot_input.setReadOnly(not psl_can_edit)
+                # Lot input must be disabled until symbol is checked
+                lot_input.setEnabled(psl_can_edit and checkbox.isChecked())
+            elif psl_configured:
+                lot_input.setReadOnly(True)
+                lot_input.setEnabled(True)
+            else:
+                lot_input.setReadOnly(True)
+                lot_input.setEnabled(False)
+            item_layout.addWidget(lot_input)
+
+            if psl_can_edit:
+                def make_handler(inp):
+                    def handler(checked):
+                        inp.setEnabled(psl_can_edit and checked)
+                        if not checked:
+                            inp.clear()
+                        self._mark_psl_dirty()
+                    return handler
+                checkbox.toggled.connect(make_handler(lot_input))
+
+                try:
+                    lot_input.textChanged.connect(lambda _=None: self._mark_psl_dirty())
+                except Exception:
+                    pass
+
+            self._psl_checkboxes[symbol] = checkbox
+            self._psl_lot_inputs[symbol] = lot_input
+            
+            item_layout.addStretch()
+            grid_layout.addWidget(item_widget, row_idx, col_idx)
+        
+        self.psl_layout.addWidget(grid_widget)
+        self.psl_layout.addStretch()
+
+        # Apply lock state after building dynamic widgets so they can't bypass
+        # disabled state due to call ordering.
+        try:
+            self._update_settings_lock_state()
+        except Exception:
+            pass
+
+    def _enter_psl_edit_mode(self) -> None:
+        """Enter PSL edit mode only (does not affect GLS)."""
+        platform = (getattr(self, "platform", None) or "mt5").lower()
+        selected_account = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop")
+        ctx_state = self._get_ea_context_state(platform, selected_account)
+        ea_active = bool(ctx_state.get("ea_active", False))
+        active_account = self._get_platform_active_account(platform)
+
+        if not ea_active:
+            self._show_toast(f"❌ Please login your EA first. Go to Expert → {self.platform.upper()} and connect your EA.")
+            return
+        if not getattr(self, "flamebot_id", None):
+            self._show_toast("❌ FlameBot ID missing. Please register/login first.")
+            return
+        if active_account and selected_account and active_account != selected_account:
+            self._show_toast(
+                f"⚠️ EA is active on {active_account.upper()} ({self.platform.upper()}). "
+                f"Switch to {active_account.upper()} or connect {selected_account.upper()} on the EA."
+            )
+            return
+        # Snapshot current Trade Control + Entry Strategy state before PSL edit
+        # so Cancel can restore it (PSL has its own independent values).
+        try:
+            self._saved_trade_control_by_mode["psl"] = {
+                "allow_message_close": self.allow_message_close,
+                "allow_message_breakeven": self.allow_message_breakeven,
+                "allow_secure_half": self.allow_secure_half,
+                "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+                "entry_mode": self.entry_mode,
+            }
+        except Exception:
+            pass
+
+        # Snapshot Scheduler (mode-independent) so Cancel can revert.
+        try:
+            self._saved_scheduler_active = bool(getattr(self, "scheduler_active", False))
+            self._saved_scheduler_pause_day = getattr(self, "scheduler_pause_day", None)
+            self._saved_scheduler_pause_time = getattr(self, "scheduler_pause_time", None)
+            self._saved_scheduler_resume_day = getattr(self, "scheduler_resume_day", None)
+            self._saved_scheduler_resume_time = getattr(self, "scheduler_resume_time", None)
+        except Exception:
+            pass
+
+        # Do not mark lot dirty just for entering PSL edit mode.
+        try:
+            self._trade_control_user_dirty = True
+        except Exception:
+            pass
+        # Hard block backend UI hydration/polling while editing to avoid racey overwrites
+        try:
+            self._suppress_backend_ui_hydration_until = time.time() + 15.0
+            if hasattr(self, "backend_timer") and self.backend_timer.isActive():
+                self.backend_timer.stop()
+        except Exception:
+            pass
+        # Prevent cross-mode edit bleed (GLS/Telegram controls must not become editable under PSL edit).
+        try:
+            self.gls_edit_mode = False
+            self._desired_edit_mode = False
+        except Exception:
+            pass
+
+        self.psl_edit_mode = True
+        # Clear search (same as GLS)
+        self.psl_search.clear()
+        # Refresh PSL list first (it builds dynamic widgets), then apply lock state
+        self._refresh_psl_list()
+        self._update_settings_lock_state()
+        self._update_edit_button_state()
+
+    def _exit_psl_edit_mode(self, revert: bool) -> None:
+        """Exit PSL edit mode (does not affect GLS)."""
+        if revert:
+            # Restore last saved snapshot
+            self.per_symbol_lots = dict(self._saved_per_symbol_lots)
+            self._psl_user_dirty = False
+            # Restore Telegram Trade Control + Entry Strategy snapshots
+            try:
+                psl_saved = self._saved_trade_control_by_mode.get("psl", {}) if hasattr(self, "_saved_trade_control_by_mode") else {}
+                if psl_saved:
+                    self.allow_message_close = bool(psl_saved.get("allow_message_close", False))
+                    self.allow_message_breakeven = bool(psl_saved.get("allow_message_breakeven", False))
+                    self.allow_secure_half = bool(psl_saved.get("allow_secure_half", False))
+                    self.allow_multiple_signals_per_symbol = bool(psl_saved.get("allow_multiple_signals_per_symbol", False))
+                    self.entry_mode = psl_saved.get("entry_mode")
+            except Exception:
+                pass
+
+            # Restore Scheduler snapshot
+            try:
+                self.scheduler_active = bool(getattr(self, "_saved_scheduler_active", False))
+                self.scheduler_pause_day = getattr(self, "_saved_scheduler_pause_day", None)
+                self.scheduler_pause_time = getattr(self, "_saved_scheduler_pause_time", None)
+                self.scheduler_resume_day = getattr(self, "_saved_scheduler_resume_day", None)
+                self.scheduler_resume_time = getattr(self, "_saved_scheduler_resume_time", None)
+                self._apply_scheduler_state_to_ui()
+            except Exception:
+                pass
+            try:
+                self._apply_trade_control_state_to_ui()
+            except Exception:
+                pass
+        self.psl_edit_mode = False
+        # Editing finished; allow backend polling to update entry_mode again.
+        try:
+            self._lot_user_dirty = False
+            self._trade_control_user_dirty = False
+        except Exception:
+            pass
+        # Resume polling/hydration now that edit mode is ending
+        try:
+            self._suppress_backend_ui_hydration_until = 0
+            if hasattr(self, "backend_timer") and not self.backend_timer.isActive():
+                if self._can_poll_backend():
+                    self.backend_timer.start()
+        except Exception:
+            pass
+        # Update button state and controls
+        self._update_edit_button_state()
+        self._update_settings_lock_state()
+        # Refresh PSL list to show saved state
+        self._refresh_psl_list()
+
+    def _save_psl_settings(self) -> None:
+        """Save PSL settings to backend (STRICT MODE).
+        
+        RULE: Include symbol ONLY IF:
+        - Checkbox is checked
+        - AND lot input has valid value > 0
+        
+        Checked + empty lot = IGNORED (not saved)
+        """
+        if not self.ea_active:
+            self._show_toast(f"❌ Please login your EA first. Go to Expert → {self.platform.upper()} and connect your EA.")
+            return
+        
+        auth_params = self._backend_auth_params()
+        if not auth_params:
+            self._show_toast("❌ FlameBot ID and License Key are required.")
+            return
+        
+        # Keep PSL edit mode enabled until backend confirms save.
+        # If we exit edit mode early and a transient network error occurs,
+        # backend polling can overwrite the user's unsaved changes.
+        
+        # Collect ONLY symbols that are BOTH checked AND have valid lot
+        per_symbol_lots = {}
+        ignored_symbols = []  # Track checked but invalid
+        
+        for symbol, input_widget in self._psl_lot_inputs.items():
+            checkbox = self._psl_checkboxes.get(symbol)
+            if not checkbox or not checkbox.isChecked():
+                continue  # Skip unchecked symbols
+            
+            lot_text = input_widget.text().strip()
+            if not lot_text:
+                # Checked but no lot = ignore completely
+                ignored_symbols.append(symbol)
+                continue
+            
+            try:
+                lot_value = float(lot_text)
+                if lot_value > 0:
+                    per_symbol_lots[symbol] = lot_value
+                else:
+                    ignored_symbols.append(symbol)
+            except ValueError:
+                ignored_symbols.append(symbol)
+        
+        # Show warning if symbols were ignored
+        if ignored_symbols:
+            self._log(f"⚠️ [PSL] Ignored {len(ignored_symbols)} symbols (checked but no valid lot): {', '.join(ignored_symbols[:5])}")
+        
+        # Allow saving empty PSL (disables PSL mode)
+        if not per_symbol_lots:
+            self._log("⚠️ [PSL] No valid symbol+lot pairs — PSL will be disabled")
+        
+        # Send to backend
+        psl_payload = {
+            **auth_params,
+            "per_symbol_lots": per_symbol_lots,
+        }
+        # DEBUG: Log outgoing payload
+        self._log(f"[PSL DEBUG] Sending to /app/settings/psl:")
+        self._log(f"[PSL DEBUG] Payload keys: {list(psl_payload.keys())}")
+        self._log(f"[PSL DEBUG] per_symbol_lots: {per_symbol_lots}")
+        self._log(f"[PSL DEBUG] per_symbol_lots type: {type(per_symbol_lots)}")
+        if per_symbol_lots:
+            for sym, lot in per_symbol_lots.items():
+                self._log(f"[PSL DEBUG]   {sym}: {lot} (type: {type(lot).__name__})")
+        else:
+            self._log(f"[PSL DEBUG] per_symbol_lots is EMPTY")
+        
+        # Save Trade Control toggles alongside PSL
+        self.allow_message_close = self.allow_close_checkbox.isChecked()
+        self.allow_message_breakeven = self.allow_breakeven_checkbox.isChecked()
+        self.allow_secure_half = self.allow_secure_half_checkbox.isChecked()
+        self.allow_multiple_signals_per_symbol = self.allow_multiple_checkbox.isChecked() if hasattr(self, "allow_multiple_checkbox") else self.allow_multiple_signals_per_symbol
+
+        # Scheduler: read from UI and validate (no partial config allowed when active)
+        try:
+            self._sync_scheduler_state_from_ui()
+        except Exception:
+            pass
+        if bool(getattr(self, "scheduler_active", False)):
+            try:
+                scheduler_invalid = (
+                    getattr(self, "scheduler_pause_day", None) is None
+                    or not self._is_valid_hhmm(getattr(self, "scheduler_pause_time", None))
+                    or getattr(self, "scheduler_resume_day", None) is None
+                    or not self._is_valid_hhmm(getattr(self, "scheduler_resume_time", None))
+                )
+            except Exception:
+                scheduler_invalid = True
+            if scheduler_invalid:
+                self._error(self._scheduler_validation_message())
+                return
+
+        # Store into PSL mode cache (GLS/PSL must not share)
+        try:
+            self._trade_control_by_mode["psl"] = {
+                "allow_message_close": self.allow_message_close,
+                "allow_message_breakeven": self.allow_message_breakeven,
+                "allow_secure_half": self.allow_secure_half,
+                "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+                "entry_mode": self.entry_mode,
+            }
+        except Exception:
+            pass
+        toggle_payload = {
+            **auth_params,
+            "allow_message_close": self.allow_message_close,
+            "allow_message_breakeven": self.allow_message_breakeven,
+            "allow_secure_half": self.allow_secure_half,
+            "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+            "scheduler_active": bool(getattr(self, "scheduler_active", False)),
+            "scheduler_pause_day": getattr(self, "scheduler_pause_day", None),
+            "scheduler_pause_time": self._hhmm_payload_value(getattr(self, "scheduler_pause_time", None)),
+            "scheduler_resume_day": getattr(self, "scheduler_resume_day", None),
+            "scheduler_resume_time": self._hhmm_payload_value(getattr(self, "scheduler_resume_time", None)),
+        }
+
+        try:
+            self.save_settings_btn.setEnabled(False)
+        except Exception:
+            pass
+        self._show_toast("Saving PSL...")
+
+        self._backend_poll_seq += 1
+        seq = self._backend_poll_seq
+        task = _BackendMultiPostTask(
+            seq,
+            self.backend_url,
+            posts=[
+                ("app/settings/psl", psl_payload),
+                ("app/settings/trade_control", toggle_payload),
+            ],
+            timeout=DEFAULT_HTTP_TIMEOUT,
+        )
+        task.signals.finished.connect(
+            lambda s, results: self._on_psl_save_finished(s, results, per_symbol_lots, ignored_symbols, psl_payload, toggle_payload)
+        )
+        task.signals.error.connect(lambda s, msg: self._on_psl_save_error(s, msg, psl_payload, toggle_payload))
+        self._backend_pool.start(task)
+
+    def _on_psl_save_error(self, seq: int, message: str, psl_payload: Optional[dict] = None, toggle_payload: Optional[dict] = None) -> None:
+        try:
+            self.save_settings_btn.setEnabled(True)
+        except Exception:
+            pass
+        if isinstance(psl_payload, dict) and isinstance(toggle_payload, dict):
+            try:
+                self._enqueue_settings_outbox(
+                    mode="psl",
+                    posts=[
+                        ("app/settings/psl", psl_payload),
+                        ("app/settings/trade_control", toggle_payload),
+                    ],
+                    toast=True,
+                )
+                try:
+                    self._suppress_backend_ui_hydration_until = time.time() + 20.0
+                except Exception:
+                    pass
+                return
+            except Exception:
+                pass
+        self._error(f"PSL save failed: {message}")
+
+    def _on_psl_save_finished(
+        self,
+        seq: int,
+        results: dict,
+        per_symbol_lots_sent: dict,
+        ignored_symbols: List[str],
+        psl_payload: dict,
+        toggle_payload: dict,
+    ) -> None:
+        try:
+            self.save_settings_btn.setEnabled(True)
+        except Exception:
+            pass
+
+        psl_response = results.get("app/settings/psl")
+        self._log(f"[PSL DEBUG] Server response: {psl_response}")
+        if not psl_response or psl_response.get("status") != "OK":
+            try:
+                st = str((psl_response or {}).get("status") or "").upper()
+            except Exception:
+                st = ""
+            if st == "NET_ERROR":
+                # Offline-first: keep user changes and sync when online returns.
+                try:
+                    self._enqueue_settings_outbox(
+                        mode="psl",
+                        posts=[
+                            ("app/settings/psl", dict(psl_payload or {})),
+                            ("app/settings/trade_control", dict(toggle_payload or {})),
+                        ],
+                        toast=True,
+                    )
+                except Exception:
+                    # Fallback toast if enqueue fails.
+                    self._show_toast("⚠️ Can't reach server right now. Your changes are kept.", duration_ms=8000)
+                try:
+                    self._suppress_backend_ui_hydration_until = time.time() + 20.0
+                except Exception:
+                    pass
+                try:
+                    self.psl_edit_mode = True
+                except Exception:
+                    pass
+                try:
+                    self._update_settings_lock_state()
+                    self._update_edit_button_state()
+                except Exception:
+                    pass
+                return
+            self._error(psl_response.get("message", "PSL save failed.") if psl_response else "PSL save failed.")
+            return
+
+        # Save confirmed: now exit PSL edit mode.
+        try:
+            self.psl_edit_mode = False
+            self.edit_settings_btn.setText("Edit")
+        except Exception:
+            pass
+
+        self.per_symbol_lots = psl_response.get("per_symbol_lots", per_symbol_lots_sent)
+        self.psl_configured = self._as_bool(psl_response.get("psl_configured", False))
+        self._saved_per_symbol_lots = dict(self.per_symbol_lots)
+        self._saved_psl_configured = self.psl_configured
+
+        # Backend save confirmed; clear local PSL dirty flag.
+        self._psl_user_dirty = False
+
+        # Backend now has a saved PSL record for this context.
+        try:
+            ctx = self._context_key()
+            self._backend_presence_by_context.get("psl", {})[ctx] = True
+        except Exception:
+            pass
+
+        if self.psl_configured:
+            self.psl_status_label.setText(f"✅ PSL configured ({len(self.per_symbol_lots)} symbols)")
+        else:
+            self.psl_status_label.setText("⚠️ PSL not configured (no symbols)")
+
+        toggle_response = results.get("app/settings/trade_control")
+        if not toggle_response or toggle_response.get("status") != "OK":
+            self._log(f"⚠️ [PSL] Trade control save warning: {toggle_response.get('message', 'Failed') if toggle_response else 'Failed'}")
+            try:
+                st = str((toggle_response or {}).get("status") or "").upper()
+            except Exception:
+                st = ""
+            if st == "NET_ERROR":
+                try:
+                    self._enqueue_settings_outbox(
+                        mode="psl",
+                        posts=[("app/settings/trade_control", dict(toggle_payload or {}))],
+                        toast=False,
+                    )
+                except Exception:
+                    pass
+        else:
+            # Update Trade Control snapshots after successful save
+            self._saved_allow_message_close = self.allow_message_close
+            self._saved_allow_message_breakeven = self.allow_message_breakeven
+            self._saved_allow_secure_half = self.allow_secure_half
+            self._saved_allow_multiple_signals = self.allow_multiple_signals_per_symbol
+            self._saved_scheduler_active = bool(getattr(self, "scheduler_active", False))
+            self._saved_scheduler_pause_day = getattr(self, "scheduler_pause_day", None)
+            self._saved_scheduler_pause_time = getattr(self, "scheduler_pause_time", None)
+            self._saved_scheduler_resume_day = getattr(self, "scheduler_resume_day", None)
+            self._saved_scheduler_resume_time = getattr(self, "scheduler_resume_time", None)
+            self._trade_control_user_dirty = False
+            try:
+                self._saved_trade_control_by_mode["psl"] = {
+                    "allow_message_close": self.allow_message_close,
+                    "allow_message_breakeven": self.allow_message_breakeven,
+                    "allow_secure_half": self.allow_secure_half,
+                    "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+                    "entry_mode": self.entry_mode,
+                }
+                if hasattr(self, "_trade_control_by_mode"):
+                    self._trade_control_by_mode["psl"] = {
+                        "allow_message_close": self.allow_message_close,
+                        "allow_message_breakeven": self.allow_message_breakeven,
+                        "allow_secure_half": self.allow_secure_half,
+                        "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+                        "entry_mode": self.entry_mode,
+                    }
+            except Exception:
+                pass
+            self._log(f"✅ [PSL] Telegram trade control settings saved | close={self.allow_message_close} | breakeven={self.allow_message_breakeven} | secure_half={self.allow_secure_half} | multi_signals={self.allow_multiple_signals_per_symbol}")
+
+        self._save_settings()
+        self._update_settings_lock_state()
+        self._update_edit_button_state()
+        self._refresh_psl_list()
+        
+        # CRITICAL: Update configuration status after successful PSL save
+        self.user_execution_mode = "psl"  # PSL mode activated
+        # PSL requires custom symbol mode by definition
+        self.user_symbol_mode = "custom"
+        
+        # Check if configuration is now complete and start polling if needed
+        self._check_and_start_polling()
+
+        # Snapshot hydrated state for this platform so switches do not flicker
+        try:
+            self._mark_platform_hydrated(self.platform)
+            self._snapshot_platform_ui_state(self.platform)
+        except Exception:
+            pass
+
+        if per_symbol_lots_sent:
+            self._show_toast(f"✅ PSL saved: {len(per_symbol_lots_sent)} symbols configured")
+            self._log(f"[PSL STRICT] Saved {len(self.per_symbol_lots)} symbol lots | Ignored: {len(ignored_symbols)}")
+        else:
+            self._show_toast("✅ PSL disabled (no symbols configured)")
+            self._log("[PSL STRICT] PSL disabled — no valid symbol+lot pairs")
+
+        # Ensure trade control UI reflects PSL mode after save
+        try:
+            self._load_trade_control_state_for_mode(self._active_settings_mode(), use_saved=True)
+        except Exception:
+            pass
+
+    def _set_lot_mode(self, mode: str, checked: bool) -> None:
+        if not checked:
+            return
+        self.lot_mode = mode
+        if mode == "default":
+            self.custom_lot = None
+        # User explicitly changed selection — lock mode from background overwrites
+        self._lot_user_dirty = True
+        self._apply_lot_state_to_ui()
+        self._render_config_status_labels()
+
+    def _set_symbol_mode(self, mode: str, checked: bool) -> None:
+        if not checked:
+            return
+        self.symbol_mode = mode
+        # Do not clear `symbols_allowed` here — preserve saved snapshot
+        # when entering edit mode. Editing will restore the editable list.
+        # User explicitly changed selection — lock mode from background overwrites
+        self._symbol_user_dirty = True
+        self._apply_symbol_state_to_ui()
+        # Ensure visibility/enabled state updates (e.g., Refresh Symbols button)
+        try:
+            self._update_settings_lock_state()
+        except Exception:
+            pass
+        self._render_config_status_labels()
+        # CRITICAL: When switching to Custom mode, MUST refresh symbol list immediately
+        # even if dirty flag is set, otherwise the list stays empty
+        if mode == "custom":
+            self._refresh_symbol_list()
+
+    def _mark_lot_dirty(self) -> None:
+        if self.lot_mode == "custom":
+            # record user's unsaved edit and preserve the typed value
+            self._lot_user_dirty = True
+            self.custom_lot = self.lot_custom_input.text().strip()
+            # Configured status is derived ONLY from backend snapshot.
+            # Any local change => not configured.
+            self._render_config_status_labels()
+
+    def _mark_psl_dirty(self) -> None:
+        """Update PSL dirty state based on whether UI matches saved values."""
+        try:
+            self._psl_user_dirty = not self._current_psl_matches_saved()
+        except Exception:
+            self._psl_user_dirty = True
+        self._render_config_status_labels()
+
+    def _current_lot_matches_saved(self) -> bool:
+        try:
+            saved_mode = getattr(self, "_saved_lot_mode", None) or "default"
+            saved_custom = getattr(self, "_saved_custom_lot", None)
+            cur_mode = getattr(self, "lot_mode", None) or "default"
+            if saved_mode != cur_mode:
+                return False
+            if cur_mode == "default":
+                return True
+            cur_text = ""
+            try:
+                cur_text = self.lot_custom_input.text().strip()
+            except Exception:
+                pass
+            cur_val = None
+            if cur_text:
+                try:
+                    cur_val = float(cur_text)
+                except Exception:
+                    cur_val = None
+            if cur_val is None:
+                try:
+                    cur_val = float(getattr(self, "custom_lot", None))
+                except Exception:
+                    cur_val = None
+            try:
+                saved_val = float(saved_custom) if saved_custom is not None else None
+            except Exception:
+                saved_val = None
+            return cur_val == saved_val
+        except Exception:
+            return False
+
+    def _current_symbols_match_saved(self) -> bool:
+        try:
+            saved_mode = getattr(self, "_saved_symbol_mode", None) or "default"
+            cur_mode = getattr(self, "symbol_mode", None) or "default"
+            if saved_mode != cur_mode:
+                return False
+            if cur_mode == "default":
+                return True
+            saved = set(getattr(self, "_saved_symbols_allowed", []) or [])
+            current = set(getattr(self, "symbols_allowed", []) or [])
+            return saved == current
+        except Exception:
+            return False
+
+    def _current_psl_matches_saved(self) -> bool:
+        try:
+            saved = dict(getattr(self, "_saved_per_symbol_lots", {}) or {})
+
+            def _norm(d: dict) -> dict:
+                out = {}
+                for k, v in (d or {}).items():
+                    try:
+                        out[str(k)] = float(v)
+                    except Exception:
+                        continue
+                return out
+
+            saved_n = _norm(saved)
+
+            if getattr(self, "psl_edit_mode", False) and hasattr(self, "_psl_checkboxes"):
+                # Strict UI comparison: any checkbox/lot mismatch = not configured.
+                checkboxes = getattr(self, "_psl_checkboxes", {})
+                inputs = getattr(self, "_psl_lot_inputs", {})
+
+                # Saved symbols must exist in UI list.
+                for sym in saved_n.keys():
+                    if sym not in checkboxes:
+                        return False
+
+                for sym, cb in checkboxes.items():
+                    saved_has = sym in saved_n
+                    if cb.isChecked() != saved_has:
+                        return False
+                    if cb.isChecked():
+                        inp = inputs.get(sym)
+                        if not inp:
+                            return False
+                        text = inp.text().strip()
+                        if not text:
+                            return False
+                        try:
+                            val = float(text)
+                        except Exception:
+                            return False
+                        if float(saved_n.get(sym, -999999)) != float(val):
+                            return False
+                return True
+
+            cur_n = _norm(getattr(self, "per_symbol_lots", {}) or {})
+            return cur_n == saved_n
+        except Exception:
+            return False
+
+    def _mark_trade_control_dirty(self) -> None:
+        """Mark trade-control state dirty and cache per-mode values from UI."""
+        try:
+            # Keep live fields aligned with the currently visible widgets
+            if hasattr(self, "allow_close_checkbox"):
+                self.allow_message_close = bool(self.allow_close_checkbox.isChecked())
+            if hasattr(self, "allow_breakeven_checkbox"):
+                self.allow_message_breakeven = bool(self.allow_breakeven_checkbox.isChecked())
+            if hasattr(self, "allow_secure_half_checkbox"):
+                self.allow_secure_half = bool(self.allow_secure_half_checkbox.isChecked())
+            if hasattr(self, "allow_multiple_checkbox"):
+                self.allow_multiple_signals_per_symbol = bool(self.allow_multiple_checkbox.isChecked())
+            # Entry radios update entry_mode and share the same dirty flag
+            try:
+                self._on_entry_mode_changed()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        self._trade_control_user_dirty = True
+
+        # Persist the dirty state into the per-mode cache (GLS vs PSL)
+        try:
+            mode = self._active_settings_mode()
+        except Exception:
+            mode = "gls"
+        try:
+            if hasattr(self, "_trade_control_by_mode") and mode in self._trade_control_by_mode:
+                self._trade_control_by_mode[mode] = {
+                    "allow_message_close": bool(getattr(self, "allow_message_close", False)),
+                    "allow_message_breakeven": bool(getattr(self, "allow_message_breakeven", False)),
+                    "allow_secure_half": bool(getattr(self, "allow_secure_half", False)),
+                    "allow_multiple_signals_per_symbol": bool(getattr(self, "allow_multiple_signals_per_symbol", False)),
+                    "entry_mode": getattr(self, "entry_mode", None),
+                }
+        except Exception:
+            pass
+
+    def _apply_lot_state_to_ui(self) -> None:
+        is_custom = self.lot_mode == "custom"
+        self.lot_default.blockSignals(True)
+        self.lot_custom.blockSignals(True)
+        self.lot_default.setChecked(self.lot_mode == "default")
+        self.lot_custom.setChecked(is_custom)
+        self.lot_default.blockSignals(False)
+        self.lot_custom.blockSignals(False)
+        # Keep the saved backend value visible unless the user has an unsaved change
+        # that differs from the backend snapshot.
+        try:
+            lot_dirty = bool(getattr(self, "_lot_user_dirty", False))
+            lot_matches = self._current_lot_matches_saved()
+        except Exception:
+            lot_dirty = False
+            lot_matches = True
+
+        if (not lot_dirty) or lot_matches or not self.lot_custom_input.text().strip():
+            saved_value = getattr(self, "_saved_custom_lot", None)
+            if saved_value is None:
+                self.lot_custom_input.setText("")
+            else:
+                self.lot_custom_input.setText(str(saved_value))
+
+        # When PSL is the active execution mode, blank GLS inputs in view mode
+        try:
+            exec_mode = (getattr(self, "user_execution_mode", None) or "").strip().lower()
+        except Exception:
+            exec_mode = None
+        if exec_mode == "psl" and not getattr(self, "gls_edit_mode", False):
+            self.lot_custom_input.setText("")
+
+        can_edit = bool(getattr(self, "gls_edit_mode", False)) and self._is_settings_unlocked()
+        self.lot_custom_input.setEnabled(bool(is_custom and can_edit))
+        self.lot_custom_input.setReadOnly(not bool(is_custom and can_edit))
+        self._render_config_status_labels()
+        # Reflect entry mode radio selection
+        try:
+            if hasattr(self, "entry_market_edge_radio") and hasattr(self, "entry_range_distributed_radio"):
+                self.entry_market_edge_radio.blockSignals(True)
+                self.entry_range_distributed_radio.blockSignals(True)
+                is_edge = (self.entry_mode or "market_edge") == "market_edge"
+                self.entry_market_edge_radio.setChecked(is_edge)
+                self.entry_range_distributed_radio.setChecked(not is_edge)
+                self.entry_market_edge_radio.blockSignals(False)
+                self.entry_range_distributed_radio.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_entry_mode_changed(self, *args) -> None:
+        # Handle radio toggles; choose mode strictly based on which radio is checked
+        try:
+            if hasattr(self, "entry_market_edge_radio") and self.entry_market_edge_radio.isChecked():
+                self.entry_mode = "market_edge"
+            elif hasattr(self, "entry_range_distributed_radio") and self.entry_range_distributed_radio.isChecked():
+                self.entry_mode = "range_distributed"
+        except Exception:
+            self.entry_mode = "market_edge"
+
+        # Store per-mode (GLS vs PSL) so settings are NOT shared.
+        try:
+            mode = self._active_settings_mode()
+            if hasattr(self, "_trade_control_by_mode") and mode in self._trade_control_by_mode:
+                self._trade_control_by_mode[mode]["entry_mode"] = self.entry_mode
+        except Exception:
+            pass
+        # Mark lot state dirty so Save Settings persists it
+        self._lot_user_dirty = True
+        self._trade_control_user_dirty = True
+        self._render_config_status_labels()
+
+    def _apply_symbol_state_to_ui(self) -> None:
+        is_custom = self.symbol_mode == "custom"
+        self.symbol_default.blockSignals(True)
+        self.symbol_custom.blockSignals(True)
+        self.symbol_default.setChecked(self.symbol_mode == "default")
+        self.symbol_custom.setChecked(is_custom)
+        self.symbol_default.blockSignals(False)
+        self.symbol_custom.blockSignals(False)
+        # Visibility must reflect mode (hide entirely when not custom)
+        self.symbol_search.setVisible(is_custom)
+        self.symbol_scroll.setVisible(is_custom)
+        # Refresh Symbols button should mirror Custom mode visibility.
+        try:
+            if hasattr(self, "gls_refresh_symbols_btn"):
+                self.gls_refresh_symbols_btn.setVisible(bool(is_custom))
+                inflight = bool(getattr(self, "_symbols_refresh_inflight", False))
+                self.gls_refresh_symbols_btn.setEnabled(bool(is_custom and self._is_settings_unlocked() and (not inflight)))
+        except Exception:
+            pass
+        # Enable only in GLS edit mode + unlocked; view mode stays read-only.
+        can_edit = bool(getattr(self, "gls_edit_mode", False)) and self._is_settings_unlocked()
+        self.symbol_search.setEnabled(bool(is_custom and can_edit))
+        # Keep scroll usable in view mode (checkboxes remain disabled)
+        self.symbol_scroll.setEnabled(bool(is_custom))
+        if not is_custom:
+            self.symbol_search.clear()
+        # Avoid heavy rebuilds here; grid refresh occurs only on explicit actions (e.g., entering edit).
+        # Note: do NOT update the persisted-configured indicator here —
+        # that marker should only change after an explicit save or initial
+        # backend load. This prevents transient edits from flipping the
+        # configured status.
+
+    def _update_symbols_status(self) -> None:
+        # Update status based on saved state. In edit mode, show ✅ if there
+        # are saved symbols (will change to ⚠️ when user makes changes).
+        self._render_config_status_labels()
+
+    def _toggle_edit_mode(self) -> None:
+        """Toggle edit mode based on active panel (GLS or PSL)."""
+        mode = self._active_settings_mode()
+        if mode == "gls":
+            # GLS mode
+            if self.gls_edit_mode:
+                self._exit_edit_mode(revert=True)
+            else:
+                self._enter_edit_mode()
+        elif mode == "psl":
+            # PSL mode
+            if self.psl_edit_mode:
+                self._exit_psl_edit_mode(revert=True)
+            else:
+                self._enter_psl_edit_mode()
+
+    def _enter_edit_mode(self) -> None:
+        # Immediate UI changes: set flags and button text so user sees
+        # instant feedback. Defer heavy work (restoring selection and
+        # rebuilding the grid) to the event loop so the UI can repaint.
+        platform = (getattr(self, "platform", None) or "mt5").lower()
+        selected_account = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop")
+        ctx_state = self._get_ea_context_state(platform, selected_account)
+        ea_active = bool(ctx_state.get("ea_active", False))
+        active_account = self._get_platform_active_account(platform)
+
+        if not ea_active:
+            self._show_toast(f"❌ Please login your EA first. Go to Expert → {self.platform.upper()} and connect your EA.")
+            return
+        if not getattr(self, "flamebot_id", None):
+            self._show_toast("❌ FlameBot ID missing. Please register/login first.")
+            return
+        if active_account and selected_account and active_account != selected_account:
+            self._show_toast(
+                f"⚠️ EA is active on {active_account.upper()} ({self.platform.upper()}). "
+                f"Switch to {active_account.upper()} or connect {selected_account.upper()} on the EA."
+            )
+            return
+        # If already in edit mode, nothing to do
+        if getattr(self, "edit_mode", False):
+            return
+
+        # Record desired mode for deferred worker guards
+        self._desired_edit_mode = True
+        # Prevent cross-mode edit bleed (PSL must not remain editable/enabled under GLS edit).
+        try:
+            self.psl_edit_mode = False
+        except Exception:
+            pass
+        self.gls_edit_mode = True
+        # Do not mark lot/symbol dirty just for entering edit mode
+        # (configured status should stay true until user actually changes something).
+        self._trade_control_user_dirty = True
+
+        # Hard block backend UI hydration/polling while editing to avoid racey overwrites
+        try:
+            self._suppress_backend_ui_hydration_until = time.time() + 15.0
+            if hasattr(self, "backend_timer") and self.backend_timer.isActive():
+                self.backend_timer.stop()
+        except Exception:
+            pass
+        
+        # Snapshot current (GLS) Trade Control state before entering edit mode
+        # (so we can revert if user cancels)
+        try:
+            self._saved_trade_control_by_mode["gls"] = {
+                "allow_message_close": self.allow_message_close,
+                "allow_message_breakeven": self.allow_message_breakeven,
+                "allow_secure_half": self.allow_secure_half,
+                "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+                "entry_mode": self.entry_mode,
+            }
+        except Exception:
+            pass
+        self._saved_allow_message_close = self.allow_message_close
+        self._saved_allow_message_breakeven = self.allow_message_breakeven
+        self._saved_allow_secure_half = self.allow_secure_half
+        self._saved_allow_multiple_signals = self.allow_multiple_signals_per_symbol
+        
+        # Update button state and controls - this will set text and enable/disable properly
+        self._update_edit_button_state()
+        self._update_settings_lock_state()
+        # Defer heavy UI rebuild so the button updates immediately
+        try:
+            QtCore.QTimer.singleShot(0, self._enter_edit_mode_heavy)
+        except Exception:
+            # Fallback: run synchronously if scheduling fails
+            try:
+                self._enter_edit_mode_heavy()
+            except Exception:
+                pass
+
+    def _enter_edit_mode_heavy(self) -> None:
+        # If user changed their mind and left edit mode before this ran,
+        # skip heavy work.
+        if not getattr(self, "_desired_edit_mode", False) or not getattr(self, "gls_edit_mode", False):
+            return
+        # Restore saved lot snapshot so the backend value is visible in edit mode.
+        try:
+            self.lot_mode = getattr(self, "_saved_lot_mode", self.lot_mode)
+            self.custom_lot = getattr(self, "_saved_custom_lot", self.custom_lot)
+            self.entry_mode = getattr(self, "_saved_entry_mode", self.entry_mode)
+        except Exception:
+            pass
+        try:
+            self._apply_lot_state_to_ui()
+        except Exception:
+            pass
+        # Restore last saved selection into editable state so checkboxes reflect
+        # the saved snapshot when entering edit mode.
+        try:
+            self.symbols_allowed = list(self._saved_symbols_allowed)
+        except Exception:
+            pass
+        # Rebuild the grid now that the UI has repainted
+        try:
+            self._refresh_symbol_list()
+        except Exception:
+            pass
+        # Update status to show ✅ if symbols were previously configured
+        try:
+            self._update_symbols_status()
+        except Exception:
+            pass
+
+    def _exit_edit_mode(self, revert: bool) -> None:
+        # Immediate UI changes: update button and mode so user sees instant feedback.
+        # Defer the heavy state restore to avoid blocking the UI thread.
+        # Record desired mode for deferred worker guards
+        self._desired_edit_mode = False
+        # If already not in edit mode and no revert requested, nothing to do
+        if not getattr(self, "gls_edit_mode", False) and not revert:
+            return
+        self.gls_edit_mode = False
+
+        # Resume polling/hydration now that edit mode is ending
+        try:
+            self._suppress_backend_ui_hydration_until = 0
+            if hasattr(self, "backend_timer") and not self.backend_timer.isActive():
+                if self._can_poll_backend():
+                    self.backend_timer.start()
+        except Exception:
+            pass
+        
+        # Update button state and controls - this handles text and enable/disable
+        self._update_edit_button_state()
+        self._update_settings_lock_state()
+        try:
+            QtCore.QTimer.singleShot(0, lambda: self._exit_edit_mode_heavy(revert))
+        except Exception:
+            try:
+                self._exit_edit_mode_heavy(revert)
+            except Exception:
+                pass
+
+    def _exit_edit_mode_heavy(self, revert: bool) -> None:
+        # If user re-entered edit mode before this ran, skip restoring
+        if getattr(self, "_desired_edit_mode", False):
+            return
+        # If revert requested, restore last-saved snapshot
+        if revert:
+            try:
+                self.lot_mode = self._saved_lot_mode
+                self.custom_lot = self._saved_custom_lot
+                self.lot_configured = self._saved_lot_configured
+                self.entry_mode = self._saved_entry_mode
+                self.symbol_mode = self._saved_symbol_mode
+                self.symbols_allowed = list(self._saved_symbols_allowed)
+                self.symbol_configured = self._saved_symbol_configured
+                self._lot_user_dirty = False
+                self._symbol_user_dirty = False
+                self._trade_control_user_dirty = False
+                # Restore Trade Control settings from backend snapshot
+                try:
+                    gls_saved = self._saved_trade_control_by_mode.get("gls", {}) if hasattr(self, "_saved_trade_control_by_mode") else {}
+                    if gls_saved:
+                        self.allow_message_close = bool(gls_saved.get("allow_message_close", self._saved_allow_message_close))
+                        self.allow_message_breakeven = bool(gls_saved.get("allow_message_breakeven", self._saved_allow_message_breakeven))
+                        self.allow_secure_half = bool(gls_saved.get("allow_secure_half", self._saved_allow_secure_half))
+                        self.allow_multiple_signals_per_symbol = bool(gls_saved.get("allow_multiple_signals_per_symbol", self._saved_allow_multiple_signals))
+                        self.entry_mode = gls_saved.get("entry_mode", self._saved_entry_mode)
+                    else:
+                        self.allow_message_close = self._saved_allow_message_close
+                        self.allow_message_breakeven = self._saved_allow_message_breakeven
+                        self.allow_secure_half = self._saved_allow_secure_half
+                        self.allow_multiple_signals_per_symbol = self._saved_allow_multiple_signals
+                except Exception:
+                    self.allow_message_close = self._saved_allow_message_close
+                    self.allow_message_breakeven = self._saved_allow_message_breakeven
+                    self.allow_secure_half = self._saved_allow_secure_half
+                    self.allow_multiple_signals_per_symbol = self._saved_allow_multiple_signals
+                # Apply restored Trade Control state to UI
+                if hasattr(self, "allow_close_checkbox"):
+                    self.allow_close_checkbox.blockSignals(True)
+                    self.allow_close_checkbox.setChecked(self.allow_message_close)
+                    self.allow_close_checkbox.blockSignals(False)
+                if hasattr(self, "allow_breakeven_checkbox"):
+                    self.allow_breakeven_checkbox.blockSignals(True)
+                    self.allow_breakeven_checkbox.setChecked(self.allow_message_breakeven)
+                    self.allow_breakeven_checkbox.blockSignals(False)
+                if hasattr(self, "allow_secure_half_checkbox"):
+                    self.allow_secure_half_checkbox.blockSignals(True)
+                    self.allow_secure_half_checkbox.setChecked(self.allow_secure_half)
+                    self.allow_secure_half_checkbox.blockSignals(False)
+                if hasattr(self, "allow_multiple_checkbox"):
+                    self.allow_multiple_checkbox.blockSignals(True)
+                    self.allow_multiple_checkbox.setChecked(self.allow_multiple_signals_per_symbol)
+                    self.allow_multiple_checkbox.blockSignals(False)
+
+                # Restore Scheduler snapshot
+                try:
+                    self.scheduler_active = bool(getattr(self, "_saved_scheduler_active", False))
+                    self.scheduler_pause_day = getattr(self, "_saved_scheduler_pause_day", None)
+                    self.scheduler_pause_time = getattr(self, "_saved_scheduler_pause_time", None)
+                    self.scheduler_resume_day = getattr(self, "_saved_scheduler_resume_day", None)
+                    self.scheduler_resume_time = getattr(self, "_saved_scheduler_resume_time", None)
+                    self._apply_scheduler_state_to_ui()
+                except Exception:
+                    pass
+                # Restore entry_mode radio buttons
+                if hasattr(self, "entry_market_edge_radio") and hasattr(self, "entry_range_distributed_radio"):
+                    if self.entry_mode == "market_edge":
+                        self.entry_market_edge_radio.setChecked(True)
+                    elif self.entry_mode == "range_distributed":
+                        self.entry_range_distributed_radio.setChecked(True)
+                # Apply UI state now (this may rebuild grid via _apply_symbol_state_to_ui)
+                self._apply_lot_state_to_ui()
+                self._apply_symbol_state_to_ui()
+                # Restore status to ✅ when canceling (if symbols were configured)
+                self._update_symbols_status()
+            except Exception:
+                pass
+
+    def _refresh_symbol_list(self) -> None:
+        if self._symbol_list_updating:
+            return
+        self._symbol_list_updating = True
+        # Remove all items from the grid layout. Widgets are reused when possible.
+        while self.symbol_grid.count():
+            item = self.symbol_grid.takeAt(0)
+            widget = item.widget()
+            if widget:
+                try:
+                    widget.setVisible(False)
+                except Exception:
+                    pass
+        # If not in custom mode, don't render any symbols (Default = trade all).
+        if self.symbol_mode != "custom":
+            # leave grid empty and return early; UI hides search/scroll via _apply_symbol_state_to_ui
+            self._symbol_list_updating = False
+            return
+
+        # CRITICAL FIX: Always load symbols from saved state first
+        # Determine which symbols to render based on edit state.
+        # VIEW MODE (not editing): Show saved symbols ALWAYS (or full list if nothing saved yet)
+        # EDIT MODE (editing): Show full available symbols so user can change selection
+        # Search filters whichever list is active, but does NOT gate rendering
+        query = self.symbol_search.text().strip().lower()
+        if not getattr(self, "gls_edit_mode", False):
+            # VIEW MODE → render saved symbols ALWAYS (never empty)
+            saved = list(getattr(self, "_saved_symbols_allowed", []))
+            if saved:
+                base_list = saved
+            elif self.symbols_allowed:
+                # Use current symbols_allowed if no saved state yet
+                base_list = list(self.symbols_allowed)
+            else:
+                # Fallback to full list only if truly nothing is configured
+                base_list = list(self.available_symbols)
+        else:
+            # EDIT MODE → render full available symbols
+            base_list = list(self.available_symbols)
+        
+        # Reuse checkbox widgets when the underlying base list is unchanged.
+        try:
+            prev_base = tuple(getattr(self, "_symbol_checkbox_base", ()) or ())
+        except Exception:
+            prev_base = ()
+        base_tuple = tuple(base_list)
+        if prev_base != base_tuple:
+            # Base changed (e.g., edit/view toggle); drop old widgets.
+            for cb in list(getattr(self, "_symbol_checkboxes", {}).values()):
+                try:
+                    cb.setParent(None)
+                    cb.deleteLater()
+                except Exception:
+                    pass
+            self._symbol_checkboxes = {}
+            self._symbol_checkbox_base = base_tuple
+
+        # Apply search filter (optional)
+        symbols = [s for s in base_list if (not query) or (query in s.lower())]
+        if not symbols:
+            placeholder = QtWidgets.QLabel("No symbols found.")
+            placeholder.setObjectName("muted")
+            self.symbol_grid.addWidget(placeholder, 0, 0)
+            self._symbol_list_updating = False
+            return
+        # Compute columns dynamically from the viewport width so rows fill
+        # horizontally and no dead space remains on the right.
+        try:
+            item_width = 110
+            viewport_width = max(1, self.symbol_scroll.viewport().width())
+            cols = max(1, viewport_width // item_width)
+        except Exception:
+            cols = 1
+        # Add widgets by index so rows are fully populated: row = i // cols
+        for i, symbol in enumerate(symbols):
+            cb = self._symbol_checkboxes.get(symbol)
+            if cb is None:
+                cb = QtWidgets.QCheckBox(symbol)
+                cb.setCursor(QtCore.Qt.PointingHandCursor)
+                def make_handler(s):
+                    return lambda state: self._on_symbol_checkbox_changed(s, state)
+                cb.stateChanged.connect(make_handler(symbol))
+                self._symbol_checkboxes[symbol] = cb
+
+            # Keep state fresh when reusing widgets.
+            try:
+                cb.blockSignals(True)
+                cb.setChecked(symbol in self.symbols_allowed)
+            finally:
+                try:
+                    cb.blockSignals(False)
+                except Exception:
+                    pass
+            # Checkboxes are only enabled in edit mode
+            cb.setEnabled(bool(getattr(self, "gls_edit_mode", False)) and bool(self._is_settings_unlocked()))
+            try:
+                cb.setVisible(True)
+            except Exception:
+                pass
+            row = i // cols
+            col = i % cols
+            self.symbol_grid.addWidget(cb, row, col)
+        # Force the grid to start from the top and consume remaining vertical space
+        try:
+            last_filled_row = row - 1 if col == 0 and row > 0 else row
+            self.symbol_grid.setRowStretch(last_filled_row + 1, 1)
+        except Exception:
+            pass
+        # Ensure predictable fixed columns: explicitly disable horizontal
+        # stretching for all columns so the grid does not expand its widgets
+        # when the window grows. Alignment is set at creation to top-left.
+        try:
+            for ci in range(cols):
+                self.symbol_grid.setColumnStretch(ci, 0)
+        except Exception:
+            pass
+        # Make vertical scrolling smoother (larger step per wheel/arrow)
+        try:
+            self.symbol_scroll.verticalScrollBar().setSingleStep(24)
+        except Exception:
+            pass
+        self._symbol_list_updating = False
+
+    def _on_symbol_checkbox_changed(self, symbol: str, state: int) -> None:
+        if self._symbol_list_updating:
+            return
+        checked = state == QtCore.Qt.Checked
+        if checked:
+            if symbol not in self.symbols_allowed:
+                self.symbols_allowed.append(symbol)
+        else:
+            self.symbols_allowed = [sym for sym in self.symbols_allowed if sym != symbol]
+        # mark user's changes as unsaved and update UI state
+        self._symbol_user_dirty = True
+        # Configured status is derived ONLY from backend snapshot.
+        self._render_config_status_labels()
+
+    def _save_all_settings(self) -> None:
+        """Save settings based on active panel (GLS or PSL)."""
+        mode = self._active_settings_mode()
+        if mode == "gls":
+            # Save GLS settings only
+            self._save_gls_settings()
+        elif mode == "psl":
+            # Save PSL settings only
+            self._save_psl_settings()
+
+    def _save_gls_settings(self) -> None:
+        """Save GLS (General Lot Size) settings only."""
+        if not self._is_settings_unlocked():
+            sel_acct = str(getattr(self, "current_account_type", None) or "prop").upper()
+            self._show_toast(
+                f"❌ Settings are locked. Connect the EA for {sel_acct} on {self.platform.upper()} first."
+            )
+            return
+        auth_params = self._backend_auth_params()
+        if not auth_params:
+            self._show_toast("❌ FlameBot ID and License Key are required.")
+            return
+        lot_mode = "custom" if self.lot_custom.isChecked() else "default"
+        custom_lot_value = None
+        if lot_mode == "custom":
+            raw_value = self.lot_custom_input.text().strip()
+            try:
+                custom_lot_value = float(raw_value)
+            except ValueError:
+                self._error("Enter a valid custom lot size.")
+                return
+            if custom_lot_value <= 0:
+                self._error("Custom lot size must be greater than 0.")
+                return
+        lot_payload = {
+            **auth_params,
+            "lot_mode": lot_mode,
+            "custom_lot": custom_lot_value,
+            "entry_mode": self.entry_mode,
+        }
+        symbol_mode = "custom" if self.symbol_custom.isChecked() else "default"
+        if symbol_mode == "custom" and not self.symbols_allowed:
+            self._error("Select at least one symbol for custom mode.")
+            return
+        symbol_payload = {
+            **auth_params,
+            "symbol_mode": symbol_mode,
+            "symbols_allowed": self.symbols_allowed,
+        }
+
+        # Save Telegram Trade Control toggle values
+        self.allow_message_close = self.allow_close_checkbox.isChecked()
+        self.allow_message_breakeven = self.allow_breakeven_checkbox.isChecked()
+        self.allow_secure_half = self.allow_secure_half_checkbox.isChecked()
+        self.allow_multiple_signals_per_symbol = self.allow_multiple_checkbox.isChecked() if hasattr(self, "allow_multiple_checkbox") else self.allow_multiple_signals_per_symbol
+
+        # Scheduler: read from UI and validate (no partial config allowed when active)
+        try:
+            self._sync_scheduler_state_from_ui()
+        except Exception:
+            pass
+        if bool(getattr(self, "scheduler_active", False)):
+            if (
+                getattr(self, "scheduler_pause_day", None) is None
+                or not self._is_valid_hhmm(getattr(self, "scheduler_pause_time", None))
+                or getattr(self, "scheduler_resume_day", None) is None
+                or not self._is_valid_hhmm(getattr(self, "scheduler_resume_time", None))
+            ):
+                self._error(self._scheduler_validation_message())
+                return
+
+        # Store into GLS mode cache (GLS/PSL must not share)
+        try:
+            self._trade_control_by_mode["gls"] = {
+                "allow_message_close": self.allow_message_close,
+                "allow_message_breakeven": self.allow_message_breakeven,
+                "allow_secure_half": self.allow_secure_half,
+                "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+                "entry_mode": self.entry_mode,
+            }
+        except Exception:
+            pass
+        toggle_payload = {
+            **auth_params,
+            "execution_mode": "gls",
+            "allow_message_close": self.allow_message_close,
+            "allow_message_breakeven": self.allow_message_breakeven,
+            "allow_secure_half": self.allow_secure_half,
+            "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+            "scheduler_active": bool(getattr(self, "scheduler_active", False)),
+            "scheduler_pause_day": getattr(self, "scheduler_pause_day", None),
+            "scheduler_pause_time": self._hhmm_payload_value(getattr(self, "scheduler_pause_time", None)),
+            "scheduler_resume_day": getattr(self, "scheduler_resume_day", None),
+            "scheduler_resume_time": self._hhmm_payload_value(getattr(self, "scheduler_resume_time", None)),
+        }
+
+        # Run network saves off the UI thread
+        try:
+            self.save_settings_btn.setEnabled(False)
+        except Exception:
+            pass
+        self._show_toast("Saving settings...")
+
+        self._backend_poll_seq += 1
+        seq = self._backend_poll_seq
+        task = _BackendMultiPostTask(
+            seq,
+            self.backend_url,
+            posts=[
+                ("save_lot", lot_payload),
+                ("save_symbols", symbol_payload),
+                ("app/settings/trade_control", toggle_payload),
+            ],
+            timeout=DEFAULT_HTTP_TIMEOUT,
+        )
+        task.signals.finished.connect(
+            lambda s, results: self._on_gls_save_finished(
+                s,
+                results,
+                lot_mode,
+                custom_lot_value,
+                symbol_mode,
+                lot_payload,
+                symbol_payload,
+                toggle_payload,
+            )
+        )
+        task.signals.error.connect(lambda s, msg: self._on_gls_save_error(s, msg, lot_payload, symbol_payload, toggle_payload))
+        self._backend_pool.start(task)
+
+    def _on_gls_save_error(
+        self,
+        seq: int,
+        message: str,
+        lot_payload: Optional[dict] = None,
+        symbol_payload: Optional[dict] = None,
+        toggle_payload: Optional[dict] = None,
+    ) -> None:
+        try:
+            self.save_settings_btn.setEnabled(True)
+        except Exception:
+            pass
+        if isinstance(lot_payload, dict) and isinstance(symbol_payload, dict) and isinstance(toggle_payload, dict):
+            try:
+                self._enqueue_settings_outbox(
+                    mode="gls",
+                    posts=[
+                        ("save_lot", lot_payload),
+                        ("save_symbols", symbol_payload),
+                        ("app/settings/trade_control", toggle_payload),
+                    ],
+                    toast=True,
+                )
+                try:
+                    self._suppress_backend_ui_hydration_until = time.time() + 20.0
+                except Exception:
+                    pass
+                return
+            except Exception:
+                pass
+        self._error(f"Save failed: {message}")
+
+    def _on_gls_save_finished(
+        self,
+        seq: int,
+        results: dict,
+        lot_mode: str,
+        custom_lot_value: Optional[float],
+        symbol_mode: str,
+        lot_payload: dict,
+        symbol_payload: dict,
+        toggle_payload: dict,
+    ) -> None:
+        try:
+            self.save_settings_btn.setEnabled(True)
+        except Exception:
+            pass
+
+        lot_response = results.get("save_lot")
+        if not lot_response:
+            self._error("Lot save failed (no response). Check your internet connection or server URL.")
+            return
+        if lot_response.get("status") != "OK":
+            try:
+                st = str(lot_response.get("status") or "").upper()
+            except Exception:
+                st = ""
+            if st == "NET_ERROR":
+                try:
+                    self._enqueue_settings_outbox(
+                        mode="gls",
+                        posts=[
+                            ("save_lot", dict(lot_payload or {})),
+                            ("save_symbols", dict(symbol_payload or {})),
+                            ("app/settings/trade_control", dict(toggle_payload or {})),
+                        ],
+                        toast=True,
+                    )
+                except Exception:
+                    self._show_toast("⚠️ Can't reach server right now.", duration_ms=8000)
+                try:
+                    self._suppress_backend_ui_hydration_until = time.time() + 20.0
+                except Exception:
+                    pass
+                return
+            self._error(lot_response.get("message", f"Lot save failed (status={lot_response.get('status')})."))
+            return
+        self.lot_mode = lot_response.get("lot_mode", lot_mode)
+        self.custom_lot = lot_response.get("custom_lot", custom_lot_value)
+        # default lot mode keeps custom_lot as None but remains configured
+        if (self.lot_mode or "default") == "default":
+            self.custom_lot = None
+        self._saved_lot_mode = self.lot_mode
+        self._saved_custom_lot = self.custom_lot
+        self._saved_lot_configured = self._as_bool(lot_response.get("lot_configured", True))
+        self._lot_user_dirty = False
+
+        # Backend now has a saved lot record for this context.
+        try:
+            ctx = self._context_key()
+            self._backend_presence_by_context.get("lot", {})[ctx] = True
+        except Exception:
+            pass
+
+        symbol_response = results.get("save_symbols")
+        if not symbol_response or symbol_response.get("status") != "OK":
+            try:
+                st = str((symbol_response or {}).get("status") or "").upper()
+            except Exception:
+                st = ""
+            if st == "NET_ERROR":
+                try:
+                    self._enqueue_settings_outbox(
+                        mode="gls",
+                        posts=[
+                            ("save_lot", dict(lot_payload or {})),
+                            ("save_symbols", dict(symbol_payload or {})),
+                            ("app/settings/trade_control", dict(toggle_payload or {})),
+                        ],
+                        toast=True,
+                    )
+                except Exception:
+                    self._show_toast("⚠️ Can't reach server right now.", duration_ms=8000)
+                try:
+                    self._suppress_backend_ui_hydration_until = time.time() + 20.0
+                except Exception:
+                    pass
+                return
+            self._error(symbol_response.get("message", "Symbols save failed.") if symbol_response else "Symbols save failed.")
+            return
+        self.symbol_mode = symbol_response.get("symbol_mode", symbol_mode)
+        if self.symbol_mode == "custom":
+            self.symbols_allowed = symbol_response.get("symbols_allowed", self.symbols_allowed)
+        self._saved_symbol_mode = self.symbol_mode
+        if self.symbol_mode == "custom":
+            self._saved_symbols_allowed = list(self.symbols_allowed)
+        else:
+            # default symbol mode: clear allowed list but still configured
+            self.symbols_allowed = []
+            self._saved_symbols_allowed = []
+        self._saved_symbol_configured = self._as_bool(symbol_response.get("symbol_configured", True))
+
+        # Backend now has a saved symbol record for this context.
+        try:
+            ctx = self._context_key()
+            self._backend_presence_by_context.get("symbol", {})[ctx] = True
+        except Exception:
+            pass
+        self._symbol_user_dirty = False
+
+        toggle_response = results.get("app/settings/trade_control")
+        if not toggle_response or toggle_response.get("status") != "OK":
+            self._log(f"⚠️ Trade control save warning: {toggle_response.get('message', 'Failed') if toggle_response else 'Failed'}")
+            try:
+                st = str((toggle_response or {}).get("status") or "").upper()
+            except Exception:
+                st = ""
+            if st == "NET_ERROR":
+                try:
+                    self._enqueue_settings_outbox(
+                        mode="gls",
+                        posts=[("app/settings/trade_control", dict(toggle_payload or {}))],
+                        toast=False,
+                    )
+                except Exception:
+                    pass
+        else:
+            # Update Trade Control snapshots after successful save
+            self._saved_allow_message_close = self.allow_message_close
+            self._saved_allow_message_breakeven = self.allow_message_breakeven
+            self._saved_allow_secure_half = self.allow_secure_half
+            self._saved_allow_multiple_signals = self.allow_multiple_signals_per_symbol
+            self._saved_scheduler_active = bool(getattr(self, "scheduler_active", False))
+            self._saved_scheduler_pause_day = getattr(self, "scheduler_pause_day", None)
+            self._saved_scheduler_pause_time = getattr(self, "scheduler_pause_time", None)
+            self._saved_scheduler_resume_day = getattr(self, "scheduler_resume_day", None)
+            self._saved_scheduler_resume_time = getattr(self, "scheduler_resume_time", None)
+            self._trade_control_user_dirty = False
+            try:
+                self._saved_trade_control_by_mode["gls"] = {
+                    "allow_message_close": self.allow_message_close,
+                    "allow_message_breakeven": self.allow_message_breakeven,
+                    "allow_secure_half": self.allow_secure_half,
+                    "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+                    "entry_mode": self.entry_mode,
+                }
+                if hasattr(self, "_trade_control_by_mode"):
+                    self._trade_control_by_mode["gls"] = {
+                        "allow_message_close": self.allow_message_close,
+                        "allow_message_breakeven": self.allow_message_breakeven,
+                        "allow_secure_half": self.allow_secure_half,
+                        "allow_multiple_signals_per_symbol": self.allow_multiple_signals_per_symbol,
+                        "entry_mode": self.entry_mode,
+                    }
+            except Exception:
+                pass
+            self._log(f"✅ Telegram trade control settings saved | close={self.allow_message_close} | breakeven={self.allow_message_breakeven} | secure_half={self.allow_secure_half} | multi_signals={self.allow_multiple_signals_per_symbol}")
+
+        self._apply_lot_state_to_ui()
+        self._apply_symbol_state_to_ui()
+        self._render_config_status_labels()
+        self._save_settings()
+        try:
+            ctx = self._context_key()
+            self._context_hydrated_at[ctx] = time.time()
+            self._settings_hydration_pending[ctx] = False
+            self._last_good_config_by_ctx[ctx] = {
+                "lot": bool(getattr(self, "_saved_lot_configured", False)),
+                "symbol": bool(getattr(self, "_saved_symbol_configured", False)),
+                "psl": bool(getattr(self, "_saved_psl_configured", False)),
+            }
+        except Exception:
+            pass
+        self._show_toast("✅ Settings saved")
+        self.gls_edit_mode = False
+        
+        # CRITICAL: Update configuration status after successful GLS save
+        self.user_execution_mode = "gls"  # GLS mode activated
+        if symbol_response.get("symbol_configured") or symbol_response.get("symbol_mode") == "default":
+            self.user_symbol_mode = symbol_response.get("symbol_mode", "default")
+        
+        # Check if configuration is now complete and start polling if needed
+        self._check_and_start_polling()
+        
+        # Disable Telegram Trade Control toggles after saving
+        self.allow_close_checkbox.setEnabled(False)
+        self.allow_breakeven_checkbox.setEnabled(False)
+        self.allow_secure_half_checkbox.setEnabled(False)
+        try:
+            self.edit_settings_btn.setText("Edit")
+        except Exception:
+            pass
+        # Clear search so the saved VIEW is not filtered by any prior search text
+        try:
+            self.symbol_search.clear()
+        except Exception:
+            pass
+        # Refresh the symbol list to show the saved snapshot immediately
+        try:
+            self._apply_symbol_state_to_ui()
+            # After saving, render only the saved symbols (view-mode)
+            self._refresh_symbol_list()
+        except Exception:
+            pass
+        # Now update persisted-configured indicator (only saved state affects this)
+        try:
+            self._update_symbols_status()
+        except Exception:
+            pass
+        self._update_settings_lock_state()
+        self._update_edit_button_state()
+
+        # Temporarily suppress backend-driven UI hydration to prevent flicker immediately after save
+        try:
+            self._suppress_backend_ui_hydration_until = time.time() + 1.0
+        except Exception:
+            pass
+
+    def _backend_auth_params(self) -> Optional[dict]:
+        if not self.flamebot_id or self.flamebot_id == "FB-XXXXXXX":
+            return None
+        license_key = self._current_license()
+        if not license_key:
+            return None
+        params = {
+            "user_id": self.flamebot_id,
+            "license_key": license_key,
+            "platform": self.platform,
+            "account_type": self._normalize_account_type(getattr(self, "current_account_type", None) or "prop") or "prop",
+        }
+        # Terminal binding: once an EA has authorized a (platform, license_key),
+        # backend requires terminal_id for state-changing calls (save settings, etc.).
+        try:
+            p = (getattr(self, "platform", None) or "mt5").lower()
+            tid = (getattr(self, "_terminal_id_by_platform", {}) or {}).get(p)
+            tid = str(tid or "").strip()
+            if tid:
+                params["terminal_id"] = tid
+        except Exception:
+            pass
+        return params
+
+    def _refresh_ea_status_for_context(self, auth_params: Optional[dict]) -> None:
+        if not auth_params:
+            return
+        try:
+            response = self._get_backend_json("ea_status", auth_params)
+        except Exception:
+            response = None
+        if not response:
+            return
+        try:
+            self._apply_platform_ea_state_from_response(auth_params, response)
+        except Exception:
+            pass
+        try:
+            if (auth_params.get("platform") or "").lower() == (getattr(self, "platform", None) or "mt5").lower():
+                self.ea_active = self._get_platform_ea_active(auth_params.get("platform"))
+                self._ea_active_account = self._get_platform_active_account(auth_params.get("platform"))
+        except Exception:
+            pass
+
+    def _resolve_backend_auth(self) -> Optional[dict]:
+        # Use the currently-selected UI license for the current platform.
+        return self._backend_auth_params()
+
+    def _resolve_backend_auth_for_platform(self, platform: str) -> Optional[dict]:
+        """Build auth params for a specific platform using stored credentials."""
+        platform_key = (platform or "").lower()
+        if platform_key not in {"mt4", "mt5"}:
+            platform_key = "mt5"
+
+        flamebot_id = (self.flamebot_ids.get(platform_key) or "").strip()
+        if not flamebot_id or flamebot_id == "FB-XXXXXXX":
+            return None
+
+        licenses = self.licenses_by_platform.get(platform_key, {}) or {}
+        acct = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop") or "prop"
+        license_key = (licenses.get(acct) or "").strip()
+        if not license_key:
+            # Fallback: any license on this platform
+            for k in ("prop", "normal"):
+                candidate = (licenses.get(k) or "").strip()
+                if candidate:
+                    license_key = candidate
+                    break
+        if not license_key:
+            return None
+        params = {
+            "user_id": flamebot_id,
+            "license_key": license_key,
+            "platform": platform_key,
+            "account_type": acct,
+        }
+        try:
+            terminal_id = (getattr(self, "_terminal_id_by_platform", {}) or {}).get(platform_key)
+            if terminal_id:
+                params["terminal_id"] = terminal_id
+        except Exception:
+            pass
+        return params
+
+    def _mark_platform_hydrated(self, platform: Optional[str] = None) -> None:
+        key = self._platform_user_key(platform)
+        if key.endswith(":"):
+            return
+        try:
+            self._platform_settings_hydrated[key] = True
+        except Exception:
+            pass
+
+    def _hydrate_platform_settings(self, auth_params: Optional[dict]) -> None:
+        """One-time settings hydration per platform (login or successful save)."""
+        if not auth_params:
+            return
+        platform = self._platform_key(auth_params.get("platform"))
+        user_id = str(auth_params.get("user_id") or "").strip()
+        ukey = self._platform_user_key(platform, user_id)
+        if ukey.endswith(":"):
+            return
+        try:
+            if getattr(self, "_platform_settings_hydrated", {}).get(ukey):
+                return
+        except Exception:
+            pass
+
+        lot_resp = self._get_backend_json("get_lot_settings", auth_params)
+        sym_resp = self._get_backend_json("get_symbol_settings", auth_params)
+        psl_resp = self._get_backend_json("get_psl_settings", auth_params)
+
+        self._fetch_lot_settings(auth_params, lot_resp)
+        self._fetch_symbol_settings(auth_params, sym_resp)
+        self._fetch_psl_settings(auth_params, psl_resp)
+
+        self._platform_settings_hydrated[ukey] = True
+        self._snapshot_platform_ui_state(platform)
+
+    def _mask_license_key(self, license_key: str) -> str:
+        if not license_key:
+            return "missing"
+        return f"{license_key[:4]}****"
+
+    def _update_active_profile_label(self) -> None:
+        # The label should reflect the account actually active on the EA (backend source-of-truth)
+        platform_label = self.platform.upper()
+        try:
+            selected_account = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop")
+            ctx_state = self._get_ea_context_state(self.platform, selected_account)
+            if not bool(ctx_state.get("known", False)):
+                self.active_profile_label.setText(f"Platform: {platform_label} | EA status pending")
+                return
+        except Exception:
+            pass
+        if not self.ea_active:
+            self.active_profile_label.setText(f"Platform: {platform_label} | EA not connected")
+            return
+        active = getattr(self, "_ea_active_account", None)
+        if not active:
+            # EA connected but backend didn't report which account is active
+            self.active_profile_label.setText(f"Platform: {platform_label} | EA connected — active profile unknown")
+            return
+        active_label = "PROP" if active == "prop" else "NORMAL"
+        inactive = "normal" if active == "prop" else "prop"
+        inactive_label = "PROP" if inactive == "prop" else "NORMAL"
+        masked_active = self._mask_license_key(self.licenses.get(active, ""))
+        masked_inactive = self._mask_license_key(self.licenses.get(inactive, ""))
+        # Two-line display: platform, active then inactive
+        self.active_profile_label.setText(
+            f"Platform: {platform_label} | Active on EA: {active_label} • {masked_active}\nInactive on EA: {inactive_label} • {masked_inactive}"
+        )
+
+    def _build_backend_url(self, path: str, params: Optional[dict] = None) -> str:
+        base = self.backend_url.rstrip("/") + "/"
+        url = base + path.lstrip("/")
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        return url
+
+    def _get_backend_json(self, path: str, params: Optional[dict] = None) -> Optional[dict]:
+        # Phase 2 hardening: these endpoints must NOT receive identity via query string.
+        post_only = {
+            "ea_status",
+            "get_lot_settings",
+            "get_symbol_settings",
+            "get_psl_settings",
+            "ea/get_trade_state",
+            "/ea/get_trade_state",
+        }
+        if (path or "").lstrip("/") in {p.lstrip("/") for p in post_only}:
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                return None
+            return self._post_backend_json(path, params)
+
+        url = self._build_backend_url(path, params)
+        try:
+            with urllib.request.urlopen(url, timeout=DEFAULT_HTTP_TIMEOUT) as response:
+                payload = response.read()
+        except Exception as e:
+            # Network errors can include: remote server resets (WinError 10054),
+            # SSL handshake issues, proxy drops, and timeouts.
+            try:
+                http_debug = os.environ.get("FLAMEBOT_HTTP_DEBUG", "0") == "1"
+                if http_debug:
+                    self._log(f"[HTTP DEBUG] GET failed: {url}")
+                    self._log(f"[HTTP DEBUG] GET exception: {repr(e)}")
+            except Exception:
+                pass
+            return None
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return None
+
+    def _post_backend_json(self, path: str, payload: dict) -> Optional[dict]:
+        url = self._build_backend_url(path)
+        # DEBUG logging (guarded to avoid UI freezes from large payload dumps)
+        http_debug = os.environ.get("FLAMEBOT_HTTP_DEBUG", "0") == "1"
+        if http_debug:
+            self._log(f"[HTTP DEBUG] POST URL: {url}")
+            try:
+                self._log(f"[HTTP DEBUG] Payload: {json.dumps(payload, indent=2)[:2000]}")
+            except Exception:
+                pass
+        
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=DEFAULT_HTTP_TIMEOUT) as response:
+                body = response.read()
+                if http_debug:
+                    self._log(f"[HTTP DEBUG] Response status: {response.status}")
+                    self._log(f"[HTTP DEBUG] Response body: {body.decode('utf-8')[:500]}")
+        except urllib.error.HTTPError as e:
+            if http_debug:
+                self._log(f"[HTTP DEBUG] HTTP Error: {e.code} - {e.reason}")
+            try:
+                error_body = e.read().decode("utf-8")
+                if http_debug:
+                    self._log(f"[HTTP DEBUG] Error body: {error_body[:1000]}")
+                try:
+                    obj = json.loads(error_body)
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return {"status": "HTTP_ERROR", "message": f"HTTP {getattr(e, 'code', '??')} {getattr(e, 'reason', '')}"}
+        except Exception as e:
+            if http_debug:
+                self._log(f"[HTTP DEBUG] Connection Error: {e}")
+            return {"status": "NET_ERROR", "message": _friendly_network_error_message(e)}
+        try:
+            return json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError:
+            return {"status": "BAD_JSON", "message": "Backend returned invalid JSON"}
+
+    def _register_with_backend(self, telegram_id: str) -> Optional[dict]:
+        """Legacy synchronous registration entry point.
+
+        Registration now runs via the async challenge/verify flow in
+        `_BackendRegisterTask`. This method schedules a register and returns
+        immediately.
+        """
+        if not telegram_id:
+            return None
+
+        try:
+            self._schedule_backend_register(str(telegram_id))
+            return {"status": "QUEUED", "message": "Registration scheduled"}
+        except Exception:
+            return None
+        
+        # Log what we're about to receive BEFORE processing
+        self._log("=" * 60)
+        self._log("[REGISTER DEBUG] BEFORE updating Desktop App state:")
+        self._log(f"  OLD FlameBot ID (cached): {self.flamebot_id}")
+        try:
+            self._log(f"  OLD License (prop): {self._mask_license_key(self.licenses.get('prop', '') or '')}")
+            self._log(f"  OLD License (normal): {self._mask_license_key(self.licenses.get('normal', '') or '')}")
+        except Exception:
+            self._log("  OLD License (prop): (masked)")
+            self._log("  OLD License (normal): (masked)")
+        self._log("=" * 60)
+        
+        resp = self._post_backend_json("/register", payload)
+        if not resp:
+            self._log("⚠️ No response from server — check connection")
+            return None
+        if resp.get("status") != "OK":
+            self._log(f"⚠️ /register error: {resp.get('message')}")
+            try:
+                self._show_toast(f"❌ Registration failed: {str(resp.get('message') or 'Failed').strip()}", duration_ms=9000)
+            except Exception:
+                pass
+            return resp
+
+        # MANDATORY: Hard reset ALL user-scoped state BEFORE applying a new login session.
+        # Preserve the current Telegram session (we are mid-login), but clear everything else.
+        try:
+            self.reset_user_state(preserve_telegram_session=True, full_ui_reset=False)
+        except Exception:
+            pass
+        
+        # LOG RAW BACKEND RESPONSE - THIS IS THE SOURCE OF TRUTH
+        self._log("=" * 60)
+        self._log("[REGISTER DEBUG] RAW SERVER RESPONSE:")
+        self._log(f"  Server FlameBot ID: {resp.get('flamebot_id')}")
+        try:
+            self._log(f"  Server License Key: {self._mask_license_key(str(resp.get('license_key') or ''))}")
+        except Exception:
+            self._log("  Server License Key: (masked)")
+        self._log(f"  Server Account Type: {resp.get('account_type')}")
+        self._log(f"  Server Platform: {resp.get('platform')}")
+        self._log(f"  Server EA Active: {resp.get('ea_active')}")
+        self._log("=" * 60)
+        
+        # Authoritative fields from backend — FORCE OVERWRITE everything
+        new_flamebot_id = resp.get("flamebot_id") or ""
+        license_key = resp.get("license_key")
+        account_type = resp.get("account_type") or self.current_account_type
+        ingest_secret = str(resp.get("telegram_ingest_secret") or "").strip()
+        
+        # Log credential update
+        if new_flamebot_id != self.flamebot_id:
+            self._log(f"✅ FlameBot ID updated: {new_flamebot_id}")
+        if license_key:
+            self._log(f"✅ NEW License Key ({account_type.upper()}): {license_key[:8]}****")
+        
+        # FORCE overwrite - clear old values first
+        self.flamebot_id = new_flamebot_id
+        self.flamebot_ids[self.platform] = new_flamebot_id
+        
+        # Clear all licenses for this platform, then set new one
+        self.licenses = {"prop": "", "normal": ""}
+        if license_key:
+            self._set_license(account_type, license_key)
+        self.licenses_by_platform[self.platform] = self.licenses
+
+        # Store per-user ingest secret for signed Telethon ingest.
+        if ingest_secret:
+            try:
+                self.telegram_ingest_secrets[self.platform] = ingest_secret
+                self.telegram_ingest_secret = ingest_secret
+            except Exception:
+                pass
+        
+        # Update UI immediately with new credentials
+        try:
+            self._update_active_profile_label()
+        except Exception:
+            pass
+        self._update_credential_labels()
+        
+        # Save to settings.json with new credentials
+        self._save_settings()
+
+        # Update worker with ingest secret(s)
+        try:
+            self.worker.set_telegram_ingest_secrets(getattr(self, "telegram_ingest_secrets", {"mt4": "", "mt5": ""}))
+        except Exception:
+            pass
+        
+        # Update worker with registered platforms list
+        self.worker.set_registered_platforms(self.flamebot_ids)
+
+        # Ensure hydration cannot be skipped due to previous user's flags.
+        try:
+            self._platform_settings_hydrated[self._platform_user_key(self.platform, new_flamebot_id)] = False
+        except Exception:
+            pass
+        
+        # LOG WHAT DESKTOP APP IS NOW DISPLAYING
+        self._log("=" * 60)
+        self._log("[REGISTER DEBUG] AFTER updating Desktop App state:")
+        self._log(f"  Desktop FlameBot ID: {self.flamebot_id}")
+        self._log(f"  Desktop License (prop): {self.licenses.get('prop', 'None')}")
+        self._log(f"  Desktop License (normal): {self.licenses.get('normal', 'None')}")
+        self._log(f"  Desktop Platform: {self.platform}")
+        self._log("=" * 60)
+        
+        # CRITICAL COMPARISON - Flag mismatch
+        if self.flamebot_id != resp.get("flamebot_id"):
+            self._log("🚨 CACHE BUG DETECTED: Desktop FlameBot ID != Server FlameBot ID")
+        elif license_key and license_key != self.licenses.get(account_type):
+            self._log("🚨 CACHE BUG DETECTED: Desktop License != Server License")
+        else:
+            self._log("[REGISTER DEBUG] CACHE OK: Desktop credentials match server response")
+        self._log("=" * 60)
+        
+        self._log(f"✅ Registration complete - platform={self.platform} account={account_type}")
+        try:
+            self._refresh_authoritative_state()
+        except Exception:
+            pass
+        return resp
+
+    def _request_license_for_account(self, account_key: str) -> Optional[dict]:
+        """Best-effort license refresh for `account_key`.
+
+        Prefer pulling authoritative state rather than re-running Telegram bot
+        verification (which should be one-time per user).
+        """
+        if not getattr(self, "telegram_id", ""):
+            return None
+        if account_key not in {"prop", "normal"}:
+            return None
+        try:
+            self._refresh_authoritative_state()
+            return {"status": "OK", "message": "License refresh requested"}
+        except Exception:
+            return None
+
+    def _refresh_authoritative_state(self) -> None:
+        """Fetch `/miniapp/api/state` for `self.flamebot_id` and update local UI state.
+
+        This ensures both `prop` and `normal` licenses are populated from
+        the backend and keeps the desktop strictly in sync with server state.
+        """
+        if not self.flamebot_id:
+            return
+        try:
+            # Determine a license key to use when querying authoritative state.
+            # Backend requires a license_key for this endpoint; prefer EA-active,
+            # then current UI selection, then any known license. If none exist
+            # attempt to request one from the backend.
+            license_key = self._current_license()
+            if not license_key:
+                # pick any known license
+                for v in (self.licenses.get("prop"), self.licenses.get("normal")):
+                    if v:
+                        license_key = v
+                        break
+            # If still missing, try to request a license for the current account
+            if not license_key and getattr(self, "telegram_id", "") and self.flamebot_id:
+                self._log("⚠️ Missing license; refreshing from server…")
+                self._request_license_for_account(self.current_account_type or "prop")
+                # try again
+                license_key = self._current_license() or self.licenses.get("prop") or self.licenses.get("normal")
+
+            params = {"user_id": self.flamebot_id}
+            if license_key:
+                params["license_key"] = license_key
+            resp = self._get_backend_json("miniapp/api/state", params)
+            if not resp or resp.get("status") != "OK":
+                return
+            state = resp.get("state") or {}
+            licenses = state.get("licenses") or {}
+            prop = licenses.get("prop")
+            normal = licenses.get("normal")
+            # Debug: log what the backend returned for licenses (masked)
+            try:
+                self._log(
+                    f"[app_state] flamebot_id={self.flamebot_id} prop={self._mask_license_key(prop or '')} normal={self._mask_license_key(normal or '')} ea_active={bool(state.get('ea_active', False))} active={state.get('active_account_type')}"
+                )
+            except Exception:
+                pass
+            if prop:
+                self._set_license("prop", prop)
+            if normal:
+                self._set_license("normal", normal)
+            # Update EA indicators
+            active = state.get("active_account_type")
+            payload = {
+                "ea_active": state.get("ea_active", False),
+                "active_account_type": active,
+            }
+            try:
+                self._apply_platform_ea_state_from_response({"platform": self.platform}, payload)
+            except Exception:
+                pass
+            # Refresh UI labels
+            try:
+                self._update_active_profile_label()
+                self.flamebot_id_label.setText(f"FlameBot ID: {self.flamebot_id}")
+                cur = self.current_account_type or "prop"
+                cur_lic = self.licenses.get(cur, "")
+                self.license_key_label.setText(f"License Key ({cur.upper()}): {self._mask_license_key(cur_lic)}")
+            except Exception:
+                pass
+            try:
+                self._save_settings()
+            except Exception:
+                pass
+
+            # Start polling only if configuration is complete.
+            try:
+                self._check_and_start_polling()
+            except Exception:
+                pass
+        except Exception:
+            return
+
+    def _set_license(self, account: str, license_key: str) -> None:
+        """Set a license in memory with logging and minimal safeguards.
+
+        This helper centralizes assignments so we can detect when both
+        `prop` and `normal` end up with the same value unexpectedly.
+        """
+        if account not in {"prop", "normal"}:
+            return
+        old = self.licenses.get(account)
+        other = "normal" if account == "prop" else "prop"
+        other_val = self.licenses.get(other)
+        if license_key and old == license_key:
+            return
+        # If the other account currently holds the same key, log warning
+        if license_key and other_val and other_val == license_key and old != license_key:
+            self._dev_log("license_collision_warning", f"{account} == {other}")
+        self.licenses[account] = license_key
+        # Never show license chatter in UI.
+        self._dev_log("license_set", f"{account} -> {self._mask_license_key(license_key or '')}")
+    
+    def _fetch_user_app_state(self) -> None:
+        """Fetch user app state to determine if this is a new or returning user.
+        
+        CRITICAL: This determines whether to auto-load settings or wait for user configuration.
+        - Returning users have both execution_mode and symbol_mode set
+        - New users have neither or only one set
+        """
+        if not self.flamebot_id:
+            self._log("⚠️ Cannot fetch app state - no FlameBot ID")
+            self.user_execution_mode = None
+            self.user_symbol_mode = None
+            self.user_has_configuration = False
+            return
+
+        # Default to None (new user state)
+        self.user_execution_mode = None
+        self.user_symbol_mode = None
+        self.user_has_configuration = False
+
+        if not self._is_online():
+            return
+
+        auth_params = None
+        try:
+            auth_params = self._resolve_backend_auth()
+        except Exception:
+            auth_params = None
+        if not auth_params:
+            self._log("⚠️ Cannot fetch app state - no auth params")
+            return
+
+        if bool(getattr(self, "_app_state_inflight", False)):
+            try:
+                started_at = float(getattr(self, "_app_state_started_at", 0.0) or 0.0)
+                if started_at > 0 and (time.time() - started_at) > float(APP_STATE_STUCK_SEC or 20.0):
+                    self._dev_log("app_state_stuck_reset", f"age={(time.time() - started_at):.1f}s")
+                    self._app_state_inflight = False
+            except Exception:
+                pass
+            if bool(getattr(self, "_app_state_inflight", False)):
+                return
+
+        self._app_state_inflight = True
+        try:
+            self._app_state_started_at = float(time.time())
+        except Exception:
+            self._app_state_started_at = 0.0
+        self._app_state_seq += 1
+        seq = int(self._app_state_seq)
+        self._app_state_expected_seq = seq
+
+        task = _BackendPollTask(
+            seq,
+            self.backend_url,
+            auth_params,
+            resources=["get_lot_settings", "get_symbol_settings"],
+        )
+        task.signals.finished.connect(self._on_app_state_poll_finished)
+        task.signals.error.connect(self._on_app_state_poll_error)
+        self._backend_pool.start(task)
+
+    def _on_app_state_poll_error(self, seq: int, auth_params: dict, message: str) -> None:
+        if seq != getattr(self, "_app_state_expected_seq", 0):
+            return
+        self._app_state_inflight = False
+        try:
+            self._app_state_started_at = 0.0
+        except Exception:
+            pass
+        self.user_execution_mode = None
+        self.user_symbol_mode = None
+        self.user_has_configuration = False
+        try:
+            self._dev_log("app_state_poll_error", str(message or ""))
+        except Exception:
+            pass
+
+    def _on_app_state_poll_finished(self, seq: int, auth_params: dict, responses: dict) -> None:
+        if seq != getattr(self, "_app_state_expected_seq", 0):
+            return
+        self._app_state_inflight = False
+        try:
+            self._app_state_started_at = 0.0
+        except Exception:
+            pass
+
+        lot_resp = (responses or {}).get("get_lot_settings")
+        sym_resp = (responses or {}).get("get_symbol_settings")
+
+        # Extract modes (None if not configured / not found)
+        try:
+            if isinstance(lot_resp, dict) and lot_resp.get("status") == "OK":
+                self.user_execution_mode = lot_resp.get("execution_mode")
+                self._log(f"[app_state] ✅ execution_mode: {self.user_execution_mode}")
+            else:
+                self.user_execution_mode = None
+                self._log("[app_state] ❌ execution_mode: None (not configured)")
+        except Exception:
+            self.user_execution_mode = None
+
+        try:
+            if isinstance(sym_resp, dict) and sym_resp.get("status") == "OK":
+                self.user_symbol_mode = sym_resp.get("symbol_mode")
+                self._log(f"[app_state] ✅ symbol_mode: {self.user_symbol_mode}")
+            else:
+                self.user_symbol_mode = None
+                self._log("[app_state] ❌ symbol_mode: None (not configured)")
+        except Exception:
+            self.user_symbol_mode = None
+
+        self.user_has_configuration = bool(self.user_execution_mode and self.user_symbol_mode)
+        if self.user_has_configuration:
+            self._log("[app_state] ✅ RETURNING USER - Configuration COMPLETE")
+        else:
+            self._log("[app_state] 🆕 NEW USER - Configuration INCOMPLETE (ea_status only)")
+
+        # Always start the timer so we at least keep EA status fresh.
+        try:
+            if not self.backend_timer.isActive():
+                self.backend_timer.start()
+        except Exception:
+            pass
+        try:
+            self._poll_backend_state_all_platforms()
+        except Exception:
+            pass
+    
+    def _check_and_start_polling(self) -> None:
+        """Check if user now has complete configuration and start polling if ready.
+        
+        Called after successful save operations to enable polling for new users.
+        """
+        if not self.user_execution_mode or not self.user_symbol_mode:
+            self._log("ℹ️ Configuration incomplete - polling not started")
+            return
+        
+        # Configuration is complete
+        self.user_has_configuration = True
+        self._log(f"✅ Configuration complete: execution={self.user_execution_mode}, symbols={self.user_symbol_mode}")
+        
+        # Start polling if not already active
+        if not self.backend_timer.isActive():
+            self._log("✅ Settings saved")
+            self.backend_timer.start()
+            self._poll_backend_state_all_platforms()
+        else:
+            self._log("✅ Live sync already active")
+
+    def _as_bool(self, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "ok"}
+        return False
+
+    def _scheduler_validation_message(self) -> str:
+        return "Scheduler is enabled. Please set both Pause and Resume day/time, or turn Scheduler OFF."
+
+    def _is_valid_hhmm(self, text: Optional[str]) -> bool:
+        s = (text or "").strip()
+        if not s:
+            return False
+        if len(s) != 5 or s[2] != ":":
+            return False
+        hh = s[:2]
+        mm = s[3:]
+        if not (hh.isdigit() and mm.isdigit()):
+            return False
+        h = int(hh)
+        m = int(mm)
+        return 0 <= h <= 23 and 0 <= m <= 59
+
+    def _hhmm_payload_value(self, text: Optional[str]) -> Optional[str]:
+        """Return a clean HH:MM string for backend payloads, or None.
+
+        The UI may contain input-mask placeholders (e.g. '__:__', '23:__').
+        We only persist values that pass strict HH:MM validation.
+        """
+        s = (text or "").strip()
+        return s if self._is_valid_hhmm(s) else None
+
+    def _populate_hour_combo(self, combo: QtWidgets.QComboBox) -> None:
+        if combo is None:
+            return
+        combo.clear()
+        combo.addItem("Select hour", None)
+        for h in range(24):
+            combo.addItem(f"{h:02d}", h)
+
+    def _populate_minute_combo(self, combo: QtWidgets.QComboBox) -> None:
+        if combo is None:
+            return
+        combo.clear()
+        combo.addItem("Select minute", None)
+        for m in range(60):
+            combo.addItem(f"{m:02d}", m)
+
+    def _get_int_combo_value(self, combo: QtWidgets.QComboBox, min_v: int, max_v: int) -> Optional[int]:
+        if combo is None:
+            return None
+        try:
+            v = combo.currentData()
+        except Exception:
+            v = None
+        if v is None:
+            return None
+        try:
+            vi = int(v)
+        except Exception:
+            return None
+        return vi if min_v <= vi <= max_v else None
+
+    def _set_int_combo_value(self, combo: QtWidgets.QComboBox, value: Optional[int]) -> None:
+        if combo is None:
+            return
+        target = None
+        if value is not None:
+            try:
+                target = int(value)
+            except Exception:
+                target = None
+        try:
+            for i in range(combo.count()):
+                if combo.itemData(i) == target:
+                    combo.setCurrentIndex(i)
+                    return
+        except Exception:
+            pass
+        try:
+            combo.setCurrentIndex(0)
+        except Exception:
+            pass
+
+    def _populate_dow_combo(self, combo: QtWidgets.QComboBox) -> None:
+        if combo is None:
+            return
+        combo.clear()
+        combo.addItem("Select day", None)
+        days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        for i, name in enumerate(days):
+            combo.addItem(name, i)
+
+    def _get_dow_value(self, combo: QtWidgets.QComboBox) -> Optional[int]:
+        if combo is None:
+            return None
+        try:
+            v = combo.currentData()
+        except Exception:
+            v = None
+        if v is None:
+            return None
+        try:
+            vi = int(v)
+        except Exception:
+            return None
+        return vi if 0 <= vi <= 6 else None
+
+    def _set_dow_value(self, combo: QtWidgets.QComboBox, value: Optional[int]) -> None:
+        if combo is None:
+            return
+        target = None
+        if value is not None:
+            try:
+                target = int(value)
+            except Exception:
+                target = None
+        try:
+            for i in range(combo.count()):
+                if combo.itemData(i) == target:
+                    combo.setCurrentIndex(i)
+                    return
+        except Exception:
+            pass
+        # fallback to "Select day"
+        try:
+            combo.setCurrentIndex(0)
+        except Exception:
+            pass
+
+    def _update_scheduler_visibility(self) -> None:
+        active = bool(getattr(self, "scheduler_active", False))
+        for name in (
+            "gls_scheduler_fields_container",
+            "psl_scheduler_fields_container",
+        ):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.setVisible(active)
+                except Exception:
+                    pass
+
+    def _apply_scheduler_state_to_ui(self) -> None:
+        """Apply current scheduler state to both GLS and PSL widgets."""
+        active = bool(getattr(self, "scheduler_active", False))
+        pause_day = getattr(self, "scheduler_pause_day", None)
+        pause_time = (getattr(self, "scheduler_pause_time", None) or "").strip()
+        resume_day = getattr(self, "scheduler_resume_day", None)
+        resume_time = (getattr(self, "scheduler_resume_time", None) or "").strip()
+
+        for prefix in ("gls", "psl"):
+            cb = getattr(self, f"{prefix}_scheduler_active_checkbox", None)
+            p_day = getattr(self, f"{prefix}_scheduler_pause_day", None)
+            p_hour = getattr(self, f"{prefix}_scheduler_pause_hour", None)
+            p_min = getattr(self, f"{prefix}_scheduler_pause_minute", None)
+            r_day = getattr(self, f"{prefix}_scheduler_resume_day", None)
+            r_hour = getattr(self, f"{prefix}_scheduler_resume_hour", None)
+            r_min = getattr(self, f"{prefix}_scheduler_resume_minute", None)
+
+            try:
+                if cb is not None:
+                    cb.blockSignals(True)
+                    cb.setChecked(active)
+                    cb.blockSignals(False)
+            except Exception:
+                pass
+            try:
+                self._set_dow_value(p_day, pause_day)
+            except Exception:
+                pass
+            try:
+                if p_hour is not None and p_min is not None and self._is_valid_hhmm(pause_time):
+                    hh = int(pause_time[:2])
+                    mm = int(pause_time[3:])
+                    p_hour.blockSignals(True)
+                    p_min.blockSignals(True)
+                    self._set_int_combo_value(p_hour, hh)
+                    self._set_int_combo_value(p_min, mm)
+                    p_hour.blockSignals(False)
+                    p_min.blockSignals(False)
+                elif p_hour is not None and p_min is not None:
+                    p_hour.blockSignals(True)
+                    p_min.blockSignals(True)
+                    self._set_int_combo_value(p_hour, None)
+                    self._set_int_combo_value(p_min, None)
+                    p_hour.blockSignals(False)
+                    p_min.blockSignals(False)
+            except Exception:
+                pass
+            try:
+                self._set_dow_value(r_day, resume_day)
+            except Exception:
+                pass
+            try:
+                if r_hour is not None and r_min is not None and self._is_valid_hhmm(resume_time):
+                    hh = int(resume_time[:2])
+                    mm = int(resume_time[3:])
+                    r_hour.blockSignals(True)
+                    r_min.blockSignals(True)
+                    self._set_int_combo_value(r_hour, hh)
+                    self._set_int_combo_value(r_min, mm)
+                    r_hour.blockSignals(False)
+                    r_min.blockSignals(False)
+                elif r_hour is not None and r_min is not None:
+                    r_hour.blockSignals(True)
+                    r_min.blockSignals(True)
+                    self._set_int_combo_value(r_hour, None)
+                    self._set_int_combo_value(r_min, None)
+                    r_hour.blockSignals(False)
+                    r_min.blockSignals(False)
+            except Exception:
+                pass
+
+        self._update_scheduler_visibility()
+
+    def _sync_scheduler_state_from_ui(self) -> None:
+        """Read scheduler values from the currently-visible (aliased) widgets."""
+        cb = getattr(self, "scheduler_active_checkbox", None)
+        p_day = getattr(self, "scheduler_pause_day_combo", None)
+        p_hour = getattr(self, "scheduler_pause_hour_combo", None)
+        p_min = getattr(self, "scheduler_pause_minute_combo", None)
+        p_time = getattr(self, "scheduler_pause_time_input", None)
+        r_day = getattr(self, "scheduler_resume_day_combo", None)
+        r_hour = getattr(self, "scheduler_resume_hour_combo", None)
+        r_min = getattr(self, "scheduler_resume_minute_combo", None)
+        r_time = getattr(self, "scheduler_resume_time_input", None)
+
+        try:
+            self.scheduler_active = bool(cb.isChecked()) if cb is not None else False
+        except Exception:
+            self.scheduler_active = False
+        try:
+            self.scheduler_pause_day = self._get_dow_value(p_day)
+        except Exception:
+            self.scheduler_pause_day = None
+        try:
+            if p_hour is not None and p_min is not None:
+                hh = self._get_int_combo_value(p_hour, 0, 23)
+                mm = self._get_int_combo_value(p_min, 0, 59)
+                self.scheduler_pause_time = f"{hh:02d}:{mm:02d}" if (hh is not None and mm is not None) else None
+            else:
+                txt = (p_time.text() if p_time is not None else "").strip()
+                self.scheduler_pause_time = txt or None
+        except Exception:
+            self.scheduler_pause_time = None
+        try:
+            self.scheduler_resume_day = self._get_dow_value(r_day)
+        except Exception:
+            self.scheduler_resume_day = None
+        try:
+            if r_hour is not None and r_min is not None:
+                hh = self._get_int_combo_value(r_hour, 0, 23)
+                mm = self._get_int_combo_value(r_min, 0, 59)
+                self.scheduler_resume_time = f"{hh:02d}:{mm:02d}" if (hh is not None and mm is not None) else None
+            else:
+                txt = (r_time.text() if r_time is not None else "").strip()
+                self.scheduler_resume_time = txt or None
+        except Exception:
+            self.scheduler_resume_time = None
+
+        # Keep GLS and PSL panels mirrored.
+        self._apply_scheduler_state_to_ui()
+
+    def _on_scheduler_ui_changed(self, *args) -> None:
+        self._sync_scheduler_state_from_ui()
+        self._mark_trade_control_dirty()
+        try:
+            self._update_settings_lock_state()
+        except Exception:
+            pass
+
+    def _extract_ea_active(self, payload: Optional[dict]) -> Optional[bool]:
+        """Backwards/forwards compatible EA-connected flag extractor."""
+        if not payload or not isinstance(payload, dict):
+            return None
+        for key in (
+            "ea_active",
+            "ea_connected",
+            "is_connected",
+            "ea_online",
+            "ea_logged_in",
+            "eaLoggedIn",
+            "eaConnected",
+        ):
+            if key in payload:
+                return self._as_bool(payload.get(key))
+        inner = payload.get("data")
+        if isinstance(inner, dict):
+            for key in (
+                "ea_active",
+                "ea_connected",
+                "is_connected",
+                "ea_online",
+                "ea_logged_in",
+                "eaLoggedIn",
+                "eaConnected",
+            ):
+                if key in inner:
+                    return self._as_bool(inner.get(key))
+        return None
+
+    def _render_backend_health_label(self, platform: Optional[str] = None) -> None:
+        if not hasattr(self, "backend_health_label"):
+            return
+        p = (platform or getattr(self, "platform", None) or "mt5").lower()
+        if p not in {"mt4", "mt5"}:
+            p = "mt5"
+        health = (getattr(self, "_backend_health_by_platform", {}) or {}).get(p, {}) or {}
+        streak = int(health.get("fail_streak", 0) or 0)
+        state = (getattr(self, "_backend_health_state_by_platform", {}) or {}).get(p, "unknown")
+
+        if state == "ok":
+            self.backend_health_label.setText("Service: OK")
+            self.backend_health_label.setStyleSheet("font-size: 12px; color: #4caf50;")
+            return
+        if state == "degraded":
+            self.backend_health_label.setText(f"Service: Unstable ({streak} failed poll{'s' if streak != 1 else ''})")
+            self.backend_health_label.setStyleSheet("font-size: 12px; color: #ffb300;")
+            return
+        if state == "down":
+            # User-facing UI must never show raw exception strings.
+            # Technical details go to developer logs via _record_backend_health callers.
+            self.backend_health_label.setText(f"Service: Offline ({streak} failures)")
+            self.backend_health_label.setStyleSheet("font-size: 12px; color: #ef5350;")
+            return
+
+        self.backend_health_label.setText("Service: Unknown")
+        self.backend_health_label.setStyleSheet("font-size: 12px; color: #7a7a7a;")
+
+    def _record_backend_health(self, platform: str, ok: bool, message: str = "") -> None:
+        p = (platform or getattr(self, "platform", None) or "mt5").lower()
+        if p not in {"mt4", "mt5"}:
+            p = "mt5"
+
+        store = getattr(self, "_backend_health_by_platform", None)
+        if not isinstance(store, dict):
+            self._backend_health_by_platform = {
+                "mt4": {"fail_streak": 0, "last_ok": 0.0, "last_error": ""},
+                "mt5": {"fail_streak": 0, "last_ok": 0.0, "last_error": ""},
+            }
+            store = self._backend_health_by_platform
+
+        entry = store.get(p) or {"fail_streak": 0, "last_ok": 0.0, "last_error": ""}
+        if ok:
+            entry["fail_streak"] = 0
+            entry["last_ok"] = time.time()
+            entry["last_error"] = ""
+            self._backend_health_state_by_platform[p] = "ok"
+        else:
+            entry["fail_streak"] = int(entry.get("fail_streak", 0) or 0) + 1
+            if message:
+                entry["last_error"] = str(message)
+            self._backend_health_state_by_platform[p] = "degraded" if int(entry["fail_streak"]) < 3 else "down"
+
+        store[p] = entry
+
+        current = (getattr(self, "platform", None) or "mt5").lower()
+        if current not in {"mt4", "mt5"}:
+            current = "mt5"
+        if p == current:
+            try:
+                self._render_backend_health_label(p)
+            except Exception:
+                pass
+
+        # Avoid spamming: show a toast only on a few milestones.
+        if (not ok) and int(entry.get("fail_streak", 0) or 0) in {3, 6, 12}:
+            try:
+                self._show_toast("Connection unstable — retrying…")
+            except Exception:
+                pass
+
+    def _poll_backend_state(self) -> None:
+        # CRITICAL HARD GUARD: NEVER poll without configuration
+        # This prevents new users from triggering backend errors
+        if not self.user_execution_mode or not self.user_symbol_mode:
+            # Dev-only diagnostics (avoid user-facing toasts for this internal state).
+            if not getattr(self, "_poll_block_logged", False):
+                try:
+                    self._dev_log(
+                        "poll_blocked",
+                        f"execution={self.user_execution_mode} symbols={self.user_symbol_mode}",
+                    )
+                except Exception:
+                    pass
+                self._poll_block_logged = True
+            return
+        
+        # Reset the block log flag when configuration is complete
+        self._poll_block_logged = False
+        
+        auth_params = self._resolve_backend_auth()
+        if not auth_params:
+            return
+        current_creds = (auth_params.get("user_id", ""), auth_params.get("license_key", ""))
+        if self._last_polled_creds != current_creds:
+            flamebot_id, license_key = current_creds
+            masked = self._mask_license_key(license_key)
+            self._log(f"[poll] Polling with FlameBot ID {flamebot_id} ({masked})")
+            self._last_polled_creds = current_creds
+
+        self._schedule_backend_poll(auth_params)
+
+    def _can_poll_backend(self) -> bool:
+        # Core invariant: never poll until BOTH modes exist.
+        if not bool(getattr(self, "user_execution_mode", None) and getattr(self, "user_symbol_mode", None)):
+            return False
+
+        # Do not poll while the user is actively editing settings.
+        try:
+            if bool(getattr(self, "gls_edit_mode", False)) or bool(getattr(self, "psl_edit_mode", False)):
+                return False
+        except Exception:
+            pass
+
+        # Honor the temporary suppression window used when entering edit mode.
+        try:
+            if time.time() <= float(getattr(self, "_suppress_backend_ui_hydration_until", 0) or 0):
+                return False
+        except Exception:
+            pass
+
+        return True
+
+    def _poll_backend_state_with_auth(self, auth_params: Optional[dict]) -> None:
+        if not auth_params:
+            return
+        self._schedule_backend_poll(auth_params)
+
+    def _backend_ui_hydration_allowed(self) -> bool:
+        return time.time() > getattr(self, "_suppress_backend_ui_hydration_until", 0)
+
+    def _start_settings_hydration(self, platform: Optional[str] = None, account_type: Optional[str] = None) -> None:
+        """Start (or skip) settings hydration using freshness TTL per context."""
+        try:
+            ctx = self._context_key(platform=platform, account_type=account_type)
+        except Exception:
+            ctx = None
+        if not ctx:
+            return
+
+        now = time.time()
+        last = getattr(self, "_context_hydrated_at", {}).get(ctx)
+        fresh = bool(last and (now - last) < HYDRATION_TTL)
+
+        # If we have fresh cached state, restore it immediately for a stable UI.
+        if fresh and self._restore_cached_context_state(ctx):
+            try:
+                self._settings_hydration_pending[ctx] = False
+                self._settings_hydration_started_at.pop(ctx, None)
+            except Exception:
+                pass
+            return
+
+        # Cache current flags as last-known-good if not already cached
+        try:
+            if ctx not in getattr(self, "_last_good_config_by_ctx", {}):
+                self._last_good_config_by_ctx[ctx] = {
+                    "lot": bool(getattr(self, "_saved_lot_configured", False)),
+                    "symbol": bool(getattr(self, "_saved_symbol_configured", False)),
+                    "psl": bool(getattr(self, "_saved_psl_configured", False)),
+                }
+        except Exception:
+            pass
+
+        if fresh:
+            try:
+                self._settings_hydration_pending[ctx] = False
+                self._settings_hydration_started_at.pop(ctx, None)
+            except Exception:
+                pass
+            # Even if fresh, ensure cached state is shown
+            self._restore_cached_context_state(ctx)
+            return
+
+        try:
+            self._settings_hydration_pending[ctx] = True
+            self._settings_hydration_started_at[ctx] = time.time()
+        except Exception:
+            pass
+
+        # Kick off backend poll for this context when stale
+        try:
+            platform_key = (platform or getattr(self, "platform", None) or "mt5").lower()
+            auth = self._resolve_backend_auth_for_platform(platform_key)
+            if auth:
+                self._poll_backend_state_with_auth(auth)
+        except Exception:
+            pass
+
+    def _cache_context_state(self, ctx: str) -> None:
+        """Persist the current UI state for a context to allow instant restores."""
+        if not ctx:
+            return
+        try:
+            self._context_state_by_ctx[ctx] = {
+                "lot_mode": getattr(self, "lot_mode", None),
+                "custom_lot": getattr(self, "custom_lot", None),
+                "_saved_lot_mode": getattr(self, "_saved_lot_mode", None),
+                "_saved_custom_lot": getattr(self, "_saved_custom_lot", None),
+                "_saved_lot_configured": bool(getattr(self, "_saved_lot_configured", False)),
+                "symbol_mode": getattr(self, "symbol_mode", None),
+                "symbols_allowed": list(getattr(self, "symbols_allowed", [])) if isinstance(getattr(self, "symbols_allowed", []), list) else [],
+                "available_symbols": list(getattr(self, "available_symbols", [])) if isinstance(getattr(self, "available_symbols", []), list) else [],
+                "_saved_symbol_mode": getattr(self, "_saved_symbol_mode", None),
+                "_saved_symbols_allowed": list(getattr(self, "_saved_symbols_allowed", [])) if isinstance(getattr(self, "_saved_symbols_allowed", []), list) else [],
+                "_saved_symbol_configured": bool(getattr(self, "_saved_symbol_configured", False)),
+                "per_symbol_lots": dict(getattr(self, "per_symbol_lots", {})) if isinstance(getattr(self, "per_symbol_lots", {}), dict) else {},
+                "_saved_per_symbol_lots": dict(getattr(self, "_saved_per_symbol_lots", {})) if isinstance(getattr(self, "_saved_per_symbol_lots", {}), dict) else {},
+                "_saved_psl_configured": bool(getattr(self, "_saved_psl_configured", False)),
+                "allow_message_close": bool(getattr(self, "allow_message_close", False)),
+                "allow_message_breakeven": bool(getattr(self, "allow_message_breakeven", False)),
+                "allow_secure_half": bool(getattr(self, "allow_secure_half", False)),
+                "allow_multiple_signals_per_symbol": bool(getattr(self, "allow_multiple_signals_per_symbol", False)),
+                "_saved_allow_message_close": bool(getattr(self, "_saved_allow_message_close", False)),
+                "_saved_allow_message_breakeven": bool(getattr(self, "_saved_allow_message_breakeven", False)),
+                "_saved_allow_secure_half": bool(getattr(self, "_saved_allow_secure_half", False)),
+                "_saved_allow_multiple_signals": bool(getattr(self, "_saved_allow_multiple_signals", False)),
+                "entry_mode": getattr(self, "entry_mode", None),
+            }
+        except Exception:
+            pass
+
+    def _restore_cached_context_state(self, ctx: Optional[str]) -> bool:
+        """Restore cached UI state for a context; returns True if restored."""
+        if not ctx:
+            return False
+        snap = getattr(self, "_context_state_by_ctx", {}).get(ctx)
+        if not snap:
+            return False
+        try:
+            self.lot_mode = snap.get("lot_mode", self.lot_mode)
+            self.custom_lot = snap.get("custom_lot", self.custom_lot)
+            self._saved_lot_mode = snap.get("_saved_lot_mode", self._saved_lot_mode)
+            self._saved_custom_lot = snap.get("_saved_custom_lot", self._saved_custom_lot)
+            self._saved_lot_configured = bool(snap.get("_saved_lot_configured", self._saved_lot_configured))
+
+            self.symbol_mode = snap.get("symbol_mode", self.symbol_mode)
+            self.symbols_allowed = list(snap.get("symbols_allowed", self.symbols_allowed))
+            self.available_symbols = list(snap.get("available_symbols", self.available_symbols))
+            self._saved_symbol_mode = snap.get("_saved_symbol_mode", self._saved_symbol_mode)
+            self._saved_symbols_allowed = list(snap.get("_saved_symbols_allowed", self._saved_symbols_allowed))
+            self._saved_symbol_configured = bool(snap.get("_saved_symbol_configured", self._saved_symbol_configured))
+
+            self.per_symbol_lots = dict(snap.get("per_symbol_lots", self.per_symbol_lots))
+            self._saved_per_symbol_lots = dict(snap.get("_saved_per_symbol_lots", self._saved_per_symbol_lots))
+            self._saved_psl_configured = bool(snap.get("_saved_psl_configured", self._saved_psl_configured))
+
+            self.allow_message_close = bool(snap.get("allow_message_close", self.allow_message_close))
+            self.allow_message_breakeven = bool(snap.get("allow_message_breakeven", self.allow_message_breakeven))
+            self.allow_secure_half = bool(snap.get("allow_secure_half", self.allow_secure_half))
+            self.allow_multiple_signals_per_symbol = bool(snap.get("allow_multiple_signals_per_symbol", self.allow_multiple_signals_per_symbol))
+            self._saved_allow_message_close = bool(snap.get("_saved_allow_message_close", self._saved_allow_message_close))
+            self._saved_allow_message_breakeven = bool(snap.get("_saved_allow_message_breakeven", self._saved_allow_message_breakeven))
+            self._saved_allow_secure_half = bool(snap.get("_saved_allow_secure_half", self._saved_allow_secure_half))
+            self._saved_allow_multiple_signals = bool(snap.get("_saved_allow_multiple_signals", self._saved_allow_multiple_signals))
+
+            self.entry_mode = snap.get("entry_mode", self.entry_mode)
+
+            self._apply_lot_state_to_ui()
+            self._apply_symbol_state_to_ui()
+            self._apply_trade_control_state_to_ui()
+            self._render_config_status_labels()
+            return True
+        except Exception:
+            return False
+
+    def _poll_backend_state_all_platforms(self) -> None:
+        """Poll MT4 and MT5 continuously when credentials exist.
+
+        This keeps both platforms updated after login, without requiring
+        the user to switch platforms.
+        """
+        if not self._is_online():
+            return
+
+        # Even when configuration is incomplete, we still poll EA status so the
+        # UI can unlock quickly once the EA connects. Full settings polling stays
+        # gated by `_can_poll_backend()`.
+        can_full_poll = bool(self._can_poll_backend())
+        if not can_full_poll:
+            if not getattr(self, "_poll_block_logged", False):
+                try:
+                    self._dev_log(
+                        "full_poll_blocked",
+                        f"execution={self.user_execution_mode} symbols={self.user_symbol_mode}",
+                    )
+                except Exception:
+                    pass
+                self._poll_block_logged = True
+        else:
+            self._poll_block_logged = False
+
+        for platform in ("mt4", "mt5"):
+            auth = self._resolve_backend_auth_for_platform(platform)
+            if auth:
+                self._schedule_backend_poll(auth)
+
+    def _schedule_backend_poll(self, auth_params: dict) -> None:
+        if not self._is_online():
+            return
+        can_full_poll = bool(self._can_poll_backend())
+        platform = (auth_params.get("platform") or getattr(self, "platform", None) or "mt5").lower()
+        if platform not in {"mt4", "mt5"}:
+            platform = "mt5"
+
+        # Safety: if the last poll for this platform got stuck, reset it now.
+        try:
+            self._recover_stuck_backend_poll(platform)
+        except Exception:
+            pass
+
+        # Prevent overlapping polls per platform
+        if getattr(self, "_backend_poll_inflight_by_platform", {}).get(platform, False):
+            self._backend_poll_pending_auth_by_platform[platform] = dict(auth_params or {})
+            return
+
+        # Enforce per-resource polling intervals
+        now = time.time()
+        intervals = getattr(self, "_poll_intervals", {}) or {}
+        last_by_platform = getattr(self, "_last_poll_by_platform", {}) or {}
+        if platform not in last_by_platform:
+            last_by_platform[platform] = {
+                "ea_status": 0.0,
+                "get_lot_settings": 0.0,
+                "get_symbol_settings": 0.0,
+                "get_psl_settings": 0.0,
+            }
+            self._last_poll_by_platform = last_by_platform
+
+        due_resources: List[str] = []
+        for key, interval in intervals.items():
+            try:
+                last = float(last_by_platform.get(platform, {}).get(key, 0.0))
+            except Exception:
+                last = 0.0
+            if (now - last) >= float(interval):
+                due_resources.append(key)
+
+        if not due_resources:
+            return
+
+        # If configuration is incomplete, only poll EA status.
+        if not can_full_poll:
+            due_resources = [r for r in due_resources if r == "ea_status"]
+            if not due_resources:
+                return
+
+        for key in due_resources:
+            try:
+                last_by_platform[platform][key] = now
+            except Exception:
+                pass
+
+        self._backend_poll_inflight_by_platform[platform] = True
+        self._backend_poll_seq += 1
+        seq = self._backend_poll_seq
+        self._backend_poll_expected_seq_by_platform[platform] = seq
+        try:
+            self._backend_poll_started_meta_by_platform[platform] = (int(seq), float(time.time()))
+        except Exception:
+            pass
+
+        task = _BackendPollTask(seq, self.backend_url, auth_params, resources=due_resources)
+        task.signals.finished.connect(self._on_backend_poll_finished)
+        task.signals.error.connect(self._on_backend_poll_error)
+        self._backend_pool.start(task)
+
+    def _set_refresh_buttons_state(self, *, refreshing: bool) -> None:
+        try:
+            self._symbols_refresh_inflight = bool(refreshing)
+        except Exception:
+            pass
+
+        # Preserve text so we can restore after refresh completes.
+        if hasattr(self, "gls_refresh_symbols_btn"):
+            try:
+                if refreshing:
+                    self._gls_refresh_btn_text = getattr(self, "_gls_refresh_btn_text", self.gls_refresh_symbols_btn.text())
+                    self.gls_refresh_symbols_btn.setText("Refreshing…")
+                else:
+                    self.gls_refresh_symbols_btn.setText(getattr(self, "_gls_refresh_btn_text", "Refresh Symbols"))
+            except Exception:
+                pass
+        if hasattr(self, "psl_refresh_symbols_btn"):
+            try:
+                if refreshing:
+                    self._psl_refresh_btn_text = getattr(self, "_psl_refresh_btn_text", self.psl_refresh_symbols_btn.text())
+                    self.psl_refresh_symbols_btn.setText("Refreshing…")
+                else:
+                    self.psl_refresh_symbols_btn.setText(getattr(self, "_psl_refresh_btn_text", "Refresh Symbols"))
+            except Exception:
+                pass
+
+        # Re-apply enable/visible logic based on lock state + mode.
+        try:
+            self._update_settings_lock_state()
+        except Exception:
+            pass
+
+    def _request_symbols_refresh(self, source: str = "gls") -> None:
+        """User-initiated refresh: asks EA to re-push symbols then re-fetches settings."""
+        if getattr(self, "_symbols_refresh_inflight", False):
+            return
+
+        auth_params = self._resolve_backend_auth()
+        if not auth_params:
+            self._show_toast("❌ FlameBot ID and License Key are required.")
+            return
+
+        if not self._is_settings_unlocked(auth_params.get("platform")):
+            self._show_toast(f"❌ Settings are locked. Connect the EA for {self._normalize_account_type(getattr(self, 'current_account_type', None) or 'prop').upper()} on {self.platform.upper()} first.")
+            return
+
+        self._set_refresh_buttons_state(refreshing=True)
+        try:
+            self._show_toast("Refreshing symbols…", duration_ms=2000)
+        except Exception:
+            pass
+
+        self._backend_refresh_seq += 1
+        seq = self._backend_refresh_seq
+        self._backend_refresh_expected_seq = seq
+
+        task = _BackendRefreshSymbolsTask(
+            seq,
+            self.backend_url,
+            auth_params,
+            wait_ms=500,
+        )
+        task.signals.finished.connect(self._on_symbols_refresh_finished)
+        task.signals.error.connect(self._on_symbols_refresh_error)
+        self._backend_pool.start(task)
+
+    def _on_symbols_refresh_error(self, seq: int, auth_params: dict, message: str) -> None:
+        if seq != getattr(self, "_backend_refresh_expected_seq", 0):
+            return
+        self._set_refresh_buttons_state(refreshing=False)
+        try:
+            self._show_toast(f"❌ Refresh failed: {message}")
+        except Exception:
+            pass
+
+    def _on_symbols_refresh_finished(self, seq: int, auth_params: dict, responses: dict) -> None:
+        if seq != getattr(self, "_backend_refresh_expected_seq", 0):
+            return
+
+        prev_available = list(getattr(self, "available_symbols", []) or [])
+        prev_set = set(prev_available)
+
+        refresh_resp = (responses or {}).get("refresh_symbols")
+        sym_resp = (responses or {}).get("get_symbol_settings")
+        psl_resp = (responses or {}).get("get_psl_settings")
+
+        # If backend explicitly indicates EA is not active, show a clear message.
+        ea_offline = False
+        try:
+            if isinstance(refresh_resp, dict) and refresh_resp.get("ea_active") is False:
+                ea_offline = True
+                self._show_toast("⚠️ EA is offline. Unable to refresh symbols.")
+        except Exception:
+            ea_offline = False
+
+        # Always update available_symbols from the symbol response if present.
+        new_available: Optional[List[str]] = None
+        try:
+            if isinstance(sym_resp, dict) and sym_resp.get("status") == "OK":
+                available = (
+                    sym_resp.get("available_symbols")
+                    or sym_resp.get("symbols_available")
+                    or sym_resp.get("symbols")
+                    or sym_resp.get("symbols_all")
+                    or []
+                )
+                if isinstance(available, list):
+                    new_available = available
+                    self.available_symbols = available
+        except Exception:
+            pass
+
+        # Apply full backend snapshots only when not editing that mode.
+        try:
+            if not getattr(self, "gls_edit_mode", False) and self._backend_ui_hydration_allowed():
+                self._fetch_symbol_settings(auth_params, sym_resp if isinstance(sym_resp, dict) else None)
+        except Exception:
+            pass
+        try:
+            if not getattr(self, "psl_edit_mode", False) and self._backend_ui_hydration_allowed():
+                self._fetch_psl_settings(auth_params, psl_resp if isinstance(psl_resp, dict) else None)
+        except Exception:
+            pass
+
+        # Re-render lists immediately (fast-path) without waiting for next poll.
+        try:
+            self._refresh_symbol_list()
+        except Exception:
+            pass
+        try:
+            self._refresh_psl_list()
+        except Exception:
+            pass
+
+        self._set_refresh_buttons_state(refreshing=False)
+
+        # User feedback: success vs waiting.
+        try:
+            after_set = set(list(getattr(self, "available_symbols", []) or []))
+            if ea_offline:
+                return
+            if not isinstance(refresh_resp, dict):
+                self._show_toast("❌ Refresh request failed (network error)")
+            else:
+                # Consider it successful if we got a valid symbol settings response with any symbols.
+                ok_list = False
+                try:
+                    if isinstance(sym_resp, dict) and sym_resp.get("status") == "OK":
+                        available = (
+                            sym_resp.get("available_symbols")
+                            or sym_resp.get("symbols_available")
+                            or sym_resp.get("symbols")
+                            or sym_resp.get("symbols_all")
+                            or []
+                        )
+                        ok_list = bool(isinstance(available, list) and len(available) > 0)
+                except Exception:
+                    ok_list = False
+
+                if ok_list:
+                    self._show_toast("✅ Symbols refreshed")
+                else:
+                    # If list is still empty/unchanged, EA hasn't pushed yet.
+                    if new_available is None or after_set == prev_set:
+                        self._show_toast("⚠️ Refresh requested. Waiting for EA…")
+                    else:
+                        self._show_toast("✅ Symbols refreshed")
+        except Exception:
+            pass
+
+    def _on_backend_poll_error(self, seq: int, auth_params: dict, message: str) -> None:
+        platform = (auth_params.get("platform") or getattr(self, "platform", None) or "mt5").lower()
+        if platform not in {"mt4", "mt5"}:
+            platform = "mt5"
+        if seq != getattr(self, "_backend_poll_expected_seq_by_platform", {}).get(platform, 0):
+            return
+
+        self._backend_poll_inflight_by_platform[platform] = False
+        try:
+            self._backend_poll_started_meta_by_platform[platform] = (0, 0.0)
+        except Exception:
+            pass
+        try:
+            self._log(f"[poll] error: {message}")
+        except Exception:
+            pass
+
+        try:
+            self._record_backend_health(platform, ok=False, message=message)
+        except Exception:
+            pass
+
+        # Run any queued poll request for this platform
+        pending = getattr(self, "_backend_poll_pending_auth_by_platform", {}).get(platform)
+        if pending:
+            self._backend_poll_pending_auth_by_platform[platform] = None
+            try:
+                self._schedule_backend_poll(pending)
+            except Exception:
+                pass
+
+    def _on_backend_poll_finished(self, seq: int, auth_params: dict, responses: dict) -> None:
+        polled_platform = (auth_params.get("platform") or "").lower()
+        if polled_platform not in {"mt4", "mt5"}:
+            polled_platform = (getattr(self, "platform", None) or "mt5").lower()
+        if seq != getattr(self, "_backend_poll_expected_seq_by_platform", {}).get(polled_platform, 0):
+            return
+
+        self._backend_poll_inflight_by_platform[polled_platform] = False
+        try:
+            self._backend_poll_started_meta_by_platform[polled_platform] = (0, 0.0)
+        except Exception:
+            pass
+
+        # Backend health: treat as reachable if ANY requested resource returned a non-network error payload.
+        try:
+            requested = []
+            try:
+                requested = list((responses or {}).get("_polled") or [])
+            except Exception:
+                requested = []
+            any_reachable = False
+            first_err = ""
+            for key in requested:
+                payload = (responses or {}).get(key)
+                if isinstance(payload, dict):
+                    if (payload.get("status") or "").upper() != "NET_ERROR":
+                        any_reachable = True
+                        break
+                    if not first_err:
+                        first_err = str(payload.get("message") or "")
+                elif payload is not None and not first_err:
+                    first_err = "Invalid response"
+            if any_reachable:
+                self._record_backend_health(polled_platform, ok=True)
+            else:
+                self._record_backend_health(polled_platform, ok=False, message=first_err or "No response")
+        except Exception:
+            pass
+
+        # Cache responses for instant refresh when switching platforms
+        try:
+            uid = str((auth_params or {}).get("user_id") or "").strip()
+            key = self._platform_user_key(polled_platform, uid)
+            if not key.endswith(":"):
+                self._cached_poll_responses_by_platform[key] = dict(responses or {})
+        except Exception:
+            pass
+
+        # Always record EA status for the platform that was polled.
+        self._fetch_ea_status(auth_params, responses.get("ea_status"))
+
+        # If the poll was for a different platform than the current UI, do NOT
+        # apply lot/symbol/psl settings to the live UI (prevents MT5 poll results
+        # overwriting MT4 screen after a platform switch).
+        current_platform = (getattr(self, "platform", None) or "mt5").lower()
+        if polled_platform and polled_platform != current_platform:
+            pending = getattr(self, "_backend_poll_pending_auth_by_platform", {}).get(polled_platform)
+            if pending:
+                self._backend_poll_pending_auth_by_platform[polled_platform] = None
+                try:
+                    self._schedule_backend_poll(pending)
+                except Exception:
+                    pass
+            return
+        
+        # CRITICAL: EA-connected state is a hard boundary (NO EA = NO DATA)
+        # If EA is not connected, do NOT hydrate lot/symbol/PSL/toggles from backend responses.
+        platform = (getattr(self, "platform", None) or "mt5").lower()
+        if not self._is_settings_unlocked(platform):
+            if getattr(self, "gls_edit_mode", False):
+                self._exit_edit_mode(revert=True)
+            if getattr(self, "psl_edit_mode", False):
+                self._exit_psl_edit_mode(revert=True)
+
+            self._update_ea_status_panel()
+            self._update_settings_lock_state()
+            self._update_edit_button_state()
+            self._save_settings()
+
+            # Run any queued poll request for this platform
+            pending = getattr(self, "_backend_poll_pending_auth_by_platform", {}).get(polled_platform)
+            if pending:
+                self._backend_poll_pending_auth_by_platform[polled_platform] = None
+                try:
+                    self._schedule_backend_poll(pending)
+                except Exception:
+                    pass
+            return
+
+        self._fetch_lot_settings(auth_params, responses.get("get_lot_settings"))
+        self._fetch_symbol_settings(auth_params, responses.get("get_symbol_settings"))
+        self._fetch_psl_settings(auth_params, responses.get("get_psl_settings"))
+        self._update_ea_status_panel()
+        self._update_settings_lock_state()
+        self._update_edit_button_state()
+        self._save_settings()
+
+        # Hydration complete for this context
+        try:
+            ctx = self._context_key(platform=polled_platform, account_type=(auth_params or {}).get("account_type"))
+            self._context_hydrated_at[ctx] = time.time()
+            self._settings_hydration_pending[ctx] = False
+            try:
+                self._settings_hydration_started_at.pop(ctx, None)
+            except Exception:
+                pass
+            # Update last-good cache from freshly applied state
+            self._last_good_config_by_ctx[ctx] = {
+                "lot": bool(getattr(self, "_saved_lot_configured", False)),
+                "symbol": bool(getattr(self, "_saved_symbol_configured", False)),
+                "psl": bool(getattr(self, "_saved_psl_configured", False)),
+            }
+            self._cache_context_state(ctx)
+        except Exception:
+            pass
+
+        # Render status labels using latest state without showing loading
+        self._render_config_status_labels()
+
+        # Run any queued poll request for this platform
+        pending = getattr(self, "_backend_poll_pending_auth_by_platform", {}).get(polled_platform)
+        if pending:
+            self._backend_poll_pending_auth_by_platform[polled_platform] = None
+            try:
+                self._schedule_backend_poll(pending)
+            except Exception:
+                pass
+
+    def _fetch_ea_status(self, auth_params: dict, response: Optional[dict] = None) -> None:
+        if response is None:
+            response = self._get_backend_json("ea_status", auth_params)
+        if not response:
+            return
+        # Always record per-platform EA/account truth from this response.
+        try:
+            self._apply_platform_ea_state_from_response(auth_params, response)
+        except Exception:
+            pass
+        # Refresh label to reflect authoritative EA state
+        self._update_active_profile_label()
+
+    def _fetch_lot_settings(self, auth_params: dict, response: Optional[dict] = None) -> None:
+        if not self._backend_ui_hydration_allowed():
+            return
+        if response is None:
+            response = self._get_backend_json("get_lot_settings", auth_params)
+        if not response or response.get("status") != "OK":
+            # If backend returned an error but included authoritative EA
+            # indicators, capture them to avoid flipping UI state.
+            if response and "ea_active" in response:
+                try:
+                    self._apply_platform_ea_state_from_response(auth_params, response)
+                except Exception:
+                    pass
+            # Error / missing record means GLS lot config not present for this context
+            try:
+                ctx = self._context_key(platform=(auth_params.get("platform") or None), account_type=auth_params.get("account_type"))
+                self._backend_presence_by_context.get("lot", {})[ctx] = False
+            except Exception:
+                pass
+            return
+
+        # Backend record exists for this context.
+        try:
+            ctx = self._context_key(platform=(auth_params.get("platform") or None), account_type=auth_params.get("account_type"))
+            self._backend_presence_by_context.get("lot", {})[ctx] = True
+        except Exception:
+            pass
+        # Capture EA/account indicators if present
+        try:
+            self._apply_platform_ea_state_from_response(auth_params, response)
+        except Exception:
+            pass
+        # NOTE: EA state is tracked per-platform via `ea_states`.
+        # Update saved snapshot from backend. We always update the saved snapshot
+        # but only apply it to the live UI if the user has no unsaved edits.
+        saved_mode = response.get("lot_mode", self._saved_lot_mode) or self._saved_lot_mode
+        saved_custom = response.get("custom_lot", self._saved_custom_lot)
+        saved_configured = self._as_bool(response.get("lot_configured", self._saved_lot_configured))
+        saved_entry_mode = response.get("entry_mode", self._saved_entry_mode) or self._saved_entry_mode
+        self._saved_lot_mode = saved_mode
+        self._saved_custom_lot = saved_custom
+
+        # Track backend execution mode so GLS/PSL labels align with active mode
+        resp_exec_mode = response.get("execution_mode")
+        if isinstance(resp_exec_mode, str):
+            resp_exec_mode = resp_exec_mode.strip().lower()
+            if resp_exec_mode in ("gls", "psl"):
+                self.user_execution_mode = resp_exec_mode
+                try:
+                    self._load_trade_control_state_for_mode(resp_exec_mode, use_saved=True)
+                except Exception:
+                    pass
+
+        # Enforce backend execution mode: GLS is not configured when PSL is active.
+        if resp_exec_mode == "psl":
+            saved_configured = False
+        self._saved_lot_configured = saved_configured
+        self._saved_entry_mode = saved_entry_mode
+
+        # FINAL SPEC: Hydrate UI state from backend snapshot immediately.
+        try:
+            self.lot_mode = self._saved_lot_mode
+            self.entry_mode = self._saved_entry_mode
+        except Exception:
+            pass
+
+        # Always apply backend custom lot value.
+        custom_lot_value = saved_custom
+        if isinstance(custom_lot_value, str):
+            try:
+                custom_lot_value = float(custom_lot_value)
+            except ValueError:
+                custom_lot_value = self.custom_lot
+        self.custom_lot = custom_lot_value
+        # reflect saved configured state from backend
+        self.lot_configured = self._saved_lot_configured
+        
+        # Update Trade Control snapshots from backend immediately.
+        # IMPORTANT: GLS and PSL must NOT share these values.
+        resp_mode = response.get("execution_mode") if isinstance(response, dict) else None
+        if isinstance(resp_mode, str):
+            resp_mode = resp_mode.strip().lower()
+        if resp_mode not in ("gls", "psl"):
+            try:
+                resp_mode = (getattr(self, "user_execution_mode", None) or "gls")
+            except Exception:
+                resp_mode = "gls"
+
+        def _has_any(keys: list[str]) -> bool:
+            return any(k in response for k in keys)
+
+        gls_keys = [
+            "allow_message_close_gls",
+            "allow_message_breakeven_gls",
+            "allow_secure_half_gls",
+            "allow_multiple_signals_per_symbol_gls",
+            "entry_mode_gls",
+        ]
+        psl_keys = [
+            "allow_message_close_psl",
+            "allow_message_breakeven_psl",
+            "allow_secure_half_psl",
+            "allow_multiple_signals_per_symbol_psl",
+            "entry_mode_psl",
+        ]
+
+        try:
+            if hasattr(self, "_saved_trade_control_by_mode"):
+                gls_snap = self._saved_trade_control_by_mode.get("gls", {})
+                psl_snap = self._saved_trade_control_by_mode.get("psl", {})
+
+                if _has_any(gls_keys):
+                    gls_snap["allow_message_close"] = self._as_bool(response.get("allow_message_close_gls", False))
+                    gls_snap["allow_message_breakeven"] = self._as_bool(response.get("allow_message_breakeven_gls", False))
+                    gls_snap["allow_secure_half"] = self._as_bool(response.get("allow_secure_half_gls", False))
+                    gls_snap["allow_multiple_signals_per_symbol"] = self._as_bool(
+                        response.get("allow_multiple_signals_per_symbol_gls", False)
+                    )
+                    gls_snap["entry_mode"] = response.get("entry_mode_gls", gls_snap.get("entry_mode"))
+                elif resp_mode == "gls":
+                    gls_snap["allow_message_close"] = self._as_bool(response.get("allow_message_close", False))
+                    gls_snap["allow_message_breakeven"] = self._as_bool(response.get("allow_message_breakeven", False))
+                    gls_snap["allow_secure_half"] = self._as_bool(response.get("allow_secure_half", False))
+                    gls_snap["allow_multiple_signals_per_symbol"] = self._as_bool(
+                        response.get("allow_multiple_signals_per_symbol", False)
+                    )
+                    gls_snap["entry_mode"] = response.get("entry_mode", gls_snap.get("entry_mode"))
+
+                if _has_any(psl_keys):
+                    psl_snap["allow_message_close"] = self._as_bool(response.get("allow_message_close_psl", False))
+                    psl_snap["allow_message_breakeven"] = self._as_bool(response.get("allow_message_breakeven_psl", False))
+                    psl_snap["allow_secure_half"] = self._as_bool(response.get("allow_secure_half_psl", False))
+                    psl_snap["allow_multiple_signals_per_symbol"] = self._as_bool(
+                        response.get("allow_multiple_signals_per_symbol_psl", False)
+                    )
+                    psl_snap["entry_mode"] = response.get("entry_mode_psl", psl_snap.get("entry_mode"))
+                elif resp_mode == "psl":
+                    psl_snap["allow_message_close"] = self._as_bool(response.get("allow_message_close", False))
+                    psl_snap["allow_message_breakeven"] = self._as_bool(response.get("allow_message_breakeven", False))
+                    psl_snap["allow_secure_half"] = self._as_bool(response.get("allow_secure_half", False))
+                    psl_snap["allow_multiple_signals_per_symbol"] = self._as_bool(
+                        response.get("allow_multiple_signals_per_symbol", False)
+                    )
+                    psl_snap["entry_mode"] = response.get("entry_mode", psl_snap.get("entry_mode"))
+
+                self._saved_trade_control_by_mode["gls"] = dict(gls_snap)
+                self._saved_trade_control_by_mode["psl"] = dict(psl_snap)
+                if hasattr(self, "_trade_control_by_mode"):
+                    self._trade_control_by_mode["gls"] = dict(gls_snap)
+                    self._trade_control_by_mode["psl"] = dict(psl_snap)
+        except Exception:
+            pass
+
+        # Scheduler (mode-independent)
+        try:
+            self.scheduler_active = self._as_bool(response.get("scheduler_active", False))
+            pd = response.get("scheduler_pause_day", None)
+            rd = response.get("scheduler_resume_day", None)
+            self.scheduler_pause_day = int(pd) if pd is not None and str(pd).strip() != "" else None
+            self.scheduler_resume_day = int(rd) if rd is not None and str(rd).strip() != "" else None
+            self.scheduler_pause_time = (str(response.get("scheduler_pause_time")) if response.get("scheduler_pause_time") is not None else "").strip() or None
+            self.scheduler_resume_time = (str(response.get("scheduler_resume_time")) if response.get("scheduler_resume_time") is not None else "").strip() or None
+
+            # Update saved snapshot from backend
+            self._saved_scheduler_active = bool(self.scheduler_active)
+            self._saved_scheduler_pause_day = self.scheduler_pause_day
+            self._saved_scheduler_pause_time = self.scheduler_pause_time
+            self._saved_scheduler_resume_day = self.scheduler_resume_day
+            self._saved_scheduler_resume_time = self.scheduler_resume_time
+            self._apply_scheduler_state_to_ui()
+        except Exception:
+            pass
+
+        # Apply to live UI state immediately.
+        try:
+            self._load_trade_control_state_for_mode(self._active_settings_mode(), use_saved=True)
+        except Exception:
+            pass
+
+        # Backwards-compatible single-value snapshots (align to visible mode).
+        try:
+            visible_mode = self._active_settings_mode()
+            if hasattr(self, "_saved_trade_control_by_mode"):
+                vis = self._saved_trade_control_by_mode.get(visible_mode, {})
+                self._saved_allow_message_close = bool(vis.get("allow_message_close", False))
+                self._saved_allow_message_breakeven = bool(vis.get("allow_message_breakeven", False))
+                self._saved_allow_secure_half = bool(vis.get("allow_secure_half", False))
+                self._saved_allow_multiple_signals = bool(vis.get("allow_multiple_signals_per_symbol", False))
+                self._saved_entry_mode = vis.get("entry_mode", self._saved_entry_mode)
+        except Exception:
+            pass
+        
+        self._apply_lot_state_to_ui()
+
+    def _fetch_symbol_settings(self, auth_params: dict, response: Optional[dict] = None) -> None:
+        if not self._backend_ui_hydration_allowed():
+            return
+        if response is None:
+            response = self._get_backend_json("get_symbol_settings", auth_params)
+        if not response or response.get("status") != "OK":
+            if response and "ea_active" in response:
+                try:
+                    self._apply_platform_ea_state_from_response(auth_params, response)
+                except Exception:
+                    pass
+            # Error / missing record means GLS symbols config not present for this context
+            try:
+                ctx = self._context_key(platform=(auth_params.get("platform") or None), account_type=auth_params.get("account_type"))
+                self._backend_presence_by_context.get("symbol", {})[ctx] = False
+            except Exception:
+                pass
+            return
+
+        # Backend record exists for this context.
+        try:
+            ctx = self._context_key(platform=(auth_params.get("platform") or None), account_type=auth_params.get("account_type"))
+            self._backend_presence_by_context.get("symbol", {})[ctx] = True
+        except Exception:
+            pass
+        # Capture EA/account indicators if present
+        try:
+            self._apply_platform_ea_state_from_response(auth_params, response)
+        except Exception:
+            pass
+
+        # Update saved snapshot from backend and apply to live UI immediately.
+        saved_mode = response.get("symbol_mode", self._saved_symbol_mode) or self._saved_symbol_mode
+        available = (
+            response.get("available_symbols")
+            or response.get("symbols_available")
+            or response.get("symbols")
+            or response.get("symbols_all")
+            or []
+        )
+        if isinstance(available, list):
+            self.available_symbols = available
+        saved_allowed = response.get("symbols_allowed", None)
+        if isinstance(saved_allowed, list):
+            # Backend is authoritative, even if empty.
+            self._saved_symbols_allowed = saved_allowed
+        saved_configured = self._as_bool(response.get("symbol_configured", self._saved_symbol_configured))
+
+        # Track backend execution mode (may be returned by this endpoint too)
+        resp_exec_mode = response.get("execution_mode") if isinstance(response, dict) else None
+        if isinstance(resp_exec_mode, str):
+            resp_exec_mode = resp_exec_mode.strip().lower()
+            if resp_exec_mode in ("gls", "psl"):
+                self.user_execution_mode = resp_exec_mode
+        if resp_exec_mode == "psl":
+            saved_configured = False
+
+        self._saved_symbol_mode = saved_mode
+        self._saved_symbol_configured = saved_configured
+
+        # Apply saved allowed-symbols and configured flag to UI immediately.
+        self.symbols_allowed = list(self._saved_symbols_allowed)
+        self.symbol_mode = self._saved_symbol_mode
+        self.symbol_configured = self._saved_symbol_configured
+
+        # Update UI controls
+        self._apply_symbol_state_to_ui()
+
+    def _fetch_psl_settings(self, auth_params: dict, response: Optional[dict] = None) -> None:
+        """Fetch PSL (Per-Symbol Lot) settings from backend."""
+        if not self._backend_ui_hydration_allowed():
+            return
+        if response is None:
+            response = self._get_backend_json("get_psl_settings", auth_params)
+        if not response or response.get("status") != "OK":
+            if response and "ea_active" in response:
+                try:
+                    self._apply_platform_ea_state_from_response(auth_params, response)
+                except Exception:
+                    pass
+            # Error / missing record means PSL config not present for this context
+            try:
+                ctx = self._context_key(platform=(auth_params.get("platform") or None), account_type=auth_params.get("account_type"))
+                self._backend_presence_by_context.get("psl", {})[ctx] = False
+            except Exception:
+                pass
+            return
+
+        # Backend record exists for this context.
+        try:
+            ctx = self._context_key(platform=(auth_params.get("platform") or None), account_type=auth_params.get("account_type"))
+            self._backend_presence_by_context.get("psl", {})[ctx] = True
+        except Exception:
+            pass
+        # Capture EA/account indicators if present
+        try:
+            self._apply_platform_ea_state_from_response(auth_params, response)
+        except Exception:
+            pass
+        
+        # Update PSL data from backend
+        per_symbol_lots = response.get("per_symbol_lots", {}) or {}
+        if isinstance(per_symbol_lots, dict):
+            self.per_symbol_lots = per_symbol_lots
+            self._saved_per_symbol_lots = dict(per_symbol_lots)
+
+        # Respect backend PSL configured flag, or infer from lots
+        psl_configured = self._as_bool(response.get("psl_configured", self._saved_psl_configured))
+        if not psl_configured and isinstance(per_symbol_lots, dict):
+            psl_configured = len(per_symbol_lots.keys()) > 0
+        self._saved_psl_configured = bool(psl_configured)
+        self.psl_configured = bool(psl_configured)
+
+        # Backend snapshot confirmed; clear local PSL dirty flag.
+        try:
+            self._psl_user_dirty = False
+        except Exception:
+            pass
+        
+        # Refresh PSL list if PSL panel is visible (backend is authoritative).
+        if hasattr(self, "psl_panel") and self.psl_panel.isVisible():
+            self._refresh_psl_list()
+
+    def _dev_log(self, event: str, detail: str = "", *, exc: Optional[BaseException] = None) -> None:
+        if os.environ.get("FLAMEBOT_DEV_LOG", "0") != "1" and not bool(getattr(self, "_debug_enabled", False)):
+            return
+        try:
+            logger = logging.getLogger("flame_ui")
+            extra = {
+                "platform": getattr(self, "platform", None),
+                "account_type": getattr(self, "current_account_type", None),
+            }
+            if exc is not None:
+                logger.exception("%s | %s | extra=%s", str(event), str(detail), extra)
+            else:
+                # Keep dev logs useful: default to DEBUG-level noise.
+                logger.debug("%s | %s | extra=%s", str(event), str(detail), extra)
+        except Exception:
+            pass
+
+    def _is_online(self) -> bool:
+        mgr = getattr(self, "net_state_mgr", None)
+        try:
+            return bool(mgr is None or mgr.is_online())
+        except Exception:
+            return True
+
+    def _set_network_status(self, text: str) -> None:
+        t = str(text or "").strip()
+        try:
+            net = getattr(self, "_net_toast", None)
+            if net is None:
+                return
+            if not t:
+                try:
+                    self._net_toast_text = ""
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "_net_cycle_timer") and self._net_cycle_timer.isActive():
+                        self._net_cycle_timer.stop()
+                except Exception:
+                    pass
+                net.hide()
+                self._position_toasts()
+                return
+            # Store text and start non-pinned cycle while offline.
+            try:
+                self._net_toast_text = t
+            except Exception:
+                pass
+            # Show immediately, then cycle show/hide.
+            net.setText(t)
+            net.adjustSize()
+            net.show()
+            try:
+                if hasattr(self, "_net_cycle_timer") and not self._net_cycle_timer.isActive():
+                    self._net_cycle_timer.start()
+            except Exception:
+                pass
+            self._position_toasts()
+        except Exception:
+            pass
+
+    def _set_auth_busy(self, busy: bool) -> None:
+        self._auth_inflight = bool(busy)
+        try:
+            self.btn_send.setEnabled(not busy)
+        except Exception:
+            pass
+        try:
+            self.btn_login.setEnabled(not busy)
+        except Exception:
+            pass
+        # Wizard navigation must be locked during in-flight network requests.
+        try:
+            self.btn_phone_back.setEnabled(not busy)
+        except Exception:
+            pass
+        try:
+            self.btn_code_back.setEnabled(not busy)
+        except Exception:
+            pass
+        try:
+            if bool(getattr(self, "_tg_api_managed", False)):
+                self.btn_api_next.setEnabled(not busy)
+            else:
+                self.btn_api_next.setEnabled((not busy) and bool(self.api_id.text().strip()) and bool(self.api_hash.text().strip()))
+        except Exception:
+            pass
+        # Prevent edits while request is in flight.
+        for w in ("api_id", "api_hash", "phone", "code", "password"):
+            try:
+                widget = getattr(self, w, None)
+                if widget is not None:
+                    # Managed API fields must remain disabled.
+                    if w in ("api_id", "api_hash") and bool(getattr(self, "_tg_api_managed", False)):
+                        widget.setEnabled(False)
+                    else:
+                        widget.setEnabled(not busy)
+            except Exception:
+                pass
+        try:
+            if hasattr(self, "country_button"):
+                self.country_button.setEnabled(not busy)
+        except Exception:
+            pass
+
+    def _show_connection_lost(self, *, during_request: bool) -> None:
+        # UX rule: only one offline message.
+        msg = "⚠️ No internet connection. Waiting to reconnect…"
+        # Connection messaging must be global (not inside wizard subtitles).
+        self._set_network_status(msg)
+        self._set_auth_busy(False)
+
+    def _on_network_state_changed(self, state: NetworkState, detail: str) -> None:
+        try:
+            if state == NetworkState.OFFLINE:
+                self._net_ever_offline = True
+                self._set_network_status("⚠️ No internet connection. Waiting to reconnect…")
+                if bool(getattr(self, "_auth_inflight", False)):
+                    try:
+                        self.worker.cancel_pending_requests()
+                    except Exception:
+                        pass
+                    self._show_connection_lost(during_request=True)
+                return
+
+            if state == NetworkState.RECONNECTING:
+                # Keep showing the offline toast until we are fully ONLINE.
+                return
+
+            if state == NetworkState.ONLINE:
+                self._set_network_status("")
+                try:
+                    # Do not show on first app launch; only after a real offline period.
+                    if bool(getattr(self, "_net_ever_offline", False)):
+                        self._net_ever_offline = False
+                        # De-dupe to avoid spamming on flaky networks.
+                        now = time.monotonic()
+                        last = float(getattr(self, "_last_conn_restored_monotonic", 0.0) or 0.0)
+                        if (now - last) > 8.0:
+                            self._last_conn_restored_monotonic = now
+                            self._show_toast("✅ Connection restored", duration_ms=2000)
+                except Exception:
+                    pass
+                self._recover_after_network_return()
+        except Exception as e:
+            self._dev_log("network_state_handler_failed", str(e), exc=e)
+
+    def _recover_after_network_return(self) -> None:
+        try:
+            if not self._is_online():
+                return
+        except Exception:
+            return
+
+        # If we started in Home while offline, authenticate now.
+        try:
+            if (
+                getattr(self, "main_stack", None) is not None
+                and self.main_stack.currentIndex() == 1
+                and bool(getattr(self, "_startup_deferred_auth", False))
+                and not bool(getattr(self, "app_state", {}).get("authenticated"))
+            ):
+                self._attempt_deferred_startup_auth()
+        except Exception:
+            pass
+
+        # Startup auth must be resolved by the boot controller only.
+
+        # Telegram
+        try:
+            if getattr(self, "main_stack", None) is not None and self.main_stack.currentIndex() == 1:
+                self.worker.start_auto_reconnect()
+        except Exception:
+            pass
+
+        # Groups
+        try:
+            if getattr(self, "main_stack", None) is not None and self.main_stack.currentIndex() == 1:
+                if not bool(getattr(self, "_groups_loaded", False)):
+                    try:
+                        self.loading_label.setVisible(True)
+                    except Exception:
+                        pass
+                    try:
+                        self.worker.fetch_groups()
+                    except Exception:
+                        pass
+                    try:
+                        self._schedule_groups_fetch_retry(1800)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Backend registration
+        try:
+            pending = getattr(self, "_pending_register_context", None)
+            if isinstance(pending, dict):
+                self._pending_register_context = None
+                self._schedule_backend_register(str(pending.get("telegram_id") or ""))
+        except Exception:
+            pass
+
+        # Backend polling
+        try:
+            if hasattr(self, "backend_timer") and bool(getattr(self, "user_has_configuration", False)):
+                # Re-check guard conditions; do not restart polling while editing.
+                if self._can_poll_backend():
+                    if not self.backend_timer.isActive():
+                        self.backend_timer.start()
+                    self._poll_backend_state_all_platforms()
+        except Exception:
+            pass
+
+        # Durable settings outbox: attempt to sync any locally-saved settings.
+        try:
+            self._maybe_flush_settings_outbox()
+        except Exception:
+            pass
+
+    def _on_worker_error(self, msg: str) -> None:
+        text = str(msg or "").strip()
+        if not text:
+            self._dev_log("worker_error", "<empty>")
+            if not self._is_online():
+                self._show_connection_lost(during_request=bool(getattr(self, "_auth_inflight", False)))
+            self._set_auth_busy(False)
+            return
+
+        if not self._is_online():
+            self._dev_log("worker_error_offline", text)
+            self._show_connection_lost(during_request=bool(getattr(self, "_auth_inflight", False)))
+            return
+
+        # If the Telethon session is invalid/expired, we must return the user to
+        # the login wizard (Home cannot load groups without a valid session).
+        try:
+            lower_global = str(text or "").lower()
+        except Exception:
+            lower_global = ""
+        if "session expired" in lower_global:
+            # If we started in Home while offline (deferred auth), do NOT
+            # immediately bounce to the wizard based on a single error string.
+            # Confirm via the silent auto-login path (which is already debounced
+            # and handles transient exceptions).
+            try:
+                if (
+                    bool(getattr(self, "_startup_deferred_auth", False))
+                    and not bool(getattr(self, "app_state", {}).get("authenticated"))
+                    and getattr(self, "main_stack", None) is not None
+                    and self.main_stack.currentIndex() == 1
+                ):
+                    try:
+                        if hasattr(self, "subtitle_label"):
+                            self.subtitle_label.setText("Reconnecting — restoring session…")
+                    except Exception:
+                        pass
+                    try:
+                        self._attempt_deferred_startup_auth()
+                    except Exception:
+                        pass
+                    self._set_auth_busy(False)
+                    return
+            except Exception:
+                pass
+            try:
+                self._log("Session expired. Please login again.")
+            except Exception:
+                pass
+            try:
+                self._startup_deferred_auth = False
+            except Exception:
+                pass
+            try:
+                self._startup_deferred_auth_inflight = False
+            except Exception:
+                pass
+            try:
+                self.app_state["authenticated"] = False
+            except Exception:
+                pass
+            try:
+                self._groups_loaded = False
+            except Exception:
+                pass
+            try:
+                t = getattr(self, "_groups_retry_timer", None)
+                if t is not None and t.isActive():
+                    t.stop()
+            except Exception:
+                pass
+            try:
+                self.decide_initial_route()
+            except Exception:
+                pass
+            self._set_auth_busy(False)
+            return
+
+        try:
+            if getattr(self, "main_stack", None) is not None and self.main_stack.currentIndex() == 0:
+                # Auth wizard:
+                # - Preserve network/offline messaging.
+                # - Never display raw Telegram/Telethon/RPC error text.
+                lower = text.lower()
+
+                # Detect Telegram/Telethon auth errors and normalize them.
+                telegram_markers = (
+                    "sendcoderequest",
+                    "sign_in",
+                    "phone code",
+                    "phone number",
+                    "invalid code",
+                    "code expired",
+                    "banned",
+                    "telethon",
+                    "telegram",
+                    "sessionpasswordneeded",
+                    "floodwait",
+                    "caused by",
+                )
+
+                if any(m in lower for m in telegram_markers):
+                    # Do NOT print this inside the wizard subtitle. Use toast/log like success.
+                    try:
+                        self._log(_generic_login_failed_message())
+                    except Exception:
+                        pass
+                    self._set_auth_busy(False)
+                    self._dev_log("worker_error_auth", text)
+                    return
+                elif "session expired" in lower:
+                    # User-facing, but not Telegram-technical; show via log/toast.
+                    try:
+                        self._log("Session expired. Please login again.")
+                    except Exception:
+                        pass
+                    self._set_auth_busy(False)
+                    self._dev_log("worker_error_auth", text)
+                    return
+                # Network/offline detection (keep legacy behaviour).
+                elif any(k in lower for k in ["timeout", "connection", "network", "winerror", "socket"]):
+                    safe = "⚠️ No internet connection. Waiting to reconnect…"
+                else:
+                    safe = text
+                try:
+                    if "internet" in safe.lower() or "connection" in safe.lower():
+                        if "no internet" in safe.lower():
+                            self._set_network_status("⚠️ No internet connection. Waiting to reconnect…")
+                        else:
+                            self._set_network_status("⚠️ No internet connection. Waiting to reconnect…")
+                    else:
+                        self.subtitle_label.setText(safe)
+                except Exception:
+                    pass
+                self._set_auth_busy(False)
+                self._dev_log("worker_error_auth", text)
+                return
+        except Exception:
+            pass
+
+        # Main app: passive, no popups.
+        self._dev_log("worker_error_main", text)
+        self._set_network_status("⚠️ No internet connection. Waiting to reconnect…")
+        self._set_auth_busy(False)
+        try:
+            if hasattr(self, "loading_label"):
+                self.loading_label.setVisible(False)
+        except Exception:
+            pass
+
+    def _schedule_backend_register(self, telegram_id: str, account_type: Optional[str] = None, platform: Optional[str] = None) -> None:
+        tid = str(telegram_id or "").strip()
+        if not tid or not tid.isdigit():
+            return
+
+        context = {
+            "telegram_id": tid,
+            "platform": (platform or getattr(self, "platform", None) or "mt5").lower(),
+            "account_type": (account_type or getattr(self, "current_account_type", None) or "prop").lower(),
+        }
+
+        # Skip bot verification if we already have backend credentials.
+        try:
+            if self._has_backend_registration(platform=context.get("platform") or "mt5", account_type=context.get("account_type") or "prop"):
+                return
+        except Exception:
+            pass
+
+        # Verification is required: show blocking overlay.
+        try:
+            self._verification_active_context = dict(context)
+            self._show_verification_overlay_pending("Generating verification link…")
+        except Exception:
+            pass
+
+        if not self._is_online():
+            self._pending_register_context = dict(context)
+            try:
+                self._show_verification_overlay_pending("⚠️ No internet connection. Waiting to reconnect…")
+            except Exception:
+                pass
+            # Continue: the backend worker will retry on NET_ERROR.
+
+        if bool(getattr(self, "_backend_register_inflight", False)):
+            self._pending_register_context = dict(context)
+            try:
+                self._show_verification_overlay_pending("Waiting for Telegram verification…")
+            except Exception:
+                pass
+            return
+
+        self._backend_register_inflight = True
+        self._backend_register_seq += 1
+        seq = int(self._backend_register_seq)
+        self._backend_register_expected_seq = seq
+
+        try:
+            self._verification_active_seq = int(seq)
+        except Exception:
+            self._verification_active_seq = 0
+
+        # Each registration attempt gets a fresh user-action event.
+        try:
+            self._verification_user_start_event = threading.Event()
+        except Exception:
+            self._verification_user_start_event = None
+
+        # Cancel any previous register task loops.
+        try:
+            prev = getattr(self, "_backend_register_cancel_event", None)
+            if isinstance(prev, threading.Event):
+                prev.set()
+        except Exception:
+            pass
+        try:
+            self._backend_register_cancel_event = threading.Event()
+        except Exception:
+            self._backend_register_cancel_event = None
+
+        # Shared latest-challenge state: lets the click open the newest link even if UI paint/signals lag.
+        try:
+            with getattr(self, "_verification_latest_challenge_lock", threading.Lock()):
+                st = getattr(self, "_verification_latest_challenge", None)
+                if isinstance(st, dict):
+                    st["nonce"] = ""
+                    st["bot_start_url"] = ""
+                    st["expires_in_sec"] = 0
+                    st["seq"] = int(seq)
+        except Exception:
+            pass
+
+        task = _BackendRegisterTask(
+            seq,
+            self.backend_url,
+            self.worker,
+            telegram_id=tid,
+            platform=context["platform"],
+            account_type=context["account_type"],
+            # UX: one Telegram verification should unlock the whole app.
+            # Keep multi-platform issuance enabled so the user is not asked
+            # to verify again when switching MT4/MT5 (until logout/login).
+            verify_all_platforms=True,
+            user_start_event=getattr(self, "_verification_user_start_event", None),
+            cancel_event=getattr(self, "_backend_register_cancel_event", None),
+            challenge_state=getattr(self, "_verification_latest_challenge", None),
+            challenge_state_lock=getattr(self, "_verification_latest_challenge_lock", None),
+        )
+        task.signals.finished.connect(self._on_backend_register_finished)
+        task.signals.challenge.connect(self._on_backend_register_challenge)
+        task.signals.error.connect(self._on_backend_register_error)
+        self._backend_pool.start(task)
+
+    def _ensure_verification_dialog(self) -> BlockingTelegramVerificationDialog:
+        dlg = getattr(self, "_verification_dialog", None)
+        if dlg is not None:
+            return dlg
+        dlg = BlockingTelegramVerificationDialog(self)
+        dlg.openTelegramClicked.connect(self._on_verification_open_telegram_clicked)
+        self._verification_dialog = dlg
+        return dlg
+
+    def _apply_verification_blur(self, enabled: bool) -> None:
+        try:
+            target = getattr(self, "main_stack", None)
+            if target is None:
+                return
+
+            # Block app activity by disabling only the content area (not the titlebar).
+            try:
+                if enabled:
+                    if self._verification_prev_main_stack_enabled is None:
+                        self._verification_prev_main_stack_enabled = bool(target.isEnabled())
+                    target.setEnabled(False)
+                else:
+                    prev = self._verification_prev_main_stack_enabled
+                    self._verification_prev_main_stack_enabled = None
+                    if prev is not None:
+                        target.setEnabled(bool(prev))
+                    else:
+                        target.setEnabled(True)
+            except Exception:
+                pass
+
+            if enabled:
+                if self._verification_blur_effect is None:
+                    try:
+                        self._verification_prev_effect = target.graphicsEffect()
+                    except Exception:
+                        self._verification_prev_effect = None
+                    eff = QtWidgets.QGraphicsBlurEffect(target)
+                    eff.setBlurRadius(12)
+                    self._verification_blur_effect = eff
+                target.setGraphicsEffect(self._verification_blur_effect)
+            else:
+                target.setGraphicsEffect(self._verification_prev_effect)
+                self._verification_prev_effect = None
+        except Exception:
+            pass
+
+    def _show_verification_overlay_pending(self, msg: str = "Waiting for Telegram verification…") -> None:
+        dlg = self._ensure_verification_dialog()
+        dlg.set_allow_close(False)
+        dlg.set_pending(str(msg or "Waiting for Telegram verification…"))
+        self._apply_verification_blur(True)
+        try:
+            # Only auto-size/center when first shown. If the user maximizes/resizes,
+            # do not override it with repeated adjustSize()/move() calls.
+            if (not dlg.isVisible()) and (not dlg.isMaximized()):
+                geo = self.geometry()
+                dlg.adjustSize()
+                x = int(geo.x() + (geo.width() - dlg.width()) / 2)
+                y = int(geo.y() + (geo.height() - dlg.height()) / 2)
+                dlg.move(max(0, x), max(0, y))
+        except Exception:
+            pass
+        try:
+            if not dlg.isVisible():
+                dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
+
+    def _hide_verification_overlay(self) -> None:
+        self._apply_verification_blur(False)
+
+        # Stop any background register worker loops.
+        try:
+            ce = getattr(self, "_backend_register_cancel_event", None)
+            if isinstance(ce, threading.Event):
+                ce.set()
+        except Exception:
+            pass
+        dlg = getattr(self, "_verification_dialog", None)
+        if dlg is None:
+            return
+        try:
+            dlg.set_allow_close(True)
+            dlg.close()
+        except Exception:
+            try:
+                dlg.hide()
+            except Exception:
+                pass
+
+    def _on_backend_register_challenge(self, seq: int, context: dict, challenge: dict) -> None:
+        if seq != getattr(self, "_backend_register_expected_seq", 0):
+            return
+        try:
+            bot_url = str((challenge or {}).get("bot_start_url") or "").strip()
+        except Exception:
+            bot_url = ""
+        try:
+            exp = int((challenge or {}).get("expires_in_sec") or 0)
+        except Exception:
+            exp = 0
+
+        try:
+            dlg = self._ensure_verification_dialog()
+            dlg.set_challenge(bot_url, exp)
+            self._apply_verification_blur(True)
+            if not dlg.isVisible():
+                dlg.show()
+        except Exception:
+            pass
+
+        # If the user already clicked to retry (or start) and we were waiting
+        # on a fresh challenge, open Telegram as soon as the link exists.
+        try:
+            if bool(getattr(self, "_verification_auto_open_on_challenge", False)) and bot_url:
+                self._verification_auto_open_on_challenge = False
+                try:
+                    ev = getattr(self, "_verification_user_start_event", None)
+                    if isinstance(ev, threading.Event):
+                        ev.set()
+                except Exception:
+                    pass
+                try:
+                    webbrowser.open(str(bot_url), new=1, autoraise=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Pre-click link refresh is handled by the register worker (auto-regenerates every TTL).
+
+    def _on_verification_link_expired(self, seq: int) -> None:
+        if int(seq or 0) != int(getattr(self, "_backend_register_expected_seq", 0) or 0):
+            return
+
+        # Allow retry even if the old QRunnable is still finishing.
+        try:
+            self._backend_register_inflight = False
+        except Exception:
+            pass
+
+        try:
+            dlg = self._ensure_verification_dialog()
+            dlg.set_expired("❌ Couldn't connect via Telegram. Wait and try again.")
+            self._apply_verification_blur(True)
+            if not dlg.isVisible():
+                dlg.show()
+        except Exception:
+            pass
+
+    def _on_verification_open_telegram_clicked(self) -> None:
+        try:
+            dlg = self._ensure_verification_dialog()
+            # Rate-limit repeated clicks: 1 attempt per 5 minutes.
+            try:
+                if dlg.in_cooldown():
+                    return
+            except Exception:
+                pass
+            # Start cooldown on any attempt.
+            try:
+                dlg.begin_cooldown(300)
+            except Exception:
+                pass
+
+            # Always open the latest link from shared state (avoids race with refresh signal delivery).
+            url = ""
+            try:
+                lk = getattr(self, "_verification_latest_challenge_lock", None)
+                st = getattr(self, "_verification_latest_challenge", None)
+                if lk is not None and isinstance(st, dict):
+                    with lk:
+                        url = str(st.get("bot_start_url") or "").strip()
+            except Exception:
+                url = ""
+            if not url:
+                url = str(dlg.bot_url() or "").strip()
+            needs_new = False
+            try:
+                needs_new = bool(dlg.needs_new_link())
+            except Exception:
+                needs_new = False
+
+            # If we need a fresh link (expired/error) or we don't have a link yet,
+            # start a new registration attempt and auto-open Telegram once the
+            # challenge arrives.
+            if needs_new or (not url):
+                try:
+                    self._verification_auto_open_on_challenge = True
+                except Exception:
+                    pass
+                try:
+                    # Pre-set the event so the new task can proceed immediately after user click.
+                    self._verification_user_start_event = threading.Event()
+                    self._verification_user_start_event.set()
+                except Exception:
+                    self._verification_user_start_event = None
+                try:
+                    ctx = dict(getattr(self, "_verification_active_context", None) or {})
+                except Exception:
+                    ctx = {}
+                platform = str(ctx.get("platform") or getattr(self, "platform", None) or "mt5").lower()
+                account_type = str(ctx.get("account_type") or getattr(self, "current_account_type", None) or "prop").lower()
+                try:
+                    self._backend_register_inflight = False
+                except Exception:
+                    pass
+                try:
+                    self._show_verification_overlay_pending("Generating verification link…")
+                except Exception:
+                    pass
+                try:
+                    self._schedule_backend_register(str(getattr(self, "telegram_id", "") or ""), account_type=account_type, platform=platform)
+                except Exception:
+                    pass
+                return
+
+            # Normal path: open Telegram for the existing link.
+            # Unblock the worker thread to start polling.
+            try:
+                ev = getattr(self, "_verification_user_start_event", None)
+                if isinstance(ev, threading.Event):
+                    ev.set()
+            except Exception:
+                pass
+            try:
+                webbrowser.open(url, new=1, autoraise=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_backend_register_error(self, seq: int, context: dict, message: str) -> None:
+        if seq != getattr(self, "_backend_register_expected_seq", 0):
+            return
+        self._backend_register_inflight = False
+        self._dev_log("backend_register_error", message)
+        self._pending_register_context = dict(context or {})
+
+        # Keep app blocked until verified.
+        try:
+            lower = str(message or "").lower()
+        except Exception:
+            lower = ""
+        try:
+            if "network error" in lower or "net_error" in lower or "winerror" in lower or "connectionreseterror" in lower or "forcibly closed" in lower:
+                dlg = self._ensure_verification_dialog()
+                dlg.set_pending("⚠️ Network issue. Waiting to reconnect…")
+                self._apply_verification_blur(True)
+                if not dlg.isVisible():
+                    dlg.show()
+            elif "timed out" in lower or "expired" in lower:
+                self._on_verification_link_expired(seq)
+            else:
+                dlg = self._ensure_verification_dialog()
+                safe = str(message or "").strip() or "Couldn't connect via Telegram. Wait and try again."
+                dlg.set_error_retryable(f"❌ {safe}")
+                self._apply_verification_blur(True)
+                if not dlg.isVisible():
+                    dlg.show()
+        except Exception:
+            pass
+
+        # Visible error handling: keep generic (registration uses Telethon proof, no shared secret).
+        try:
+            msg = str(message or "").strip()
+            lower_msg = msg.lower()
+            if "network error" in lower_msg or "net_error" in lower_msg or "winerror" in lower_msg or "connectionreseterror" in lower_msg or "forcibly closed" in lower_msg:
+                # Avoid noisy toasts for transient network issues during verification.
+                return
+            if "nonce" in lower_msg or "expired" in lower_msg or "timed out" in lower_msg:
+                msg = "Couldn't connect via Telegram. Wait and try again."
+            if msg:
+                self._show_toast(f"❌ Registration failed: {msg}", duration_ms=9000)
+            else:
+                self._show_toast("❌ Registration failed. Please check Telegram login and internet connection.", duration_ms=9000)
+        except Exception:
+            pass
+
+    def _on_backend_register_finished(self, seq: int, context: dict, resp: dict) -> None:
+        if seq != getattr(self, "_backend_register_expected_seq", 0):
+            return
+        self._backend_register_inflight = False
+
+        try:
+            if not isinstance(resp, dict):
+                self._dev_log("backend_register_invalid", str(type(resp)))
+                return
+            if (resp.get("status") or "").upper() != "OK":
+                self._dev_log("backend_register_not_ok", str(resp.get("message") or resp))
+                try:
+                    msg = str(resp.get("message") or "Registration failed").strip() or "Registration failed"
+
+                    # Normalize user-visible nonce/expiry wording.
+                    try:
+                        ml = msg.lower()
+                        if "nonce" in ml or "expired" in ml or "timed out" in ml:
+                            msg = "Couldn't connect via Telegram. Wait and try again."
+                    except Exception:
+                        pass
+
+                    # Safe diagnostics (no secrets): show only if server provided.
+                    extra_parts: List[str] = []
+                    try:
+                        rpc_err = str(resp.get("rpc_error") or "").strip()
+                    except Exception:
+                        rpc_err = ""
+                    if rpc_err:
+                        extra_parts.append(f"rpc={rpc_err}")
+                    try:
+                        stid = resp.get("server_tg_api_id")
+                        if isinstance(stid, (int, float)) and not isinstance(stid, bool):
+                            extra_parts.append(f"server_api_id={int(stid)}")
+                        elif isinstance(stid, str) and stid.strip().isdigit():
+                            extra_parts.append(f"server_api_id={int(stid.strip())}")
+                    except Exception:
+                        pass
+                    try:
+                        cv = str(resp.get("code_version") or "").strip()
+                        if cv:
+                            extra_parts.append(f"v={cv}")
+                    except Exception:
+                        pass
+
+                    suffix = f" ({'; '.join(extra_parts)})" if extra_parts else ""
+                    self._show_toast(f"❌ Registration failed: {msg}{suffix}", duration_ms=12000)
+                except Exception:
+                    pass
+                if (resp.get("status") or "").upper() == "NET_ERROR":
+                    self._pending_register_context = dict(context or {})
+
+                # Keep app blocked until verified; show retry UI.
+                try:
+                    ec = str(resp.get("error_code") or "").strip().upper()
+                except Exception:
+                    ec = ""
+                try:
+                    if ec in {"CHALLENGE_EXPIRED", "NONCE_EXPIRED", "EXPIRED"}:
+                        self._on_verification_link_expired(seq)
+                    else:
+                        dlg = self._ensure_verification_dialog()
+                        dlg.set_error_retryable(f"❌ {msg}")
+                        self._apply_verification_blur(True)
+                        if not dlg.isVisible():
+                            dlg.show()
+                except Exception:
+                    pass
+                return
+        except Exception as e:
+            self._dev_log("backend_register_parse_failed", str(e), exc=e)
+            return
+
+        apply_ok = False
+        try:
+            account_type = (resp.get("account_type") or getattr(self, "current_account_type", "prop") or "prop").lower()
+
+            # New multi-platform response: one Telegram verification covers MT4+MT5.
+            regs = resp.get("registrations")
+            if isinstance(regs, dict) and any(k in regs for k in ("mt4", "mt5")):
+                try:
+                    self._dev_log("backend_register_ok", f"platform=all account={account_type} proof=bot")
+                except Exception:
+                    pass
+
+                # Ensure containers exist
+                try:
+                    if not isinstance(getattr(self, "flamebot_ids", None), dict):
+                        self.flamebot_ids = {"mt4": "", "mt5": ""}
+                except Exception:
+                    self.flamebot_ids = {"mt4": "", "mt5": ""}
+                try:
+                    if not isinstance(getattr(self, "licenses_by_platform", None), dict):
+                        self.licenses_by_platform = {"mt4": {}, "mt5": {}}
+                except Exception:
+                    self.licenses_by_platform = {"mt4": {}, "mt5": {}}
+                try:
+                    if not isinstance(getattr(self, "telegram_ingest_secrets", None), dict):
+                        self.telegram_ingest_secrets = {"mt4": "", "mt5": ""}
+                except Exception:
+                    self.telegram_ingest_secrets = {"mt4": "", "mt5": ""}
+
+                for p in ("mt4", "mt5"):
+                    entry = regs.get(p)
+                    if not isinstance(entry, dict):
+                        continue
+                    fb_id = str(entry.get("flamebot_id") or "").strip()
+                    lk = str(entry.get("license_key") or "").strip()
+                    lmap = entry.get("licenses")
+                    sec = str(entry.get("telegram_ingest_secret") or "").strip()
+                    if fb_id:
+                        try:
+                            self.flamebot_ids[p] = fb_id
+                        except Exception:
+                            pass
+                    if sec:
+                        try:
+                            self.telegram_ingest_secrets[p] = sec
+                        except Exception:
+                            pass
+                    try:
+                        plat_lic = self.licenses_by_platform.get(p)
+                        if not isinstance(plat_lic, dict):
+                            plat_lic = {"prop": "", "normal": ""}
+                        if "prop" not in plat_lic or "normal" not in plat_lic:
+                            plat_lic = {"prop": str(plat_lic.get("prop") or ""), "normal": str(plat_lic.get("normal") or "")}
+
+                        # Prefer explicit licenses map (prop+normal) when provided.
+                        if isinstance(lmap, dict):
+                            prop = str(lmap.get("prop") or "").strip()
+                            normal = str(lmap.get("normal") or "").strip()
+                            if prop:
+                                plat_lic["prop"] = prop
+                            if normal:
+                                plat_lic["normal"] = normal
+                        # Back-compat: single license key for current account_type.
+                        elif lk and account_type in {"prop", "normal"}:
+                            plat_lic[account_type] = lk
+
+                        self.licenses_by_platform[p] = plat_lic
+                    except Exception:
+                        pass
+
+                # Sync active platform fields from the per-platform stores.
+                current_platform = str((getattr(self, "platform", None) or "mt5").lower())
+                if current_platform not in {"mt4", "mt5"}:
+                    current_platform = "mt5"
+                try:
+                    self.flamebot_id = str(self.flamebot_ids.get(current_platform, "") or "").strip()
+                except Exception:
+                    self.flamebot_id = ""
+                try:
+                    self.licenses = self.licenses_by_platform.get(current_platform) or {"prop": "", "normal": ""}
+                except Exception:
+                    self.licenses = {"prop": "", "normal": ""}
+                try:
+                    self.telegram_ingest_secret = str(self.telegram_ingest_secrets.get(current_platform, "") or "").strip()
+                except Exception:
+                    self.telegram_ingest_secret = ""
+
+                try:
+                    self._update_active_profile_label()
+                except Exception:
+                    pass
+                try:
+                    self._update_credential_labels()
+                except Exception:
+                    pass
+                try:
+                    self._save_settings()
+                except Exception:
+                    pass
+                try:
+                    self.worker.set_telegram_ingest_secrets(getattr(self, "telegram_ingest_secrets", {"mt4": "", "mt5": ""}))
+                except Exception:
+                    pass
+                try:
+                    self.worker.set_registered_platforms(self.flamebot_ids)
+                except Exception:
+                    pass
+                apply_ok = True
+
+                # Clear any deferred register attempt; we are now verified.
+                try:
+                    self._pending_register_context = None
+                except Exception:
+                    pass
+            else:
+                new_flamebot_id = str(resp.get("flamebot_id") or "").strip()
+                license_key = str(resp.get("license_key") or "").strip()
+                licenses_map = resp.get("licenses")
+                ingest_secret = str(resp.get("telegram_ingest_secret") or "").strip()
+                resp_platform = str(resp.get("platform") or "").strip().lower()
+                ctx_platform = str((context or {}).get("platform") or "").strip().lower()
+                platform_key = resp_platform if resp_platform in {"mt4", "mt5"} else (ctx_platform if ctx_platform in {"mt4", "mt5"} else (getattr(self, "platform", None) or "mt5").lower())
+                if platform_key not in {"mt4", "mt5"}:
+                    platform_key = "mt5"
+
+                # Verification-friendly, safe log (no secrets).
+                try:
+                    self._dev_log(
+                        "backend_register_ok",
+                        f"platform={platform_key} account={account_type} flamebot_id={new_flamebot_id} license={self._mask_license_key(str(license_key or ''))} proof=bot",
+                    )
+                except Exception:
+                    pass
+
+                # Ensure containers exist.
+                try:
+                    if not isinstance(getattr(self, "flamebot_ids", None), dict):
+                        self.flamebot_ids = {"mt4": "", "mt5": ""}
+                except Exception:
+                    self.flamebot_ids = {"mt4": "", "mt5": ""}
+                try:
+                    if not isinstance(getattr(self, "licenses_by_platform", None), dict):
+                        self.licenses_by_platform = {"mt4": {}, "mt5": {}}
+                except Exception:
+                    self.licenses_by_platform = {"mt4": {}, "mt5": {}}
+                try:
+                    if not isinstance(getattr(self, "telegram_ingest_secrets", None), dict):
+                        self.telegram_ingest_secrets = {"mt4": "", "mt5": ""}
+                except Exception:
+                    self.telegram_ingest_secrets = {"mt4": "", "mt5": ""}
+
+                if new_flamebot_id:
+                    self.flamebot_id = new_flamebot_id
+                    try:
+                        self.flamebot_ids[str(platform_key)] = new_flamebot_id
+                    except Exception:
+                        pass
+
+                # Store per-user ingest secret for signed Telethon ingest.
+                if ingest_secret:
+                    try:
+                        self.telegram_ingest_secrets[str(platform_key)] = ingest_secret
+                        if str(platform_key) == str((getattr(self, "platform", None) or "mt5").lower()):
+                            self.telegram_ingest_secret = ingest_secret
+                    except Exception:
+                        pass
+
+                # Store licenses (prefer explicit map when provided).
+                try:
+                    plat_lic = self.licenses_by_platform.get(str(platform_key))
+                    if not isinstance(plat_lic, dict):
+                        plat_lic = {"prop": "", "normal": ""}
+                    if "prop" not in plat_lic or "normal" not in plat_lic:
+                        plat_lic = {"prop": str(plat_lic.get("prop") or ""), "normal": str(plat_lic.get("normal") or "")}
+                    if isinstance(licenses_map, dict):
+                        prop = str(licenses_map.get("prop") or "").strip()
+                        normal = str(licenses_map.get("normal") or "").strip()
+                        if prop:
+                            plat_lic["prop"] = prop
+                        if normal:
+                            plat_lic["normal"] = normal
+                    elif license_key and account_type in {"prop", "normal"}:
+                        plat_lic[account_type] = str(license_key)
+                    self.licenses_by_platform[str(platform_key)] = plat_lic
+                    self.licenses = plat_lic
+                except Exception:
+                    pass
+
+                try:
+                    self._update_active_profile_label()
+                except Exception:
+                    pass
+                try:
+                    self._update_credential_labels()
+                except Exception:
+                    pass
+                try:
+                    self._save_settings()
+                except Exception:
+                    pass
+                try:
+                    self.worker.set_telegram_ingest_secrets(getattr(self, "telegram_ingest_secrets", {"mt4": "", "mt5": ""}))
+                except Exception:
+                    pass
+                try:
+                    self.worker.set_registered_platforms(self.flamebot_ids)
+                except Exception:
+                    pass
+
+                try:
+                    self._pending_register_context = None
+                except Exception:
+                    pass
+                apply_ok = True
+        except Exception as e:
+            self._dev_log("apply_register_failed", str(e), exc=e)
+
+        # Even if applying credentials had an unexpected error, do NOT trap the
+        # user behind the blocking overlay after the server returned OK.
+        if not apply_ok:
+            try:
+                self._show_toast("⚠️ Verified, but failed to apply credentials. Please restart the app.", duration_ms=12000)
+            except Exception:
+                pass
+
+        try:
+            self._fetch_user_app_state()
+        except Exception as e:
+            self._dev_log("fetch_user_app_state_failed", str(e), exc=e)
+
+        # Verified: unblock the app.
+        try:
+            self._hide_verification_overlay()
+        except Exception:
+            pass
+
+    def _log(self, msg: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        debug_enabled = bool(getattr(self, "_debug_enabled", False))
+
+        # Never show license/internal account-key chatter in the UI.
+        if isinstance(msg, str) and msg:
+            lower = msg.lower()
+            if "license set:" in lower or "server license key" in lower or "new license key" in lower:
+                if debug_enabled:
+                    print(f"[{timestamp}] {msg}")
+                return
+
+        def _is_worker_status_toast(m: str) -> bool:
+            """Return True for noisy worker/backend status messages.
+
+            These are useful for debugging but too noisy for production UI toasts.
+            """
+            if not m:
+                return False
+            prefixes = (
+                "✅ Signal forwarded:",
+                "❌ Server rejected signal:",
+                "❌ Failed to forward signal:",
+                "📢 Global/direct command",
+                "✅ Trade command:",
+                "🚫 Command blocked:",
+                "⚠️ Failed to send command",
+                "❌ Failed to process trade command:",
+            )
+            if m.startswith(prefixes):
+                return True
+            noisy_substrings = (
+                "Session active. Auto-login.",
+                "Auto-Reconnect Started",
+                "Auto-Reconnect Stopped",
+                "Reconnecting to Telegram",
+                "Session expired.",
+                "Runtime reconnect error",
+                "Reconnect error",
+                "Reconnect after reset failed",
+                "Catch-up error",
+                "Walking up reply chain",
+                "Resolved to signal message",
+                "Reply/Edit resolved to signal",
+                "Edit detected",
+                "Attached image to signal",
+                "Image too large to attach",
+            )
+            return any(s in m for s in noisy_substrings)
+
+        def _is_debug(m: str) -> bool:
+            if not m:
+                return False
+            debug_prefixes = (
+                "[STARTUP DEBUG]",
+                "[REGISTER DEBUG]",
+                "[HTTP DEBUG]",
+                "[app_state]",
+                "[poll]",
+                "[PSL DEBUG]",
+                "[PSL STRICT]",
+            )
+            if m.startswith(debug_prefixes):
+                return True
+            if m.startswith("=") and len(m) >= 20:
+                return True
+            if "CACHE BUG DETECTED" in m:
+                return True
+            if m.startswith("🚫 Polling") or m.startswith("Polling backend"):
+                return True
+            return False
+
+        # Telegram chat activity (📩...) is rendered via per-chat buffers.
+        # Use the worker log_message channel as a reliable transport too.
+        if msg.startswith("📩CID="):
+            try:
+                m = re.match(
+                    r"^📩CID=(\d+)\s+OUT=([01])(?:\s+EPOCH=(\d+))?(?:\s+TS=([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?))?\s*(.*)$",
+                    str(msg or ""),
+                    flags=re.DOTALL,
+                )
+            except Exception:
+                m = None
+
+            if m:
+                try:
+                    chat_id = int(m.group(1) or 0)
+                except Exception:
+                    chat_id = 0
+                try:
+                    outgoing = bool(int(m.group(2) or 0))
+                except Exception:
+                    outgoing = False
+                try:
+                    epoch = int(m.group(3) or 0)
+                except Exception:
+                    epoch = 0
+                try:
+                    ts = str(m.group(4) or "").strip()
+                except Exception:
+                    ts = ""
+                try:
+                    remainder = str(m.group(5) or "").strip()
+                except Exception:
+                    remainder = ""
+
+                if chat_id:
+                    # Strip edit marker if present.
+                    try:
+                        if remainder.startswith("✏️"):
+                            remainder = remainder[len("✏️") :].strip()
+                    except Exception:
+                        pass
+
+                    sender = ""
+                    text = remainder
+                    try:
+                        if remainder.startswith("["):
+                            close = remainder.find("]")
+                            if close > 1:
+                                sender = remainder[1:close].strip()
+                                text = remainder[close + 1 :].lstrip()
+                    except Exception:
+                        sender = ""
+                        text = remainder
+
+                    try:
+                        date_key = ""
+                        if epoch and int(epoch) > 0:
+                            try:
+                                date_key = _format_local_ymd_from_utc_epoch(int(epoch))
+                            except Exception:
+                                date_key = ""
+                        self._ingest_message(
+                            int(chat_id),
+                            str(sender or ""),
+                            str(text or ""),
+                            str(ts or ""),
+                            bool(outgoing),
+                            date_key=date_key,
+                            save_settings=False,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+        # Legacy/un-tagged chat activity: do not render here (would mix chats).
+        if msg.startswith("📩"):
+            if debug_enabled:
+                print(f"[{timestamp}] {msg}")
+            return
+
+        # Debug/diagnostic logs should not be shown as toasts.
+        if _is_debug(msg):
+            if debug_enabled:
+                print(f"[{timestamp}] {msg}")
+                try:
+                    if hasattr(self, 'log'):
+                        self.log.appendPlainText(f"[{timestamp}] {msg}")
+                except Exception:
+                    pass
+            return
+
+        # Hide noisy worker/backend status toasts in production.
+        # Keep them available in debug mode by printing and/or appending to the log.
+        if _is_worker_status_toast(msg):
+            if debug_enabled:
+                print(f"[{timestamp}] {msg}")
+                try:
+                    if hasattr(self, 'log'):
+                        self.log.appendPlainText(f"[{timestamp}] {msg}")
+                except Exception:
+                    pass
+            return
+
+        # User-facing notification
+        if hasattr(self, '_toast') and hasattr(self, '_toast_timer'):
+            self._show_toast(msg)
+        else:
+            # If UI isn't ready yet, only print when debugging.
+            if debug_enabled:
+                print(f"[{timestamp}] {msg}")
+
+    def _error(self, msg: str) -> None:
+        # Strict UX rule: never show raw technical errors in the Message Log.
+        # Keep this method for user-facing validation messages.
+        try:
+            self._dev_log("ui_error", str(msg or ""))
+        except Exception:
+            pass
+
+        text = str(msg or "").strip()
+        if not text:
+            return
+
+        # Auth wizard: show inline under the wizard title.
+        try:
+            if getattr(self, "main_stack", None) is not None and self.main_stack.currentIndex() == 0:
+                if hasattr(self, "subtitle_label"):
+                    self.subtitle_label.setText(text)
+                return
+        except Exception:
+            pass
+
+        # Main app: passive status label only (no popups).
+        try:
+            self._set_network_status(text)
+        except Exception:
+            pass
+
+    def _show_message_log(self) -> None:
+        self._toggle_drawer(False)
+        self.content_stack.setCurrentWidget(self.message_log_page)
+        try:
+            self._render_message_log_for_group(getattr(self, "current_group_id", None))
+        except Exception:
+            pass
+
+    def _show_settings_wizard(self) -> None:
+        """Open the Settings wizard (Platform → Account → Existing Settings).
+
+        This wizard only controls navigation and selection. It must not
+        mutate backend state or run EA checks. After selection it opens
+        the existing Settings page as a leaf.
+        """
+        self._toggle_drawer(False)
+        self.wizard_selected_platform = None
+        self.wizard_selected_account = None
+        try:
+            self._start_settings_hydration(getattr(self, "platform", None), getattr(self, "current_account_type", None))
+        except Exception:
+            pass
+        self._render_config_status_labels()
+        self.content_stack.setCurrentWidget(self.settings_wizard)
+        try:
+            self.settings_wizard_stack.setCurrentIndex(0)
+        except Exception:
+            pass
+        try:
+            getattr(self, "_update_settings_context_indicator", lambda: None)()
+        except Exception:
+            pass
+
+    def _show_expert(self) -> None:
+        self._toggle_drawer(False)
+        self.content_stack.setCurrentWidget(self.expert_page)
+        self.expert_stack.setCurrentIndex(0)
+        try:
+            getattr(self, "_update_expert_context_indicator", lambda: None)()
+        except Exception:
+            pass
+        # REMOVED: Do NOT trigger polling on UI navigation
+        # Polling is controlled solely by backend configuration state
+
+    def _show_subscription(self) -> None:
+        self._toggle_drawer(False)
+        self.content_stack.setCurrentWidget(self.subscription_page)
+        # Keep the current tab selection; default to Method if none.
+        if not self.subscription_method_btn.isChecked() and not self.subscription_status_btn.isChecked():
+            self.subscription_method_btn.setChecked(True)
+        index = 0 if self.subscription_method_btn.isChecked() else 1
+        self.subscription_stack.setCurrentIndex(index)
+
+    def _on_wizard_account_selected(self, acct: str) -> None:
+        """Handle account selection from the compact settings flow.
+
+        This is UI-only: it sets the selected account, opens the existing
+        settings form (leaf) and triggers the usual settings fetch/update
+        logic. It does NOT mutate backend account/EA state or licenses.
+        
+        CRITICAL: Cancels active edits and reloads fresh backend state.
+        """
+        try:
+            # RULE 4: Cancel any active edit mode when switching account types
+            if getattr(self, "gls_edit_mode", False):
+                self._exit_edit_mode(revert=True)
+            if getattr(self, "psl_edit_mode", False):
+                self._exit_psl_edit_mode(revert=True)
+            
+            self.wizard_selected_account = acct
+            self.current_account_type = acct
+            try:
+                self._reset_settings_state_for_context_switch()
+            except Exception:
+                pass
+            try:
+                self._start_settings_hydration(getattr(self, "platform", None), acct)
+            except Exception:
+                pass
+            self._render_config_status_labels()
+            self.content_stack.setCurrentWidget(self.settings_wizard)
+            self.settings_wizard_stack.setCurrentIndex(2)
+            # Pull latest settings without blocking the UI (fresh backend state)
+            auth = self._backend_auth_params()
+            if auth:
+                self._poll_backend_state_with_auth(auth)
+                self._refresh_ea_status_for_context(auth)
+        except Exception:
+            pass
+        self._update_active_profile_label()
+        self._update_ea_status_panel()
+        self._update_settings_lock_state()
+        self._update_edit_button_state()
+
+    def _show_credentials(self, account_type: str) -> None:
+        # RULE 4: Cancel any active edit mode when switching account types
+        if getattr(self, "gls_edit_mode", False):
+            self._exit_edit_mode(revert=True)
+        if getattr(self, "psl_edit_mode", False):
+            self._exit_psl_edit_mode(revert=True)
+        
+        # Default to the requested account type
+        account_key = account_type.lower()
+        # Persist the UI-selected account for credential display/copy.
+        # EA-active account is shown separately in the EA Status panel.
+        self.current_account_type = account_key
+        try:
+            self._reset_settings_state_for_context_switch()
+        except Exception:
+            pass
+        try:
+            self._start_settings_hydration(getattr(self, "platform", None), account_key)
+        except Exception:
+            pass
+        self._render_config_status_labels()
+        self._ensure_license_for_account(account_key)
+        self._save_settings()
+        display_key = account_key
+        self._update_active_profile_label()
+        try:
+            auth = self._backend_auth_params()
+            if auth:
+                self._refresh_ea_status_for_context(auth)
+        except Exception:
+            pass
+        self.flamebot_id_label.setText(f"FlameBot ID: {self.flamebot_id}")
+        license_key = self.licenses.get(display_key, "")
+        label = "PROP" if display_key == "prop" else "NORMAL"
+        self.license_key_label.setText(f"License Key ({label}): {license_key}")
+        self.expert_stack.setCurrentIndex(2)
+        # Update edit button state after account type switch
+        self._update_ea_status_panel()
+        self._update_settings_lock_state()
+        self._update_edit_button_state()
+        # REMOVED: Do NOT trigger polling on UI click
+        # Polling is controlled solely by backend configuration state
+
+    def _copy_flamebot_id(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(self.flamebot_id)
+        self._show_toast("FlameBot ID copied")
+
+    def _copy_license_key(self) -> None:
+        QtWidgets.QApplication.clipboard().setText(self._current_license())
+        self._show_toast("License Key copied")
+    
+    def _logout_ea(self) -> None:
+        """Log out the EA for a selected platform + account type (backend-authoritative)."""
+        try:
+            platform = (getattr(self, "platform", None) or "mt5").lower()
+            account_type = (getattr(self, "current_account_type", None) or "prop").lower()
+
+            # Only allow logout for the currently-selected context *if* the EA
+            # is actually logged in for that context.
+            try:
+                ctx_state = self._get_ea_context_state(platform, account_type)
+                if not bool(ctx_state.get("known", False)) or (ctx_state.get("ea_active") is not True):
+                    # Should be unreachable if the button is disabled, but keep safe.
+                    self._update_logout_ea_button_state()
+                    return
+            except Exception:
+                self._update_logout_ea_button_state()
+                return
+
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Log out EA")
+            set_windows_native_titlebar_dark(dialog, bool(getattr(self, "dark_mode", False)))
+            dialog.setModal(True)
+            dialog.setFixedSize(340, 180)
+
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.setContentsMargins(16, 16, 16, 16)
+            layout.setSpacing(10)
+
+            icon_row = QtWidgets.QHBoxLayout()
+            icon_row.setAlignment(QtCore.Qt.AlignCenter)
+            icon_label = QtWidgets.QLabel("🔌")
+            icon_label.setAlignment(QtCore.Qt.AlignCenter)
+            icon_label.setStyleSheet("font-size: 34px;")
+            icon_row.addWidget(icon_label)
+            layout.addLayout(icon_row)
+
+            message = QtWidgets.QLabel("Are you sure you want to log out the EA?")
+            message.setWordWrap(True)
+            message.setAlignment(QtCore.Qt.AlignCenter)
+            layout.addWidget(message)
+
+            btn_row = QtWidgets.QHBoxLayout()
+            btn_row.setContentsMargins(0, 8, 0, 0)
+            cancel_btn = QtWidgets.QPushButton("Cancel")
+            ok_btn = QtWidgets.QPushButton("OK")
+            cancel_btn.clicked.connect(dialog.reject)
+            ok_btn.clicked.connect(dialog.accept)
+            btn_row.addWidget(cancel_btn)
+            btn_row.addStretch(1)
+            btn_row.addWidget(ok_btn)
+            layout.addLayout(btn_row)
+
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                return
+
+            # Disable immediately to prevent double-click while request is in flight.
+            try:
+                if hasattr(self, "clear_cached_btn"):
+                    self.clear_cached_btn.setEnabled(False)
+            except Exception:
+                pass
+
+            flamebot_id = (self.flamebot_ids.get(platform, "") or "").strip()
+            license_key = ((self.licenses_by_platform.get(platform, {}) or {}).get(account_type, "") or "").strip()
+
+            if not flamebot_id or not license_key:
+                self._show_toast("Missing credentials for selected context")
+                return
+
+            # Backend requires terminal_id for state-changing calls (logout/settings saves).
+            terminal_id = None
+            try:
+                terminal_id = (getattr(self, "_terminal_id_by_platform", {}) or {}).get(platform)
+                terminal_id = str(terminal_id or "").strip() or None
+            except Exception:
+                terminal_id = None
+            if not terminal_id:
+                # Best-effort refresh to capture terminal_id from ea_status.
+                try:
+                    auth = {
+                        "user_id": flamebot_id,
+                        "license_key": license_key,
+                        "platform": platform,
+                        "account_type": account_type,
+                    }
+                    self._refresh_ea_status_for_context(auth)
+                except Exception:
+                    pass
+                try:
+                    terminal_id = (getattr(self, "_terminal_id_by_platform", {}) or {}).get(platform)
+                    terminal_id = str(terminal_id or "").strip() or None
+                except Exception:
+                    terminal_id = None
+            if not terminal_id:
+                self._show_toast("Terminal not bound yet — please wait for EA status to update")
+                return
+
+            payload = {
+                "action": "logout_ea",
+                "flamebot_id": flamebot_id,
+                "license_key": license_key,
+                "platform": platform,
+                "account_type": account_type,
+                "terminal_id": terminal_id,
+            }
+            response = self._post_backend_json("app/logout_ea", payload) or {}
+            if response.get("status") != "OK":
+                self._show_toast(response.get("message", "Logout failed"))
+                return
+
+            # Mark EA as disconnected for this platform
+            try:
+                ctx_state = self._get_ea_context_state(platform, account_type)
+                ctx_state["ea_active"] = False
+                ctx_state["known"] = True
+                if platform == (getattr(self, "platform", None) or "mt5").lower():
+                    self.ea_active = self._get_platform_ea_active(platform)
+                    self._ea_active_account = self._get_platform_active_account(platform)
+            except Exception:
+                pass
+
+            # Mark hydration pending for this specific context (display-only)
+            try:
+                ctx = self._context_key(platform=platform, account_type=account_type)
+                if ctx:
+                    self._settings_hydration_pending[ctx] = True
+                    try:
+                        self._settings_hydration_started_at[ctx] = float(time.time())
+                    except Exception:
+                        pass
+                    try:
+                        self._context_hydrated_at.pop(ctx, None)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # If current UI matches, refresh status and lock state
+            if platform == (getattr(self, "platform", None) or "mt5").lower():
+                self.ea_active = self._get_platform_ea_active(platform)
+                self._ea_active_account = self._get_platform_active_account(platform)
+                self._update_ea_status_panel()
+                self._update_settings_lock_state()
+                self._update_edit_button_state()
+                self._render_config_status_labels()
+
+            self._save_settings()
+            self._show_toast("EA logged out")
+
+            # Ensure the button reflects the new state.
+            self._update_logout_ea_button_state()
+
+        except Exception as e:
+            self._log(f"❌ EA logout error: {e}")
+            self._show_toast("EA logout failed")
+            try:
+                self._update_logout_ea_button_state()
+            except Exception:
+                pass
+
+    def _update_logout_ea_button_state(self) -> None:
+        """Enable 'Log out EA' only when EA is active for selected context."""
+        try:
+            btn = getattr(self, "clear_cached_btn", None)
+            if btn is None:
+                return
+            platform = (getattr(self, "platform", None) or "mt5").lower()
+            account_type = (getattr(self, "current_account_type", None) or "prop").lower()
+            ctx_state = self._get_ea_context_state(platform, account_type)
+            enabled = bool(ctx_state.get("known", False)) and (ctx_state.get("ea_active") is True)
+            btn.setEnabled(enabled)
+        except Exception:
+            pass
+
+    def _ensure_license_for_account(self, account_key: str) -> None:
+        if self.licenses.get(account_key):
+            return
+
+        # Missing license should NOT force Telegram verification again.
+        # Prefer pulling authoritative state from the backend.
+        try:
+            self._refresh_authoritative_state()
+        except Exception:
+            pass
+
+        if self.licenses.get(account_key):
+            return
+
+        # Only if we are genuinely unregistered do we schedule verification.
+        try:
+            platform_key = (getattr(self, "platform", None) or "mt5").lower()
+            acct = (account_key or getattr(self, "current_account_type", None) or "prop").lower()
+            if getattr(self, "telegram_id", "") and (not self._has_backend_identity(platform=platform_key)):
+                self._schedule_backend_register(str(self.telegram_id), platform=platform_key, account_type=acct)
+        except Exception:
+            pass
+
+    def _current_license(self) -> str:
+        # Credentials UI should reflect the user-selected account (Prop/Normal),
+        # not the EA-active account. EA state is shown separately in the status panel.
+        return self.licenses.get(self.current_account_type, "")
+    
+    def _get_active_license(self) -> str:
+        """Alias for _current_license for consistency."""
+        return self._current_license()
+
+    def _normalize_account_type(self, value: Optional[object]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value).strip().lower()
+        except Exception:
+            return None
+        if text in ("prop", "normal"):
+            return text
+        return None
+
+    def _ensure_platform_ea_state(self, platform: Optional[str] = None) -> Dict[str, Dict[str, bool]]:
+        platform_key = (platform or getattr(self, "platform", None) or "mt5").lower()
+        if platform_key not in {"mt4", "mt5"}:
+            platform_key = "mt5"
+        platform_state = self.ea_states.setdefault(platform_key, {})
+        for acct in ("prop", "normal"):
+            if acct not in platform_state or not isinstance(platform_state.get(acct), dict):
+                platform_state[acct] = {"ea_active": None, "known": False}
+            else:
+                platform_state[acct].setdefault("ea_active", None)
+                platform_state[acct].setdefault("known", False)
+        return platform_state
+
+    def _get_ea_context_state(self, platform: Optional[str] = None, account_type: Optional[str] = None) -> Dict[str, bool]:
+        platform_state = self._ensure_platform_ea_state(platform)
+        acct = self._normalize_account_type(account_type) or "prop"
+        return platform_state.setdefault(acct, {"ea_active": None, "known": False})
+
+    def _get_platform_active_account(self, platform: Optional[str] = None) -> Optional[str]:
+        platform_state = self._ensure_platform_ea_state(platform)
+        if bool(platform_state.get("prop", {}).get("ea_active")):
+            return "prop"
+        if bool(platform_state.get("normal", {}).get("ea_active")):
+            return "normal"
+        return None
+
+    def _get_platform_ea_active(self, platform: Optional[str] = None) -> bool:
+        platform_state = self._ensure_platform_ea_state(platform)
+        return bool(platform_state.get("prop", {}).get("ea_active")) or bool(platform_state.get("normal", {}).get("ea_active"))
+
+    def _apply_platform_ea_state_from_response(self, auth_params: dict, response: Optional[dict]) -> None:
+        """Update per-platform EA state from any backend response.
+
+        Some endpoints include `ea_active` and/or the active account type.
+        We treat this as authoritative per-platform truth to prevent
+        MT4/MT5 and PROP/NORMAL leakage.
+        """
+        if not response or not isinstance(response, dict):
+            return
+
+        platform = (auth_params.get("platform") or getattr(self, "platform", None) or "mt5").lower()
+        if platform not in {"mt4", "mt5"}:
+            platform = (getattr(self, "platform", None) or "mt5").lower()
+
+        current_platform = (getattr(self, "platform", None) or "mt5").lower()
+
+        ea_active_value = self._extract_ea_active(response)
+
+        # Backwards-compatible keys for active account
+        active = None
+        for key in ("active_account_type", "active_account", "account_type", "active_on_ea", "active"):
+            if key in response and response.get(key) is not None:
+                active = response.get(key)
+                break
+        active = self._normalize_account_type(active)
+
+        platform_state = self._ensure_platform_ea_state(platform)
+        if ea_active_value is not None:
+            ea_active = bool(ea_active_value)
+            if not ea_active:
+                platform_state["prop"]["ea_active"] = False
+                platform_state["prop"]["known"] = True
+                platform_state["normal"]["ea_active"] = False
+                platform_state["normal"]["known"] = True
+            else:
+                if active:
+                    platform_state["prop"]["ea_active"] = active == "prop"
+                    platform_state["prop"]["known"] = True
+                    platform_state["normal"]["ea_active"] = active == "normal"
+                    platform_state["normal"]["known"] = True
+        elif active:
+            platform_state["prop"]["ea_active"] = active == "prop"
+            platform_state["prop"]["known"] = True
+            platform_state["normal"]["ea_active"] = active == "normal"
+            platform_state["normal"]["known"] = True
+
+        if platform == current_platform:
+            self.ea_active = self._get_platform_ea_active(platform)
+            self._ea_active_account = self._get_platform_active_account(platform)
+
+        # Capture terminal binding info when backend provides it.
+        try:
+            tid = response.get("terminal_id") if isinstance(response, dict) else None
+            tid = str(tid or "").strip() or None
+            if tid:
+                store = getattr(self, "_terminal_id_by_platform", None)
+                if not isinstance(store, dict):
+                    self._terminal_id_by_platform = {"mt4": None, "mt5": None}
+                    store = self._terminal_id_by_platform
+                store[platform] = tid
+        except Exception:
+            pass
+
+    def _is_settings_unlocked(self, platform: Optional[str] = None) -> bool:
+        """True only when EA is active for this platform AND matches selected account.
+
+        This is the single source of truth for Rule 2 gating (no EA/no edit),
+        including account mismatch (EA active on PROP while UI selected NORMAL).
+        """
+        platform_key = (platform or getattr(self, "platform", None) or "mt5").lower()
+        selected_account = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop")
+        ctx_state = self._get_ea_context_state(platform_key, selected_account)
+        ea_active = ctx_state.get("ea_active") is True
+        known = bool(ctx_state.get("known", False))
+        # FlameBot IDs are platform-specific; do not treat MT5 ID as MT4 ID.
+        try:
+            has_id = bool((self.flamebot_ids.get(platform_key) or "").strip())
+        except Exception:
+            has_id = bool(getattr(self, "flamebot_id", None))
+        if not selected_account:
+            return False
+        if not known:
+            return False
+        if not ea_active or not has_id:
+            return False
+        return True
+
+    def _update_ea_status_panel(self) -> None:
+        # Show success only when the backend reports EA active for the
+        # currently-selected account AND platform. Otherwise show a clear blocked state.
+   
+        platform = (getattr(self, "platform", None) or "mt5").lower()
+        selected_account = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop")
+        ctx_state = self._get_ea_context_state(platform, selected_account)
+        ea_active = ctx_state.get("ea_active") is True
+        known = bool(ctx_state.get("known", False))
+
+        # Keep logout button in sync with EA active context.
+        self._update_logout_ea_button_state()
+
+        if not known:
+            account_label = (selected_account or "prop").upper()
+            platform_display = platform.upper()
+            self.ea_status_message.setText(
+                f"⏳ Checking EA status for {platform_display} {account_label}...\n"
+                "Please wait for the next server update."
+            )
+            return
+        
+        if self._is_settings_unlocked(platform):
+            self.ea_status_message.setText(
+                "✅ Your EA has successfully logged in.\n"
+                "Settings are now unlocked.\n\n"
+                "➡️ Click Settings to configure lot size and symbols."
+            )
+        else:
+            # Account-specific guidance when selected account is not active
+            sel = (self._normalize_account_type(self.current_account_type) or "prop").upper()
+            platform_display = platform.upper()
+            self.ea_status_message.setText(
+                f"⚠️ Connect {sel} account to {platform_display} to activate.\n\n"
+                f"Please attach the FlameBot EA to {platform_display}\n"
+                "and enter your FlameBot ID and License Key."
+            )
+
+    def _update_settings_lock_state(self) -> None:
+        platform = (getattr(self, "platform", None) or "mt5").lower()
+        unlocked = self._is_settings_unlocked(platform)
+        locked = not unlocked
+
+        try:
+            self.settings_lock_banner.setVisible(locked)
+            if locked:
+                self.settings_lock_banner.setText(
+                    f"❌ Please login your EA first. Go to Expert → {self.platform.upper()} and connect your EA."
+                )
+        except Exception:
+            pass
+
+        # Editing must NOT bleed across modes: use selector checkboxes as source of truth.
+        mode = self._active_settings_mode()
+        gls_can_edit = bool(mode == "gls") and bool(getattr(self, "gls_edit_mode", False)) and unlocked
+        psl_can_edit = bool(mode == "psl") and bool(getattr(self, "psl_edit_mode", False)) and unlocked
+
+        # GLS controls become editable only in GLS edit-mode
+        for widget in (
+            self.lot_default,
+            self.lot_custom,
+            self.lot_custom_input,
+            self.symbol_default,
+            self.symbol_custom,
+            self.symbol_search,
+            self.symbol_scroll,
+        ):
+            widget.setEnabled(gls_can_edit)
+
+        # Allow scrolling/viewing in view mode (checkboxes remain disabled).
+        try:
+            if hasattr(self, "symbol_scroll"):
+                self.symbol_scroll.setEnabled(True)
+        except Exception:
+            pass
+        
+        # Trade Control toggles - only editable in GLS edit mode
+        if hasattr(self, "allow_close_checkbox"):
+            self.allow_close_checkbox.setEnabled(bool(gls_can_edit or psl_can_edit))
+        if hasattr(self, "allow_breakeven_checkbox"):
+            self.allow_breakeven_checkbox.setEnabled(bool(gls_can_edit or psl_can_edit))
+        if hasattr(self, "allow_secure_half_checkbox"):
+            self.allow_secure_half_checkbox.setEnabled(bool(gls_can_edit or psl_can_edit))
+        if hasattr(self, "allow_multiple_checkbox"):
+            self.allow_multiple_checkbox.setEnabled(bool(gls_can_edit or psl_can_edit))
+        if hasattr(self, "entry_market_edge_radio"):
+            self.entry_market_edge_radio.setEnabled(bool(gls_can_edit or psl_can_edit))
+        if hasattr(self, "entry_range_distributed_radio"):
+            self.entry_range_distributed_radio.setEnabled(bool(gls_can_edit or psl_can_edit))
+
+        # Scheduler controls - follow the same edit gating
+        can_edit_tc = bool(gls_can_edit or psl_can_edit)
+        try:
+            if hasattr(self, "scheduler_active_checkbox"):
+                self.scheduler_active_checkbox.setEnabled(can_edit_tc)
+        except Exception:
+            pass
+        sched_on = False
+        try:
+            sched_on = bool(self.scheduler_active_checkbox.isChecked()) if hasattr(self, "scheduler_active_checkbox") else bool(getattr(self, "scheduler_active", False))
+        except Exception:
+            sched_on = bool(getattr(self, "scheduler_active", False))
+        for wname in (
+            "scheduler_pause_day_combo",
+            "scheduler_pause_hour_combo",
+            "scheduler_pause_minute_combo",
+            "scheduler_resume_day_combo",
+            "scheduler_resume_hour_combo",
+            "scheduler_resume_minute_combo",
+        ):
+            w = getattr(self, wname, None)
+            if w is not None:
+                try:
+                    w.setEnabled(bool(can_edit_tc and sched_on))
+                except Exception:
+                    pass
+        
+        # PSL controls become editable only in PSL edit-mode
+        self.psl_search.setEnabled(psl_can_edit)
+
+        # Manual symbol refresh buttons (require unlocked; not tied to edit mode)
+        try:
+            inflight = bool(getattr(self, "_symbols_refresh_inflight", False))
+        except Exception:
+            inflight = False
+
+        try:
+            is_custom = bool(getattr(self, "symbol_mode", "default") == "custom")
+            if hasattr(self, "symbol_custom"):
+                try:
+                    is_custom = bool(self.symbol_custom.isChecked())
+                except Exception:
+                    pass
+        except Exception:
+            is_custom = False
+
+        try:
+            if hasattr(self, "gls_refresh_symbols_btn"):
+                self.gls_refresh_symbols_btn.setVisible(bool(is_custom))
+                self.gls_refresh_symbols_btn.setEnabled(bool(unlocked and (not inflight) and is_custom))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "psl_refresh_symbols_btn"):
+                self.psl_refresh_symbols_btn.setEnabled(bool(unlocked and (not inflight)))
+        except Exception:
+            pass
+        
+        # PSL checkboxes and lot inputs - disable ALL when not in PSL edit mode
+        if hasattr(self, '_psl_checkboxes'):
+            for checkbox in self._psl_checkboxes.values():
+                checkbox.setEnabled(psl_can_edit)
+        if hasattr(self, '_psl_lot_inputs'):
+            for lot_input in self._psl_lot_inputs.values():
+                lot_input.setEnabled(psl_can_edit)
+
+        # Save button is active only for the active mode in edit mode
+        self.save_settings_btn.setEnabled(bool(gls_can_edit or psl_can_edit))
+
+        if not gls_can_edit:
+            # Ensure custom input is readonly when not editing
+            try:
+                self.lot_custom_input.setReadOnly(True)
+            except Exception:
+                pass
+        else:
+            # When editing, apply UI state (enabling inputs appropriately)
+            self._apply_lot_state_to_ui()
+            self._apply_symbol_state_to_ui()
+
+        self._save_settings()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        # Prevent timer ticks/queued slots from doing work during teardown.
+        try:
+            self._closing = True
+        except Exception:
+            pass
+
+        # Stop any timers that might rebuild UI or make network calls.
+        for timer_name in (
+            "backend_timer",
+            "_symbol_resize_timer",
+            "_symbol_filter_timer",
+            "_groups_retry_timer",
+            "_startup_deferred_auth_timeout_timer",
+            "_group_build_timer",
+            "_boot_timeout_timer",
+            "_settings_save_timer",
+            "_group_filter_timer",
+            "_toast_timer",
+            "_net_cycle_timer",
+            "_cooldown_timer",
+        ):
+            try:
+                t = getattr(self, timer_name, None)
+                if t is not None and hasattr(t, "isActive") and t.isActive():
+                    t.stop()
+            except Exception:
+                pass
+
+        self._save_settings(immediate=True)
+        self.worker.stop_listening()
+        self.worker.stop()
+        super().closeEvent(event)
+
+
+class FlameApp(QtWidgets.QApplication):
+    def __init__(self) -> None:
+        super().__init__([])
+        # Global boot state (required): block navigation until resolved.
+        self.app_state = {"booting": True, "authenticated": None}
+        apply_system_theme(self)
+        # Ensure the app icon is set globally (taskbar/title bar).
+        self.setWindowIcon(QtGui.QIcon(resolve_resource_path("icon.ico")))
+        splash = FlameSplash("splash.png")
+        self._splash = splash
+        self._main_opened = False
+        try:
+            self._splash_started_at = float(time.time())
+        except Exception:
+            self._splash_started_at = 0.0
+        splash.show()
+
+        # Give Qt a chance to paint the splash immediately.
+        try:
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
+
+        # Create the main window but keep it hidden until boot resolves.
+        self.window = MainWindow()
+        try:
+            self.window.resize(900, 600)
+        except Exception:
+            pass
+        try:
+            self.window.hide()
+        except Exception:
+            pass
+
+        def open_main() -> None:
+            """Open the main window and close the splash.
+
+            This matches the older boot UX (splash first, then main window).
+            To avoid delaying fast boots, this is used as a fallback: if the
+            splash is still visible after a long boot, open the window anyway.
+            """
+            try:
+                if bool(getattr(self, "_main_opened", False)):
+                    return
+            except Exception:
+                pass
+
+            # Preserve the user's chosen window state (e.g., if they maximized the
+            # splash before boot finishes, keep the main window maximized).
+            want_maximized = False
+            try:
+                want_maximized = bool(splash.isMaximized())
+            except Exception:
+                want_maximized = False
+            try:
+                splash.close()
+            except Exception:
+                pass
+            try:
+                # Clear any minimized state explicitly.
+                try:
+                    st = self.window.windowState()
+                    if bool(st & QtCore.Qt.WindowMinimized):
+                        self.window.setWindowState(st & ~QtCore.Qt.WindowMinimized)
+                except Exception:
+                    pass
+                if want_maximized:
+                    self.window.showMaximized()
+                else:
+                    # showNormal avoids opening minimized on some Windows setups.
+                    try:
+                        self.window.showNormal()
+                    except Exception:
+                        self.window.show()
+            except Exception:
+                pass
+            try:
+                self._main_opened = True
+            except Exception:
+                pass
+
+        # Ensure Telethon worker is stopped even if the window closeEvent is bypassed
+        # (e.g., programmatic quit, early shutdown paths).
+        def _shutdown_worker() -> None:
+            try:
+                self.window.worker.stop_listening()
+            except Exception:
+                pass
+            try:
+                self.window.worker.stop()
+            except Exception:
+                pass
+
+        try:
+            self.aboutToQuit.connect(_shutdown_worker)
+        except Exception:
+            pass
+
+        def _on_boot_resolved(authenticated: bool) -> None:
+            try:
+                self.app_state["authenticated"] = bool(authenticated)
+                self.app_state["booting"] = False
+            except Exception:
+                pass
+            try:
+                self.window.app_state = dict(self.app_state)
+            except Exception:
+                pass
+
+            # Centralized route decision (no redirects after render).
+            try:
+                self.window.decide_initial_route()
+            except Exception:
+                pass
+
+            # Keep splash visible for the requested minimum duration.
+            try:
+                elapsed_ms = int(max(0.0, (time.time() - float(getattr(self, "_splash_started_at", 0.0))) * 1000.0))
+            except Exception:
+                elapsed_ms = 0
+            try:
+                min_ms = int(max(0, int(SPLASH_MIN_VISIBLE_MS)))
+            except Exception:
+                min_ms = 25000
+            delay_ms = max(0, int(min_ms) - int(elapsed_ms))
+            try:
+                QtCore.QTimer.singleShot(int(delay_ms), open_main)
+            except Exception:
+                open_main()
+
+        try:
+            self.window.boot_resolved.connect(_on_boot_resolved)
+        except Exception:
+            pass
+
+        # MANDATORY ORDER: Splash -> resolve_auth_state -> decide_initial_route -> render.
+        QtCore.QTimer.singleShot(0, self.window.resolve_auth_state)
+
+        # Fallback: if boot/hydration gets stuck, show the main window after 25s
+        # (restores the older behavior from test_settings_isolation.py).
+        QtCore.QTimer.singleShot(25000, open_main)
+
+
+def main() -> None:
+    setup_dev_logging()
+    setup_telethon_logging()
+    try:
+        _install_crash_protection_hooks()
+    except Exception:
+        pass
+    _log_dependency_drift_warning()
+    # HiDPI behavior must be configured BEFORE QApplication is created.
+    try:
+        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    except Exception:
+        pass
+    try:
+        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    except Exception:
+        pass
+    try:
+        policy_enum = getattr(QtCore.Qt, "HighDpiScaleFactorRoundingPolicy", None)
+        if policy_enum is not None and hasattr(QtGui.QGuiApplication, "setHighDpiScaleFactorRoundingPolicy"):
+            QtGui.QGuiApplication.setHighDpiScaleFactorRoundingPolicy(policy_enum.PassThrough)
+    except Exception:
+        pass
+
+    # Best-effort filter for extremely noisy JPEG warnings. Note that some
+    # libjpeg warnings can bypass Qt's message system; the primary mitigation
+    # is deleting/re-downloading truncated cached JPEGs.
+    try:
+        def _qt_message_handler(_mode, _context, message) -> None:  # type: ignore[no-redef]
+            try:
+                msg = str(message or "")
+            except Exception:
+                msg = ""
+            if "Corrupt JPEG data:" in msg and "premature end of data segment" in msg:
+                return
+            try:
+                sys.stderr.write(msg + "\n")
+            except Exception:
+                pass
+
+        QtCore.qInstallMessageHandler(_qt_message_handler)
+    except Exception:
+        pass
+
+    # Ensure Ctrl+C (SIGINT) quits the Qt event loop cleanly so shutdown hooks run.
+    try:
+        import signal
+
+        def _handle_sigint(_signum=None, _frame=None) -> None:
+            try:
+                inst = QtWidgets.QApplication.instance()
+                if inst is not None:
+                    inst.quit()
+            except Exception:
+                pass
+
+        try:
+            signal.signal(signal.SIGINT, _handle_sigint)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    app = FlameApp()
+
+    # Keep Python signal handling responsive while the Qt loop is running.
+    try:
+        _sig_timer = QtCore.QTimer()
+        _sig_timer.setInterval(200)
+        _sig_timer.timeout.connect(lambda: None)
+        _sig_timer.start()
+    except Exception:
+        _sig_timer = None
+
+    app.exec_()
+
+
+if __name__ == "__main__":
+    main() 
+     

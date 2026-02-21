@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlameBot Downloads</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background: #fff; color: #111; }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 28px 16px; }
+    h1 { font-size: 28px; margin: 0 0 8px; }
+    p { line-height: 1.45; }
+    .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); margin-top: 18px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; }
+    .btn { display: inline-block; padding: 10px 14px; border-radius: 10px; border: 1px solid #111; text-decoration: none; color: #111; font-weight: 600; }
+    .muted { color: #555; font-size: 14px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.95em; }
+    ul { margin: 10px 0 0; padding-left: 18px; }
+    li { margin: 6px 0; }
+    .footer { margin-top: 22px; padding-top: 14px; border-top: 1px solid #eee; font-size: 13px; color: #555; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>FlameBot Downloads</h1>
+    <p class="muted">Download the desktop app bundle. The MT4 + MT5 EAs are included inside the same download.</p>
+
+    <div class="cards">
+      <div class="card">
+        <h2 style="margin:0 0 8px; font-size:18px;">Windows (App + MT4/MT5 EAs)</h2>
+        <p class="muted">Single zip bundle: FlameBot + EAs + installer helper.</p>
+        <!-- Replace this href with your hosted URL (GitHub Release / S3 / R2). -->
+        <a class="btn" href="#">Download FlameBot for Windows</a>
+        <ul class="muted">
+          <li>Run <code>FlameBot.exe</code></li>
+          <li>Install EAs: run <code>Install_EAs.ps1</code> or copy manually</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h2 style="margin:0 0 8px; font-size:18px;">macOS</h2>
+        <p class="muted">Coming soon. (Best built on a Mac for code-signing/notarization.)</p>
+        <a class="btn" href="#" onclick="return false;">Download for macOS (soon)</a>
+      </div>
+
+      <div class="card">
+        <h2 style="margin:0 0 8px; font-size:18px;">MetaTrader Setup</h2>
+        <p class="muted">After installing the EA files:</p>
+        <ul class="muted">
+          <li>Restart MT4/MT5</li>
+          <li>Attach the EA to a chart</li>
+          <li>MT4: ensure WebRequest is allowed for your server URL</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div><strong>Tip:</strong> Host the zip on GitHub Releases or Cloud storage, and point the download button to the direct file URL.</div>
+    </div>
+  </div>
+</body>
+</html>

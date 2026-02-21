@@ -285,24 +285,23 @@
       color: var(--muted);
     }
 
-    .cards {
+    @media (max-width: 980px) {
+      .heroGrid { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: 1fr; }
+      .downloadGrid { grid-template-columns: 1fr; }
+      .graphic { height: 240px; }
+    }
+
+    @media (max-width: 520px) {
       .wrap { padding: 38px 14px 30px; }
       .hero { padding: 18px 14px; }
       h1 { font-size: 36px; }
-      .heroGrid { grid-template-columns: 1fr; }
-      .graphic { height: 220px; }
-      .cards { grid-template-columns: 1fr; }
-      .downloadGrid { grid-template-columns: 1fr; }
-      margin-top: 16px;
-
-    @media (max-width: 980px) {
-      .cards { grid-template-columns: 1fr; }
     }
-    }
-
-    .section {
-      margin-top: 18px;
-    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
       <div class="heroGrid">
         <div>
           <div class="kicker"><span class="kickerDot" aria-hidden="true"></span>Premium Desktop Signal Copier</div>
@@ -338,7 +337,7 @@
           </svg>
         </div>
       </div>
-      justify-content: space-between;
+    </div>
 
     <div class="section" aria-label="What FlameBot does">
       <div class="sectionHead">
@@ -365,8 +364,8 @@
         <div class="downloadGrid">
           <div>
             <div class="kicker"><span class="kickerDot" aria-hidden="true"></span>Download</div>
-            <h2 style="margin: 12px 0 8px; font-size: 24px; letter-spacing: -0.01em;">Get FlameBot (Windows bundle)</h2>
-            <p class="muted" style="margin: 0;">Includes the desktop app + the MT4/MT5 EAs inside the same download.</p>
+            <h2 style="margin: 12px 0 8px; font-size: 24px; letter-spacing: -0.01em;">Get FlameBot</h2>
+            <p class="muted" style="margin: 0;">Choose Windows or macOS bundle. MT4/MT5 EAs are included inside the same download.</p>
           </div>
           <a class="btn" href="download.html">Go to download page</a>
         </div>
@@ -376,152 +375,6 @@
     <div class="footer">
       <div>By downloading, you agree to use the software responsibly and in accordance with your broker/platform rules.</div>
     </div>
-    .card {
-      letter-spacing: -0.01em;
-      box-shadow: 0 14px 30px rgba(0, 0, 0, 0.45);
-    }
-
-    .btn:focus {
-      outline: 3px solid rgba(124, 58, 237, 0.35);
-      outline-offset: 2px;
-    }
-
-    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.95em; }
-    ul { margin: 12px 0 0; padding-left: 18px; }
-    li { margin: 7px 0; }
-    .footer { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--border-2); font-size: 13px; color: var(--muted); }
-
-    @media (max-width: 520px) {
-      .wrap { padding: 34px 14px 26px; }
-      .hero { padding: 18px 14px; }
-      h1 { font-size: 32px; }
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="hero">
-      <h1>FlameBot Downloads</h1>
-      <p class="muted">FlameBot is a desktop companion that helps you set up and manage your trading automation on MetaTrader. Each bundle includes the FlameBot app plus the included MT4 + MT5 Expert Advisors (EAs).</p>
-      <p class="muted">Download the desktop app bundle. The MT4 + MT5 EAs are included inside the same download.</p>
-      <p class="muted" style="margin-top: 8px;">Windows users: download, open the app, and install the EAs from Settings.</p>
-    </div>
-
-    <div class="cards">
-      <div class="card">
-        <h2 class="cardTitle">
-          <svg class="osIcon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <rect x="2" y="3" width="9" height="9" rx="1.2" />
-            <rect x="13" y="3" width="9" height="9" rx="1.2" />
-            <rect x="2" y="14" width="9" height="9" rx="1.2" />
-            <rect x="13" y="14" width="9" height="9" rx="1.2" />
-          </svg>
-          Windows (App + MT4/MT5 EAs)
-        </h2>
-        <p class="muted">Single zip bundle: FlameBot + EAs + installer helper.</p>
-        <a class="btn" href="https://github.com/Emperorgeneral/FLAMEBOT/releases/latest/download/FlameBot-Windows.zip">Download FlameBot for Windows</a>
-        <ul class="muted">
-          <li>Run <code>FlameBot.exe</code></li>
-          <li>Install EAs: run <code>Install_EAs.ps1</code> or copy manually</li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <h2 class="cardTitle">
-          <svg class="osIcon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <path d="M16.6 13.2c0-2.2 1.8-3.4 1.9-3.5-1-1.5-2.7-1.7-3.2-1.7-1.4-.1-2.7.8-3.4.8-.7 0-1.8-.8-3-.8-1.5 0-2.9.9-3.7 2.2-1.6 2.7-.4 6.7 1.1 8.9.7 1.1 1.6 2.3 2.8 2.2 1.1 0 1.5-.7 2.9-.7 1.3 0 1.7.7 2.9.7 1.2 0 2-.9 2.7-2 .8-1.2 1.1-2.4 1.1-2.4-.1 0-2.1-.8-2.1-3.7z"/>
-            <path d="M14.9 6.1c.6-.7 1-1.8.9-2.8-.9.1-2 .6-2.6 1.3-.6.7-1.1 1.7-.9 2.7 1 0 2-.5 2.6-1.2z"/>
-          </svg>
-          macOS
-        </h2>
-        <p class="muted">Coming soon. (Best built on a Mac for code-signing/notarization.)</p>
-        <a class="btn" href="#" onclick="return false;">Download for macOS (soon)</a>
-      </div>
-
-      <div class="card">
-        <h2>MetaTrader Setup</h2>
-        <p class="muted">After installing the EA files:</p>
-        <ul class="muted">
-          <li>Restart MT4/MT5</li>
-          <li>Attach the EA to a chart</li>
-          <li>MT4: ensure WebRequest is allowed for your server URL</li>
-        </ul>
-      </div>
-    </div>
-
-    <div class="section" id="preview" aria-label="App Preview" hidden>
-      <div class="sectionHead">
-        <h2>App Preview</h2>
-      </div>
-      <div class="shots">
-        <figure class="shot" hidden>
-          <div class="shotInner">
-            <div class="shotFrame">
-              <img class="shotImg" data-shot src="assets/screenshots/screen-1.png" alt="FlameBot app preview: message log" loading="lazy" />
-            </div>
-            <figcaption class="shotCaption"><span class="dot" aria-hidden="true"></span>Message log</figcaption>
-          </div>
-        </figure>
-
-        <figure class="shot" hidden>
-          <div class="shotInner">
-            <div class="shotFrame">
-              <img class="shotImg" data-shot src="assets/screenshots/screen-2.png" alt="FlameBot app preview: connect MT4/MT5" loading="lazy" />
-            </div>
-            <figcaption class="shotCaption"><span class="dot" aria-hidden="true"></span>Connect MT4 / MT5</figcaption>
-          </div>
-        </figure>
-
-        <figure class="shot" hidden>
-          <div class="shotInner">
-            <div class="shotFrame">
-              <img class="shotImg" data-shot src="assets/screenshots/screen-3.png" alt="FlameBot app preview: splash screen" loading="lazy" />
-            </div>
-            <figcaption class="shotCaption"><span class="dot" aria-hidden="true"></span>Splash screen</figcaption>
-          </div>
-        </figure>
-      </div>
-    </div>
-
-    <div class="footer">
-      <div><strong>Tip:</strong> Host the zip on GitHub Releases or Cloud storage, and point the download button to the direct file URL.</div>
-    </div>
   </div>
-
-  <script>
-    // Hide missing screenshots so the page never shows broken image icons.
-    (function () {
-      const section = document.getElementById('preview');
-      if (!section) return;
-
-      const images = Array.from(section.querySelectorAll('img[data-shot]'));
-      if (!images.length) return;
-
-      let loadedCount = 0;
-      let resolvedCount = 0;
-
-      const finalize = () => {
-        if (resolvedCount !== images.length) return;
-        section.hidden = loadedCount === 0;
-      };
-
-      images.forEach((img) => {
-        const figure = img.closest('figure');
-        const show = () => {
-          loadedCount += 1;
-          if (figure) figure.hidden = false;
-        };
-        const done = () => {
-          resolvedCount += 1;
-          finalize();
-        };
-
-        const preloader = new Image();
-        preloader.onload = () => { show(); done(); };
-        preloader.onerror = () => { if (figure) figure.remove(); done(); };
-        preloader.src = img.currentSrc || img.src;
-      });
-    })();
-  </script>
 </body>
 </html>

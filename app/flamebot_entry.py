@@ -11,11 +11,11 @@ from pathlib import Path
 
 
 def main() -> None:
-    here = Path(__file__).resolve().parent
-    if str(here) not in sys.path:
-        sys.path.insert(0, str(here))
+    root = Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
-    from text5 import main as _app_main  # noqa: WPS433
+    from app.text5 import main as _app_main  # noqa: WPS433
 
     _app_main()
 

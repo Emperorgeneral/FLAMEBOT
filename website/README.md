@@ -12,6 +12,16 @@ This is a minimal static download page.
 
 - Build output zip: `..\\dist\\FlameBot-Windows.zip`
 
+## Screenshots (optional)
+
+To show the in-page preview gallery, add 3 screenshots here:
+
+- `website/assets/screenshots/screen-1.png`
+- `website/assets/screenshots/screen-2.png`
+- `website/assets/screenshots/screen-3.png`
+
+If any are missing, the gallery auto-hides those items (and hides the section if none exist).
+
 ## Recommended hosting (simple)
 
 1) Create a GitHub repository and push this project.

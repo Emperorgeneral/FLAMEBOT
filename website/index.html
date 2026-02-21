@@ -155,6 +155,95 @@
       margin-top: 16px;
     }
 
+    .section {
+      margin-top: 18px;
+    }
+
+    .sectionHead {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin: 0 0 12px;
+    }
+
+    .sectionHead h2 {
+      margin: 0;
+      font-size: 12px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: rgba(243, 244, 246, 0.70);
+    }
+
+    .shots {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+    }
+
+    figure.shot {
+      margin: 0;
+      border-radius: calc(var(--radius) + 4px);
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.03);
+      overflow: hidden;
+      position: relative;
+      box-shadow:
+        0 26px 75px rgba(0, 0, 0, 0.58),
+        0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+      backdrop-filter: blur(10px);
+    }
+
+    figure.shot::before {
+      content: "";
+      position: absolute;
+      inset: -1px;
+      background:
+        radial-gradient(680px 240px at 15% 0%, rgba(255, 122, 24, 0.10) 0%, transparent 55%),
+        radial-gradient(620px 240px at 85% 10%, rgba(34, 211, 238, 0.08) 0%, transparent 60%);
+      pointer-events: none;
+      opacity: 0.9;
+    }
+
+    .shotInner {
+      position: relative;
+      padding: 10px;
+    }
+
+    .shotFrame {
+      border-radius: 14px;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      background: rgba(0, 0, 0, 0.30);
+      overflow: hidden;
+    }
+
+    .shotImg {
+      display: block;
+      width: 100%;
+      height: auto;
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      filter: saturate(1.02) contrast(1.02);
+    }
+
+    .shotCaption {
+      margin-top: 10px;
+      font-size: 12px;
+      color: rgba(243, 244, 246, 0.70);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: rgba(255, 122, 24, 0.72);
+      box-shadow: 0 0 20px rgba(255, 122, 24, 0.55);
+      flex: 0 0 auto;
+    }
+
     .card {
       position: relative;
       overflow: hidden;
@@ -227,6 +316,40 @@
       <p class="muted" style="margin-top: 8px;">Windows users: download, open the app, and install the EAs from Settings.</p>
     </div>
 
+    <div class="section" id="preview" aria-label="App Preview">
+      <div class="sectionHead">
+        <h2>App Preview</h2>
+      </div>
+      <div class="shots">
+        <figure class="shot" hidden>
+          <div class="shotInner">
+            <div class="shotFrame">
+              <img class="shotImg" data-shot src="assets/screenshots/screen-1.png" alt="FlameBot app preview: dashboard and message log" loading="lazy" />
+            </div>
+            <figcaption class="shotCaption"><span class="dot" aria-hidden="true"></span>Dashboard & message log</figcaption>
+          </div>
+        </figure>
+
+        <figure class="shot" hidden>
+          <div class="shotInner">
+            <div class="shotFrame">
+              <img class="shotImg" data-shot src="assets/screenshots/screen-2.png" alt="FlameBot app preview: connect MT4/MT5" loading="lazy" />
+            </div>
+            <figcaption class="shotCaption"><span class="dot" aria-hidden="true"></span>Connect MT4 / MT5</figcaption>
+          </div>
+        </figure>
+
+        <figure class="shot" hidden>
+          <div class="shotInner">
+            <div class="shotFrame">
+              <img class="shotImg" data-shot src="assets/screenshots/screen-3.png" alt="FlameBot app preview: EA settings and scheduler" loading="lazy" />
+            </div>
+            <figcaption class="shotCaption"><span class="dot" aria-hidden="true"></span>EA settings & scheduler</figcaption>
+          </div>
+        </figure>
+      </div>
+    </div>
+
     <div class="cards">
       <div class="card">
         <h2 class="cardTitle">
@@ -274,5 +397,41 @@
       <div><strong>Tip:</strong> Host the zip on GitHub Releases or Cloud storage, and point the download button to the direct file URL.</div>
     </div>
   </div>
+
+  <script>
+    // Hide missing screenshots so the page never shows broken image icons.
+    (function () {
+      const section = document.getElementById('preview');
+      if (!section) return;
+
+      const images = Array.from(section.querySelectorAll('img[data-shot]'));
+      if (!images.length) return;
+
+      let loadedCount = 0;
+      let resolvedCount = 0;
+
+      const finalize = () => {
+        if (resolvedCount !== images.length) return;
+        section.hidden = loadedCount === 0;
+      };
+
+      images.forEach((img) => {
+        const figure = img.closest('figure');
+        const show = () => {
+          loadedCount += 1;
+          if (figure) figure.hidden = false;
+        };
+        const done = () => {
+          resolvedCount += 1;
+          finalize();
+        };
+
+        const preloader = new Image();
+        preloader.onload = () => { show(); done(); };
+        preloader.onerror = () => { if (figure) figure.remove(); done(); };
+        preloader.src = img.currentSrc || img.src;
+      });
+    })();
+  </script>
 </body>
 </html>

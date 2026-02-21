@@ -40,6 +40,9 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import copy
 from collections import OrderedDict, deque
 
+from version import APP_VERSION, GITHUB_OWNER, GITHUB_REPO, WINDOWS_UPDATE_ASSET_NAME
+import updater as flamebot_updater
+
 import ctypes
 from ctypes import wintypes
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -7250,6 +7253,10 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             self._chat_history_max_messages = 200
         self.settings = self._load_settings()
+        try:
+            self._update_state: Dict[str, object] = dict(self.settings.get("update", {}) or {})
+        except Exception:
+            self._update_state = {}
 
         # Durable settings outbox: if settings saves fail due to transient
         # network issues, keep the latest save payload and retry automatically
@@ -7565,6 +7572,12 @@ class MainWindow(QtWidgets.QWidget):
         # This prevents users from entering mismatched API apps and breaking verification.
         try:
             self._apply_managed_telegram_app_config()
+        except Exception:
+            pass
+
+        # Automatic updates (Windows packaged builds only).
+        try:
+            self._schedule_update_check_startup()
         except Exception:
             pass
 
@@ -8894,6 +8907,7 @@ class MainWindow(QtWidgets.QWidget):
             "telegram_phone": self.telegram_phone,
             "current_account_type": self.current_account_type,
             "backend_url": self.backend_url,
+            "update": getattr(self, "_update_state", {}) or {},
             "lot_mode": self.lot_mode,
             "custom_lot": self.custom_lot,
             "lot_configured": self.lot_configured,
@@ -13714,7 +13728,7 @@ class MainWindow(QtWidgets.QWidget):
 
         title = QtWidgets.QLabel("FlameBot Telegram Copier")
         title.setStyleSheet("font-weight: 700; font-size: 15px;")
-        version = QtWidgets.QLabel("Version: v1.0")
+        version = QtWidgets.QLabel(f"Version: v{APP_VERSION}")
         build_mode = QtWidgets.QLabel(
             "Build: Packaged (.exe/.app)" if bool(getattr(sys, "frozen", False)) else "Build: Source (python)"
         )
@@ -13729,6 +13743,130 @@ class MainWindow(QtWidgets.QWidget):
 
         layout.addStretch()
         dialog.exec_()
+
+    def _schedule_update_check_startup(self) -> None:
+        if os.name != "nt":
+            return
+        if not bool(getattr(sys, "frozen", False)):
+            return
+        if str(os.environ.get("FLAMEBOT_DISABLE_UPDATES", "0") or "0").strip() == "1":
+            return
+
+        now = time.time()
+        try:
+            last = float((self._update_state or {}).get("last_check_ts", 0) or 0)
+        except Exception:
+            last = 0.0
+
+        # Default: check at most twice per day.
+        if (now - last) < (12 * 60 * 60):
+            return
+
+        try:
+            self._update_state["last_check_ts"] = int(now)
+        except Exception:
+            self._update_state = {"last_check_ts": int(now)}
+
+        # UI is built by now; safe to persist via normal settings machinery.
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+        try:
+            QtCore.QTimer.singleShot(3000, self._run_update_check)
+        except Exception:
+            # Fallback: run immediately (best-effort).
+            self._run_update_check()
+
+    def _run_update_check(self) -> None:
+        owner, repo, asset = flamebot_updater.get_update_config_from_env(
+            default_owner=GITHUB_OWNER,
+            default_repo=GITHUB_REPO,
+            default_asset_name=WINDOWS_UPDATE_ASSET_NAME,
+        )
+        if not owner or not repo:
+            return
+
+        t = threading.Thread(
+            target=self._update_check_worker,
+            args=(owner, repo, asset),
+            daemon=True,
+        )
+        t.start()
+
+    def _update_check_worker(self, owner: str, repo: str, asset: str) -> None:
+        try:
+            info = flamebot_updater.get_latest_github_release(owner, repo, asset_name=asset, timeout=10.0)
+        except Exception:
+            info = None
+
+        if info is None:
+            return
+
+        if not flamebot_updater.is_newer_version(APP_VERSION, info.latest_version):
+            return
+
+        try:
+            skipped = str((self._update_state or {}).get("skipped_version", "") or "").strip()
+        except Exception:
+            skipped = ""
+        if skipped and skipped == str(info.latest_version):
+            return
+
+        try:
+            self._pending_update_info = info
+        except Exception:
+            return
+
+        try:
+            QtCore.QTimer.singleShot(0, self._prompt_update_available)
+        except Exception:
+            pass
+
+    def _prompt_update_available(self) -> None:
+        info = getattr(self, "_pending_update_info", None)
+        if info is None:
+            return
+
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setWindowTitle("Update available")
+        box.setText(f"A new FlameBot version is available: {info.latest_version}")
+        box.setInformativeText("Update now? The app will restart automatically.")
+        update_btn = box.addButton("Update now", QtWidgets.QMessageBox.AcceptRole)
+        later_btn = box.addButton("Later", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(update_btn)
+        box.exec_()
+
+        if box.clickedButton() is later_btn:
+            try:
+                self._update_state["skipped_version"] = str(info.latest_version)
+            except Exception:
+                self._update_state = {"skipped_version": str(info.latest_version)}
+            try:
+                self._save_settings()
+            except Exception:
+                pass
+            return
+
+        install_dir = Path(sys.executable).resolve().parent
+        exe_name = Path(sys.executable).name
+        process_name = Path(sys.executable).stem
+
+        started = flamebot_updater.launch_powershell_update(
+            zip_url=str(info.asset_url),
+            install_dir=install_dir,
+            exe_name=exe_name,
+            process_name=process_name,
+        )
+        if started:
+            try:
+                QtWidgets.QApplication.quit()
+            except Exception:
+                pass
+        else:
+            QtWidgets.QMessageBox.warning(self, "Update failed", "Could not start the updater helper.")
 
     def on_filter_groups(self, text: str) -> None:
         # Debounce to avoid rebuilding/updating the list on every keystroke

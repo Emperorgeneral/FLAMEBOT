@@ -1,6 +1,9 @@
-# FlameBot download page
+# FlameBot website
 
-This is a minimal static download page.
+This is a static website with:
+
+- `index.html` (front page / marketing)
+- `download.html` (downloads + setup)
 
 ## Deploy options
 
@@ -21,6 +24,8 @@ To show the in-page preview gallery, add 3 screenshots here:
 - `website/assets/screenshots/screen-3.png`
 
 If any are missing, the gallery auto-hides those items (and hides the section if none exist).
+
+Note: screenshots are shown on `download.html`.
 
 ## Recommended hosting (simple)
 

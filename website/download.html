@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>FlameBot</title>
+  <title>FlameBot Downloads</title>
   <style>
     :root {
       color-scheme: dark;
@@ -40,15 +40,15 @@
     }
 
     .wrap {
-      max-width: 1060px;
+      max-width: 980px;
       margin: 0 auto;
-      padding: 52px 18px 46px;
+      padding: 44px 18px 34px;
     }
 
     .hero {
       position: relative;
       overflow: hidden;
-      padding: 26px 22px;
+      padding: 22px 18px;
       border: 1px solid var(--border);
       border-radius: calc(var(--radius) + 8px);
       background: linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.03) 100%);
@@ -69,50 +69,29 @@
 
     .hero > * { position: relative; }
 
-    .heroGrid {
-      display: grid;
-      grid-template-columns: 1.15fr 0.85fr;
-      gap: 18px;
-      align-items: center;
-    }
-
-    .kicker {
+    .cardTitle {
       display: inline-flex;
       align-items: center;
       gap: 10px;
-      font-size: 12px;
-      font-weight: 750;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: rgba(243, 244, 246, 0.76);
-      padding: 10px 12px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: rgba(255, 255, 255, 0.03);
-      width: fit-content;
     }
 
-    .kickerDot {
-      width: 8px;
-      height: 8px;
-      border-radius: 999px;
-      background: rgba(255, 122, 24, 0.75);
-      box-shadow: 0 0 22px rgba(255, 122, 24, 0.55);
+    .osIcon {
+      width: 18px;
+      height: 18px;
       flex: 0 0 auto;
+      opacity: 0.92;
+    }
+
+    .osIcon path,
+    .osIcon rect {
+      fill: rgba(243, 244, 246, 0.88);
     }
 
     h1 {
-      font-size: 46px;
+      font-size: 40px;
       letter-spacing: -0.02em;
       line-height: 1.1;
-      margin: 12px 0 10px;
-    }
-
-    .titleAccent {
-      background: linear-gradient(90deg, rgba(124, 58, 237, 1) 0%, rgba(34, 211, 238, 1) 100%);
-      -webkit-background-clip: text;
-      background-clip: text;
-      color: transparent;
+      margin: 0 0 10px;
     }
 
     p { line-height: 1.55; margin: 10px 0; }
@@ -122,53 +101,11 @@
       font-size: 14px;
     }
 
-    .lead {
-      font-size: 15px;
-      color: rgba(243, 244, 246, 0.76);
-      max-width: 62ch;
-    }
-
-    .scrollHint {
-      margin-top: 14px;
-      font-size: 12px;
-      color: rgba(243, 244, 246, 0.60);
-    }
-
-    .scrollHint a {
-      color: rgba(243, 244, 246, 0.82);
-      text-decoration: none;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.16);
-      padding-bottom: 1px;
-    }
-
-    .graphic {
-      position: relative;
-      border-radius: calc(var(--radius) + 10px);
-      border: 1px solid var(--border);
-      background: rgba(255, 255, 255, 0.03);
-      overflow: hidden;
-      height: 280px;
-      box-shadow: 0 22px 60px rgba(0, 0, 0, 0.55);
-    }
-
-    .graphic::before {
-      content: "";
-      position: absolute;
-      inset: -1px;
-      background:
-        radial-gradient(560px 260px at 20% 20%, rgba(255, 122, 24, 0.16), transparent 55%),
-        radial-gradient(520px 240px at 80% 30%, rgba(34, 211, 238, 0.14), transparent 58%),
-        radial-gradient(520px 240px at 50% 105%, rgba(124, 58, 237, 0.16), transparent 60%);
-      opacity: 0.95;
-      pointer-events: none;
-    }
-
-    .graphic svg {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      opacity: 0.95;
+    .cards {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+      margin-top: 16px;
     }
 
     .section {
@@ -191,11 +128,73 @@
       color: rgba(243, 244, 246, 0.70);
     }
 
-    .cards {
+    .shots {
       display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
       gap: 14px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      margin-top: 16px;
+    }
+
+    figure.shot {
+      margin: 0;
+      border-radius: calc(var(--radius) + 4px);
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.03);
+      overflow: hidden;
+      position: relative;
+      box-shadow:
+        0 26px 75px rgba(0, 0, 0, 0.58),
+        0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+      backdrop-filter: blur(10px);
+    }
+
+    figure.shot::before {
+      content: "";
+      position: absolute;
+      inset: -1px;
+      background:
+        radial-gradient(680px 240px at 15% 0%, rgba(255, 122, 24, 0.10) 0%, transparent 55%),
+        radial-gradient(620px 240px at 85% 10%, rgba(34, 211, 238, 0.08) 0%, transparent 60%);
+      pointer-events: none;
+      opacity: 0.9;
+    }
+
+    .shotInner {
+      position: relative;
+      padding: 10px;
+    }
+
+    .shotFrame {
+      border-radius: 14px;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      background: rgba(0, 0, 0, 0.30);
+      overflow: hidden;
+    }
+
+    .shotImg {
+      display: block;
+      width: 100%;
+      height: auto;
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      filter: saturate(1.02) contrast(1.02);
+    }
+
+    .shotCaption {
+      margin-top: 10px;
+      font-size: 12px;
+      color: rgba(243, 244, 246, 0.70);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: rgba(255, 122, 24, 0.72);
+      box-shadow: 0 0 20px rgba(255, 122, 24, 0.55);
+      flex: 0 0 auto;
     }
 
     .card {
@@ -207,7 +206,6 @@
       background: var(--panel);
       box-shadow: var(--shadow-soft);
       backdrop-filter: blur(8px);
-      min-height: 110px;
     }
 
     .card::before {
@@ -223,160 +221,19 @@
 
     .card > * { position: relative; }
 
-    .card h3 { margin: 0 0 8px; font-size: 16px; letter-spacing: -0.01em; }
+    .card h2 { margin: 0 0 10px; font-size: 16px; letter-spacing: -0.01em; }
 
     .btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      padding: 12px 18px;
+      padding: 11px 16px;
       border-radius: 12px;
       border: 1px solid rgba(255, 255, 255, 0.16);
       background: linear-gradient(180deg, rgba(255, 255, 255, 0.10) 0%, rgba(255, 255, 255, 0.04) 100%);
       text-decoration: none;
       color: var(--text);
-      font-weight: 750;
-      letter-spacing: -0.01em;
-      box-shadow: 0 14px 30px rgba(0, 0, 0, 0.45);
-      width: fit-content;
-    }
-
-    .btn:focus {
-      outline: 3px solid rgba(124, 58, 237, 0.35);
-      outline-offset: 2px;
-    }
-
-    .downloadCard {
-      position: relative;
-      overflow: hidden;
-      border: 1px solid var(--border);
-      border-radius: calc(var(--radius) + 8px);
-      padding: 20px;
-      background: linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.03) 100%);
-      box-shadow: var(--shadow-soft);
-      backdrop-filter: blur(8px);
-    }
-
-    .downloadCard::before {
-      content: "";
-      position: absolute;
-      inset: -1px;
-      background:
-        radial-gradient(760px 240px at 20% 0%, rgba(124, 58, 237, 0.26) 0%, transparent 65%),
-        radial-gradient(700px 240px at 84% 0%, rgba(34, 211, 238, 0.16) 0%, transparent 70%);
-      pointer-events: none;
-      opacity: 0.85;
-    }
-
-    .downloadCard > * { position: relative; }
-
-    .downloadGrid {
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 16px;
-      align-items: center;
-    }
-
-    .footer {
-      margin-top: 22px;
-      padding-top: 14px;
-      border-top: 1px solid var(--border-2);
-      font-size: 13px;
-      color: var(--muted);
-    }
-
-    .cards {
-      .wrap { padding: 38px 14px 30px; }
-      .hero { padding: 18px 14px; }
-      h1 { font-size: 36px; }
-      .heroGrid { grid-template-columns: 1fr; }
-      .graphic { height: 220px; }
-      .cards { grid-template-columns: 1fr; }
-      .downloadGrid { grid-template-columns: 1fr; }
-      margin-top: 16px;
-
-    @media (max-width: 980px) {
-      .cards { grid-template-columns: 1fr; }
-    }
-    }
-
-    .section {
-      margin-top: 18px;
-    }
-      <div class="heroGrid">
-        <div>
-          <div class="kicker"><span class="kickerDot" aria-hidden="true"></span>Premium Desktop Signal Copier</div>
-          <h1><span class="titleAccent">FlameBot</span></h1>
-          <p class="lead">FlameBot is a desktop companion that helps you connect Telegram signal channels to MetaTrader automation. It guides setup, keeps everything organized, and ships with the included MT4 + MT5 Expert Advisors (EAs) inside the same bundle.</p>
-          <p class="muted">Built for clean setup, fast workflow, and a professional trading experience.</p>
-          <div class="scrollHint">Scroll down for the download button or <a href="#download">jump to download</a>.</div>
-        </div>
-
-        <div class="graphic" aria-hidden="true">
-          <svg viewBox="0 0 760 420" preserveAspectRatio="none">
-            <defs>
-              <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0%" stop-color="rgba(124,58,237,0.60)" />
-                <stop offset="45%" stop-color="rgba(34,211,238,0.40)" />
-                <stop offset="100%" stop-color="rgba(255,122,24,0.25)" />
-              </linearGradient>
-              <radialGradient id="g2" cx="50%" cy="38%" r="60%">
-                <stop offset="0%" stop-color="rgba(255,255,255,0.18)" />
-                <stop offset="55%" stop-color="rgba(255,255,255,0.06)" />
-                <stop offset="100%" stop-color="rgba(255,255,255,0.00)" />
-              </radialGradient>
-            </defs>
-            <rect x="0" y="0" width="760" height="420" fill="rgba(255,255,255,0.02)" />
-            <circle cx="420" cy="210" r="148" fill="url(#g2)" />
-            <circle cx="420" cy="210" r="170" fill="none" stroke="url(#g1)" stroke-width="2" opacity="0.75" />
-            <circle cx="420" cy="210" r="220" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="1" opacity="0.6" />
-            <path d="M110 285 C 190 170, 260 165, 345 220 C 430 275, 510 285, 650 170" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="2" />
-            <path d="M110 285 C 190 170, 260 165, 345 220 C 430 275, 510 285, 650 170" fill="none" stroke="rgba(255,122,24,0.20)" stroke-width="6" opacity="0.35" />
-            <circle cx="110" cy="285" r="6" fill="rgba(255,122,24,0.65)" />
-            <circle cx="345" cy="220" r="6" fill="rgba(34,211,238,0.60)" />
-            <circle cx="650" cy="170" r="6" fill="rgba(124,58,237,0.65)" />
-          </svg>
-        </div>
-      </div>
-      justify-content: space-between;
-
-    <div class="section" aria-label="What FlameBot does">
-      <div class="sectionHead">
-        <h2>What FlameBot Does</h2>
-      </div>
-      <div class="cards">
-        <div class="card">
-          <h3>Connect Telegram</h3>
-          <p class="muted">Log in and select the groups/channels you want to follow.</p>
-        </div>
-        <div class="card">
-          <h3>Route to MT4 / MT5</h3>
-          <p class="muted">Use the included EAs to execute trades on your MetaTrader terminal.</p>
-        </div>
-        <div class="card">
-          <h3>Control the rules</h3>
-          <p class="muted">Manage lot size, symbols, and trade controls in one place.</p>
-        </div>
-      </div>
-    </div>
-
-    <div class="section" id="download" aria-label="Download">
-      <div class="downloadCard">
-        <div class="downloadGrid">
-          <div>
-            <div class="kicker"><span class="kickerDot" aria-hidden="true"></span>Download</div>
-            <h2 style="margin: 12px 0 8px; font-size: 24px; letter-spacing: -0.01em;">Get FlameBot (Windows bundle)</h2>
-            <p class="muted" style="margin: 0;">Includes the desktop app + the MT4/MT5 EAs inside the same download.</p>
-          </div>
-          <a class="btn" href="download.html">Go to download page</a>
-        </div>
-      </div>
-    </div>
-
-    <div class="footer">
-      <div>By downloading, you agree to use the software responsibly and in accordance with your broker/platform rules.</div>
-    </div>
-    .card {
+      font-weight: 700;
       letter-spacing: -0.01em;
       box-shadow: 0 14px 30px rgba(0, 0, 0, 0.45);
     }

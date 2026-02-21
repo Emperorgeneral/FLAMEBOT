@@ -341,11 +341,17 @@
     </div>
 
     <div class="footer">
-      <div><strong>Tip:</strong> Host the zip on GitHub Releases or Cloud storage, and point the download button to the direct file URL.</div>
+      <div>© <span id="year"></span> FlameBot. All rights reserved.</div>
     </div>
   </div>
 
   <script>
+    // Keep the copyright year current.
+    (function () {
+      const el = document.getElementById('year');
+      if (el) el.textContent = String(new Date().getFullYear());
+    })();
+
     // Hide missing screenshots so the page never shows broken image icons.
     (function () {
       const section = document.getElementById('preview');

@@ -40,8 +40,8 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import copy
 from collections import OrderedDict, deque
 
-from app.version import APP_VERSION, GITHUB_OWNER, GITHUB_REPO, WINDOWS_UPDATE_ASSET_NAME
-import app.updater as flamebot_updater
+from .version import APP_VERSION, GITHUB_OWNER, GITHUB_REPO, WINDOWS_UPDATE_ASSET_NAME
+from . import updater as flamebot_updater
 
 import ctypes
 from ctypes import wintypes

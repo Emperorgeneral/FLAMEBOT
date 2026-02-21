@@ -34,8 +34,6 @@ Note: screenshots are shown on `download.html`.
 3) Upload `dist/FlameBot-Windows.zip` as a release asset.
 4) Use this URL format on the website:
 
-`https://github.com/OWNER/REPO/releases/latest/download/FlameBot-Windows.zip`
-
-Replace `OWNER/REPO` with your repo.
+`https://github.com/Emperorgeneral/FLAMEBOT/releases/latest/download/FlameBot-Windows.zip`
 
 Update the Windows download link in `index.html` to point to wherever you host that zip (GitHub Release asset URL, S3/R2 public URL, etc.).

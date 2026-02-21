@@ -9,8 +9,8 @@ APP_VERSION = "1.0"
 
 # GitHub repo used for auto-updates (set these before building a release).
 # You can still override via env vars at runtime.
-GITHUB_OWNER = ""
-GITHUB_REPO = ""
+GITHUB_OWNER = "Emperorgeneral"
+GITHUB_REPO = "FLAMEBOT"
 
 # Default expected GitHub Release asset for Windows updates.
 # This matches the output of build_windows.ps1.

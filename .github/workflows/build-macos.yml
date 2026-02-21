@@ -1,6 +1,6 @@
 name: Build macOS app
 
-on:
+"on":
   workflow_dispatch:
   push:
     branches: [ main, master ]

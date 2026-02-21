@@ -11,6 +11,22 @@ This is a static website with:
 - GitHub Pages
 - Railway (connect a Git repo and deploy the `website/` folder)
 
+## Local preview
+
+From the `website/` folder:
+
+- `python -m http.server 5173`
+- Open `http://localhost:5173`
+
+## Railway deploy (simple)
+
+This repo includes `website/package.json` so Railway can deploy the site as a small Node web service.
+
+1) Railway: **New Project** -> **Deploy from GitHub repo**
+2) In the service settings, set **Root Directory** to `website`
+3) Railway will run `npm install` and then `npm start`
+4) Once deployed, open the Railway-provided URL
+
 ## What to upload
 
 - Build output zips:

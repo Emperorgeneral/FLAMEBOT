@@ -15,9 +15,25 @@ ENTRY="app/flamebot_entry.py"
 
 rm -rf build dist
 
-"$PYTHON_BIN" -m PyInstaller --noconfirm --clean --name FlameBot --windowed \
-  --add-data "eas:eas" \
-  "$ENTRY"
+PYI_ARGS=(
+  --noconfirm
+  --clean
+  --name FlameBot
+  --windowed
+  --add-data "eas:eas"
+  --add-data "app/country.json:."
+  --add-data "app/splash.png:."
+  --add-data "app/icon.ico:."
+)
+
+# Managed Telegram API app config (optional, recommended for public builds)
+if [[ -f "app/telegram_app.json" ]]; then
+  PYI_ARGS+=(--add-data "app/telegram_app.json:.")
+else
+  echo "NOTE: app/telegram_app.json not found; building without managed Telegram API creds."
+fi
+
+"$PYTHON_BIN" -m PyInstaller "${PYI_ARGS[@]}" "$ENTRY"
 
 echo "[3/4] Staging bundle extras"
 # Put EA files beside the app too (easier for users + works with in-app installer fallback).

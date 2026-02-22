@@ -7,4 +7,8 @@ dist/
 *.log
 *.ndjson
 settings.json
+telegram_app.json
 signals.ndjson
+signals.json
+.tmp_git_state.txt
+.tmp_git_*.txt

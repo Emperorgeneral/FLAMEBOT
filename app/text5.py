@@ -300,16 +300,36 @@ _MANAGED_TG_APP_LOCK = threading.Lock()
 
 def _find_telegram_app_config_file() -> Optional[Path]:
     candidates: List[Path] = []
+    # PyInstaller onedir builds commonly place --add-data files under dist/<app>/_internal.
+    # Search there explicitly so public builds can find telegram_app.json reliably.
     # Packaged executable location (PyInstaller/py2exe style)
     try:
         exe = str(getattr(sys, "executable", "") or "").strip()
         if exe:
-            candidates.append(Path(exe).resolve().parent / "telegram_app.json")
+            exe_dir = Path(exe).resolve().parent
+            candidates.append(exe_dir / "telegram_app.json")
+            candidates.append(exe_dir / "_internal" / "telegram_app.json")
+    except Exception:
+        pass
+    # Onefile extraction directory (PyInstaller)
+    try:
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            mp = Path(str(meipass))
+            candidates.append(mp / "telegram_app.json")
+            candidates.append(mp / "_internal" / "telegram_app.json")
     except Exception:
         pass
     # Script location
     try:
         candidates.append(Path(__file__).resolve().parent / "telegram_app.json")
+    except Exception:
+        pass
+    # Best-effort resource resolver (works for many frozen layouts)
+    try:
+        rp = str(resolve_resource_path("telegram_app.json") or "").strip()
+        if rp and rp != "telegram_app.json":
+            candidates.append(Path(rp))
     except Exception:
         pass
     # Launch location
@@ -8213,21 +8233,38 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
     def _load_settings(self) -> dict:
-        # Prefer the historical local settings.json in CWD, but fall back to the
-        # per-user app directory if CWD is not writable or the file is missing.
-        try:
-            obj = _safe_read_json_dict(SETTINGS_FILE)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
+        # Public/packaged builds should prefer per-user settings under SESSION_DIR.
+        # This avoids reading or creating a local settings.json next to the EXE.
+        prefer_user = bool(getattr(sys, "frozen", False))
+        if prefer_user:
+            try:
+                obj2 = _safe_read_json_dict(SETTINGS_FALLBACK_FILE)
+                if isinstance(obj2, dict):
+                    return obj2
+            except Exception:
+                pass
+            try:
+                obj = _safe_read_json_dict(SETTINGS_FILE)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+        else:
+            # Prefer the historical local settings.json in CWD, but fall back to the
+            # per-user app directory if CWD is not writable or the file is missing.
+            try:
+                obj = _safe_read_json_dict(SETTINGS_FILE)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
 
-        try:
-            obj2 = _safe_read_json_dict(SETTINGS_FALLBACK_FILE)
-            if isinstance(obj2, dict):
-                return obj2
-        except Exception:
-            pass
+            try:
+                obj2 = _safe_read_json_dict(SETTINGS_FALLBACK_FILE)
+                if isinstance(obj2, dict):
+                    return obj2
+            except Exception:
+                pass
 
         return {}
 
@@ -8924,18 +8961,26 @@ class MainWindow(QtWidgets.QWidget):
             "entry_mode_psl": (self._trade_control_by_mode.get("psl", {}).get("entry_mode") if hasattr(self, "_trade_control_by_mode") else self.entry_mode),
         }
         ok = False
-        try:
-            ok = _atomic_write_json(SETTINGS_FILE, payload)
-        except Exception:
-            ok = False
-
-        # If CWD is not writable (common for installed apps), fall back to a
-        # per-user path under SESSION_DIR.
-        if not ok:
+        prefer_user = bool(getattr(sys, "frozen", False))
+        if prefer_user:
+            # Packaged builds: write per-user only.
             try:
                 ok = _atomic_write_json(SETTINGS_FALLBACK_FILE, payload)
             except Exception:
                 ok = False
+        else:
+            try:
+                ok = _atomic_write_json(SETTINGS_FILE, payload)
+            except Exception:
+                ok = False
+
+            # If CWD is not writable (common for installed apps), fall back to a
+            # per-user path under SESSION_DIR.
+            if not ok:
+                try:
+                    ok = _atomic_write_json(SETTINGS_FALLBACK_FILE, payload)
+                except Exception:
+                    ok = False
 
         if ok:
             try:
@@ -9585,7 +9630,7 @@ class MainWindow(QtWidgets.QWidget):
         self.title_label.setObjectName("title")
         self.title_label.setAlignment(QtCore.Qt.AlignCenter)
         self.subtitle_label = QtWidgets.QLabel(
-            "Connect your Telegram account in three simple steps."
+            "Connect your Telegram account in two simple steps."
         )
         self.subtitle_label.setObjectName("subtitle")
         self.subtitle_label.setAlignment(QtCore.Qt.AlignCenter)
@@ -9594,34 +9639,18 @@ class MainWindow(QtWidgets.QWidget):
         card_layout.addWidget(self.subtitle_label)
         self.stack = QtWidgets.QStackedWidget()
         card_layout.addWidget(self.stack)
-        api_page = QtWidgets.QWidget()
-        api_layout = QtWidgets.QVBoxLayout(api_page)
-        api_layout.setSpacing(10)
-        api_info = QtWidgets.QLabel(
-            "Step 1 of 3 • Enter your Telegram API credentials from my.telegram.org."
-        )
-        self.api_info_label = api_info
-        api_info.setWordWrap(True)
-        api_layout.addWidget(api_info)
-        self.api_id = QtWidgets.QLineEdit()
-        self.api_id.setPlaceholderText("API ID")
-        self.api_hash = QtWidgets.QLineEdit()
-        self.api_hash.setPlaceholderText("API HASH")
-        api_layout.addWidget(self.api_id)
-        api_layout.addWidget(self.api_hash)
-        self.btn_api_next = QtWidgets.QPushButton("Next")
-        self.btn_api_next.setObjectName("primary")
-        self.btn_api_next.setEnabled(False)
-        api_btn_row = QtWidgets.QHBoxLayout()
-        api_btn_row.addStretch()
-        api_btn_row.addWidget(self.btn_api_next)
-        api_layout.addLayout(api_btn_row)
-        self.stack.addWidget(api_page)
+        # Hidden credential inputs retained for compatibility with existing
+        # managed-credentials logic (telegram_app.json). They are not part of
+        # the wizard UX anymore.
+        self.api_id = QtWidgets.QLineEdit(wizard_page)
+        self.api_hash = QtWidgets.QLineEdit(wizard_page)
+        self.api_id.hide()
+        self.api_hash.hide()
         phone_page = QtWidgets.QWidget()
         phone_layout = QtWidgets.QVBoxLayout(phone_page)
         phone_layout.setSpacing(10)
         phone_info = QtWidgets.QLabel(
-            "Step 2 of 3 • Confirm your country and enter your phone number."
+            "Step 1 of 2 • Confirm your country and enter your phone number."
         )
         self.phone_info_label = phone_info
         phone_info.setWordWrap(True)
@@ -9661,7 +9690,7 @@ class MainWindow(QtWidgets.QWidget):
         code_layout = QtWidgets.QVBoxLayout(code_page)
         code_layout.setSpacing(10)
         code_info = QtWidgets.QLabel(
-            "Step 3 of 3 • Enter the login code from Telegram.\n"
+            "Step 2 of 2 • Enter the login code from Telegram.\n"
             "If your account has 2FA, you can also enter your password."
         )
         self.code_info_label = code_info
@@ -11352,11 +11381,8 @@ class MainWindow(QtWidgets.QWidget):
         super().keyPressEvent(event)
 
     def _connect_signals(self) -> None:
-        self.api_id.textChanged.connect(self._update_api_next_state)
-        self.api_hash.textChanged.connect(self._update_api_next_state)
-        self.btn_api_next.clicked.connect(self._go_to_phone_page)
         self.btn_phone_back.clicked.connect(self._go_back_from_phone_page)
-        self.btn_code_back.clicked.connect(lambda: self.stack.setCurrentIndex(1))
+        self.btn_code_back.clicked.connect(lambda: self.stack.setCurrentIndex(0))
         self.country_button.pressed.connect(self._open_country_dialog)
         self.phone.textChanged.connect(self._on_phone_text_changed)
         self.btn_send.clicked.connect(self.on_send)
@@ -11699,31 +11725,16 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
     def _update_api_next_state(self) -> None:
-        # Public builds may manage Telegram API credentials via telegram_app.json.
-        # If managed, keep Next enabled even though the inputs are hidden/disabled.
-        try:
-            if bool(getattr(self, "_tg_api_managed", False)):
-                self.btn_api_next.setEnabled(True)
-                return
-        except Exception:
-            pass
-        api_ok = bool(self.api_id.text().strip())
-        hash_ok = bool(self.api_hash.text().strip())
-        self.btn_api_next.setEnabled(api_ok and hash_ok)
+        # Two-step wizard: no credentials page / Next button.
+        return
 
     def _go_back_from_phone_page(self) -> None:
-        # If credentials are managed, do not navigate back to the disabled API page.
-        try:
-            if bool(getattr(self, "_tg_api_managed", False)):
-                self.stack.setCurrentIndex(1)
-                return
-        except Exception:
-            pass
+        # Phone page is the first page in the two-step wizard.
         self.stack.setCurrentIndex(0)
 
     def _go_to_phone_page(self) -> None:
-        self.stack.setCurrentIndex(1)
-        self.subtitle_label.setText("Now confirm your country and phone number.")
+        self.stack.setCurrentIndex(0)
+        self.subtitle_label.setText("Connect your Telegram account in two simple steps.")
         if not self.phone.text().strip():
             self._suppress_phone_sync = True
             self.phone.setText("+")
@@ -11897,7 +11908,7 @@ class MainWindow(QtWidgets.QWidget):
     def on_code_sent(self) -> None:
         self._set_auth_busy(False)
         self._log("Code sent. Check Telegram.")
-        self.stack.setCurrentIndex(2)
+        self.stack.setCurrentIndex(1)
         self.password.clear()
         self.password.setVisible(False)
         self.password_toggle.hide()

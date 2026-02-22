@@ -1,0 +1,1466 @@
+[
+    {
+        "name": "Afghanistan",
+        "iso": "AF",
+        "dial_code": "+93",
+        "flag": "🇦🇫"
+    },
+    {
+        "name": "Albania",
+        "iso": "AL",
+        "dial_code": "+355",
+        "flag": "🇦🇱"
+    },
+    {
+        "name": "Algeria",
+        "iso": "DZ",
+        "dial_code": "+213",
+        "flag": "🇩🇿"
+    },
+    {
+        "name": "American Samoa",
+        "iso": "AS",
+        "dial_code": "+1684",
+        "flag": "🇦🇸"
+    },
+    {
+        "name": "Andorra",
+        "iso": "AD",
+        "dial_code": "+376",
+        "flag": "🇦🇩"
+    },
+    {
+        "name": "Angola",
+        "iso": "AO",
+        "dial_code": "+244",
+        "flag": "🇦🇴"
+    },
+    {
+        "name": "Anguilla",
+        "iso": "AI",
+        "dial_code": "+1264",
+        "flag": "🇦🇮"
+    },
+    {
+        "name": "Antarctica",
+        "iso": "AQ",
+        "dial_code": "+672",
+        "flag": "🇦🇶"
+    },
+    {
+        "name": "Antigua and Barbuda",
+        "iso": "AG",
+        "dial_code": "+1268",
+        "flag": "🇦🇬"
+    },
+    {
+        "name": "Argentina",
+        "iso": "AR",
+        "dial_code": "+54",
+        "flag": "🇦🇷"
+    },
+    {
+        "name": "Armenia",
+        "iso": "AM",
+        "dial_code": "+374",
+        "flag": "🇦🇲"
+    },
+    {
+        "name": "Aruba",
+        "iso": "AW",
+        "dial_code": "+297",
+        "flag": "🇦🇼"
+    },
+    {
+        "name": "Australia",
+        "iso": "AU",
+        "dial_code": "+61",
+        "flag": "🇦🇺"
+    },
+    {
+        "name": "Austria",
+        "iso": "AT",
+        "dial_code": "+43",
+        "flag": "🇦🇹"
+    },
+    {
+        "name": "Azerbaijan",
+        "iso": "AZ",
+        "dial_code": "+994",
+        "flag": "🇦🇿"
+    },
+    {
+        "name": "Bahamas",
+        "iso": "BS",
+        "dial_code": "+1242",
+        "flag": "🇧🇸"
+    },
+    {
+        "name": "Bahrain",
+        "iso": "BH",
+        "dial_code": "+973",
+        "flag": "🇧🇭"
+    },
+    {
+        "name": "Bangladesh",
+        "iso": "BD",
+        "dial_code": "+880",
+        "flag": "🇧🇩"
+    },
+    {
+        "name": "Barbados",
+        "iso": "BB",
+        "dial_code": "+1246",
+        "flag": "🇧🇧"
+    },
+    {
+        "name": "Belarus",
+        "iso": "BY",
+        "dial_code": "+375",
+        "flag": "🇧🇾"
+    },
+    {
+        "name": "Belgium",
+        "iso": "BE",
+        "dial_code": "+32",
+        "flag": "🇧🇪"
+    },
+    {
+        "name": "Belize",
+        "iso": "BZ",
+        "dial_code": "+501",
+        "flag": "🇧🇿"
+    },
+    {
+        "name": "Benin",
+        "iso": "BJ",
+        "dial_code": "+229",
+        "flag": "🇧🇯"
+    },
+    {
+        "name": "Bermuda",
+        "iso": "BM",
+        "dial_code": "+1441",
+        "flag": "🇧🇲"
+    },
+    {
+        "name": "Bhutan",
+        "iso": "BT",
+        "dial_code": "+975",
+        "flag": "🇧🇹"
+    },
+    {
+        "name": "Bolivia",
+        "iso": "BO",
+        "dial_code": "+591",
+        "flag": "🇧🇴"
+    },
+    {
+        "name": "Bosnia and Herzegovina",
+        "iso": "BA",
+        "dial_code": "+387",
+        "flag": "🇧🇦"
+    },
+    {
+        "name": "Botswana",
+        "iso": "BW",
+        "dial_code": "+267",
+        "flag": "🇧🇼"
+    },
+    {
+        "name": "Brazil",
+        "iso": "BR",
+        "dial_code": "+55",
+        "flag": "🇧🇷"
+    },
+    {
+        "name": "British Indian Ocean Territory",
+        "iso": "IO",
+        "dial_code": "+246",
+        "flag": "🇮🇴"
+    },
+    {
+        "name": "British Virgin Islands",
+        "iso": "VG",
+        "dial_code": "+1284",
+        "flag": "🇻🇬"
+    },
+    {
+        "name": "Brunei",
+        "iso": "BN",
+        "dial_code": "+673",
+        "flag": "🇧🇳"
+    },
+    {
+        "name": "Bulgaria",
+        "iso": "BG",
+        "dial_code": "+359",
+        "flag": "🇧🇬"
+    },
+    {
+        "name": "Burkina Faso",
+        "iso": "BF",
+        "dial_code": "+226",
+        "flag": "🇧🇫"
+    },
+    {
+        "name": "Burundi",
+        "iso": "BI",
+        "dial_code": "+257",
+        "flag": "🇧🇮"
+    },
+    {
+        "name": "Cambodia",
+        "iso": "KH",
+        "dial_code": "+855",
+        "flag": "🇰🇭"
+    },
+    {
+        "name": "Cameroon",
+        "iso": "CM",
+        "dial_code": "+237",
+        "flag": "🇨🇲"
+    },
+    {
+        "name": "Canada",
+        "iso": "CA",
+        "dial_code": "+1",
+        "flag": "🇨🇦"
+    },
+    {
+        "name": "Cape Verde",
+        "iso": "CV",
+        "dial_code": "+238",
+        "flag": "🇨🇻"
+    },
+    {
+        "name": "Cayman Islands",
+        "iso": "KY",
+        "dial_code": "+1345",
+        "flag": "🇰🇾"
+    },
+    {
+        "name": "Central African Republic",
+        "iso": "CF",
+        "dial_code": "+236",
+        "flag": "🇨🇫"
+    },
+    {
+        "name": "Chad",
+        "iso": "TD",
+        "dial_code": "+235",
+        "flag": "🇹🇩"
+    },
+    {
+        "name": "Chile",
+        "iso": "CL",
+        "dial_code": "+56",
+        "flag": "🇨🇱"
+    },
+    {
+        "name": "China",
+        "iso": "CN",
+        "dial_code": "+86",
+        "flag": "🇨🇳"
+    },
+    {
+        "name": "Christmas Island",
+        "iso": "CX",
+        "dial_code": "+61",
+        "flag": "🇨🇽"
+    },
+    {
+        "name": "Cocos (Keeling) Islands",
+        "iso": "CC",
+        "dial_code": "+61",
+        "flag": "🇨🇨"
+    },
+    {
+        "name": "Colombia",
+        "iso": "CO",
+        "dial_code": "+57",
+        "flag": "🇨🇴"
+    },
+    {
+        "name": "Comoros",
+        "iso": "KM",
+        "dial_code": "+269",
+        "flag": "🇰🇲"
+    },
+    {
+        "name": "Congo",
+        "iso": "CG",
+        "dial_code": "+242",
+        "flag": "🇨🇬"
+    },
+    {
+        "name": "Congo (DRC)",
+        "iso": "CD",
+        "dial_code": "+243",
+        "flag": "🇨🇩"
+    },
+    {
+        "name": "Cook Islands",
+        "iso": "CK",
+        "dial_code": "+682",
+        "flag": "🇨🇰"
+    },
+    {
+        "name": "Costa Rica",
+        "iso": "CR",
+        "dial_code": "+506",
+        "flag": "🇨🇷"
+    },
+    {
+        "name": "Cote d'Ivoire",
+        "iso": "CI",
+        "dial_code": "+225",
+        "flag": "🇨🇮"
+    },
+    {
+        "name": "Croatia",
+        "iso": "HR",
+        "dial_code": "+385",
+        "flag": "🇭🇷"
+    },
+    {
+        "name": "Cuba",
+        "iso": "CU",
+        "dial_code": "+53",
+        "flag": "🇨🇺"
+    },
+    {
+        "name": "Curacao",
+        "iso": "CW",
+        "dial_code": "+599",
+        "flag": "🇨🇼"
+    },
+    {
+        "name": "Cyprus",
+        "iso": "CY",
+        "dial_code": "+357",
+        "flag": "🇨🇾"
+    },
+    {
+        "name": "Czech Republic",
+        "iso": "CZ",
+        "dial_code": "+420",
+        "flag": "🇨🇿"
+    },
+    {
+        "name": "Denmark",
+        "iso": "DK",
+        "dial_code": "+45",
+        "flag": "🇩🇰"
+    },
+    {
+        "name": "Djibouti",
+        "iso": "DJ",
+        "dial_code": "+253",
+        "flag": "🇩🇯"
+    },
+    {
+        "name": "Dominica",
+        "iso": "DM",
+        "dial_code": "+1767",
+        "flag": "🇩🇲"
+    },
+    {
+        "name": "Dominican Republic",
+        "iso": "DO",
+        "dial_code": "+1809",
+        "flag": "🇩🇴"
+    },
+    {
+        "name": "Dominican Republic",
+        "iso": "DO",
+        "dial_code": "+1829",
+        "flag": "🇩🇴"
+    },
+    {
+        "name": "Dominican Republic",
+        "iso": "DO",
+        "dial_code": "+1849",
+        "flag": "🇩🇴"
+    },
+    {
+        "name": "Ecuador",
+        "iso": "EC",
+        "dial_code": "+593",
+        "flag": "🇪🇨"
+    },
+    {
+        "name": "Egypt",
+        "iso": "EG",
+        "dial_code": "+20",
+        "flag": "🇪🇬"
+    },
+    {
+        "name": "El Salvador",
+        "iso": "SV",
+        "dial_code": "+503",
+        "flag": "🇸🇻"
+    },
+    {
+        "name": "Equatorial Guinea",
+        "iso": "GQ",
+        "dial_code": "+240",
+        "flag": "🇬🇶"
+    },
+    {
+        "name": "Eritrea",
+        "iso": "ER",
+        "dial_code": "+291",
+        "flag": "🇪🇷"
+    },
+    {
+        "name": "Estonia",
+        "iso": "EE",
+        "dial_code": "+372",
+        "flag": "🇪🇪"
+    },
+    {
+        "name": "Eswatini",
+        "iso": "SZ",
+        "dial_code": "+268",
+        "flag": "🇸🇿"
+    },
+    {
+        "name": "Ethiopia",
+        "iso": "ET",
+        "dial_code": "+251",
+        "flag": "🇪🇹"
+    },
+    {
+        "name": "Falkland Islands",
+        "iso": "FK",
+        "dial_code": "+500",
+        "flag": "🇫🇰"
+    },
+    {
+        "name": "Faroe Islands",
+        "iso": "FO",
+        "dial_code": "+298",
+        "flag": "🇫🇴"
+    },
+    {
+        "name": "Fiji",
+        "iso": "FJ",
+        "dial_code": "+679",
+        "flag": "🇫🇯"
+    },
+    {
+        "name": "Finland",
+        "iso": "FI",
+        "dial_code": "+358",
+        "flag": "🇫🇮"
+    },
+    {
+        "name": "France",
+        "iso": "FR",
+        "dial_code": "+33",
+        "flag": "🇫🇷"
+    },
+    {
+        "name": "French Guiana",
+        "iso": "GF",
+        "dial_code": "+594",
+        "flag": "🇬🇫"
+    },
+    {
+        "name": "French Polynesia",
+        "iso": "PF",
+        "dial_code": "+689",
+        "flag": "🇵🇫"
+    },
+    {
+        "name": "Gabon",
+        "iso": "GA",
+        "dial_code": "+241",
+        "flag": "🇬🇦"
+    },
+    {
+        "name": "Gambia",
+        "iso": "GM",
+        "dial_code": "+220",
+        "flag": "🇬🇲"
+    },
+    {
+        "name": "Georgia",
+        "iso": "GE",
+        "dial_code": "+995",
+        "flag": "🇬🇪"
+    },
+    {
+        "name": "Germany",
+        "iso": "DE",
+        "dial_code": "+49",
+        "flag": "🇩🇪"
+    },
+    {
+        "name": "Ghana",
+        "iso": "GH",
+        "dial_code": "+233",
+        "flag": "🇬🇭"
+    },
+    {
+        "name": "Gibraltar",
+        "iso": "GI",
+        "dial_code": "+350",
+        "flag": "🇬🇮"
+    },
+    {
+        "name": "Greece",
+        "iso": "GR",
+        "dial_code": "+30",
+        "flag": "🇬🇷"
+    },
+    {
+        "name": "Greenland",
+        "iso": "GL",
+        "dial_code": "+299",
+        "flag": "🇬🇱"
+    },
+    {
+        "name": "Grenada",
+        "iso": "GD",
+        "dial_code": "+1473",
+        "flag": "🇬🇩"
+    },
+    {
+        "name": "Guadeloupe",
+        "iso": "GP",
+        "dial_code": "+590",
+        "flag": "🇬🇵"
+    },
+    {
+        "name": "Guam",
+        "iso": "GU",
+        "dial_code": "+1671",
+        "flag": "🇬🇺"
+    },
+    {
+        "name": "Guatemala",
+        "iso": "GT",
+        "dial_code": "+502",
+        "flag": "🇬🇹"
+    },
+    {
+        "name": "Guernsey",
+        "iso": "GG",
+        "dial_code": "+44",
+        "flag": "🇬🇬"
+    },
+    {
+        "name": "Guinea",
+        "iso": "GN",
+        "dial_code": "+224",
+        "flag": "🇬🇳"
+    },
+    {
+        "name": "Guinea-Bissau",
+        "iso": "GW",
+        "dial_code": "+245",
+        "flag": "🇬🇼"
+    },
+    {
+        "name": "Guyana",
+        "iso": "GY",
+        "dial_code": "+592",
+        "flag": "🇬🇾"
+    },
+    {
+        "name": "Haiti",
+        "iso": "HT",
+        "dial_code": "+509",
+        "flag": "🇭🇹"
+    },
+    {
+        "name": "Honduras",
+        "iso": "HN",
+        "dial_code": "+504",
+        "flag": "🇭🇳"
+    },
+    {
+        "name": "Hong Kong",
+        "iso": "HK",
+        "dial_code": "+852",
+        "flag": "🇭🇰"
+    },
+    {
+        "name": "Hungary",
+        "iso": "HU",
+        "dial_code": "+36",
+        "flag": "🇭🇺"
+    },
+    {
+        "name": "Iceland",
+        "iso": "IS",
+        "dial_code": "+354",
+        "flag": "🇮🇸"
+    },
+    {
+        "name": "India",
+        "iso": "IN",
+        "dial_code": "+91",
+        "flag": "🇮🇳"
+    },
+    {
+        "name": "Indonesia",
+        "iso": "ID",
+        "dial_code": "+62",
+        "flag": "🇮🇩"
+    },
+    {
+        "name": "Iran",
+        "iso": "IR",
+        "dial_code": "+98",
+        "flag": "🇮🇷"
+    },
+    {
+        "name": "Iraq",
+        "iso": "IQ",
+        "dial_code": "+964",
+        "flag": "🇮🇶"
+    },
+    {
+        "name": "Ireland",
+        "iso": "IE",
+        "dial_code": "+353",
+        "flag": "🇮🇪"
+    },
+    {
+        "name": "Isle of Man",
+        "iso": "IM",
+        "dial_code": "+44",
+        "flag": "🇮🇲"
+    },
+    {
+        "name": "Israel",
+        "iso": "IL",
+        "dial_code": "+972",
+        "flag": "🇮🇱"
+    },
+    {
+        "name": "Italy",
+        "iso": "IT",
+        "dial_code": "+39",
+        "flag": "🇮🇹"
+    },
+    {
+        "name": "Jamaica",
+        "iso": "JM",
+        "dial_code": "+1876",
+        "flag": "🇯🇲"
+    },
+    {
+        "name": "Japan",
+        "iso": "JP",
+        "dial_code": "+81",
+        "flag": "🇯🇵"
+    },
+    {
+        "name": "Jersey",
+        "iso": "JE",
+        "dial_code": "+44",
+        "flag": "🇯🇪"
+    },
+    {
+        "name": "Jordan",
+        "iso": "JO",
+        "dial_code": "+962",
+        "flag": "🇯🇴"
+    },
+    {
+        "name": "Kazakhstan",
+        "iso": "KZ",
+        "dial_code": "+7",
+        "flag": "🇰🇿"
+    },
+    {
+        "name": "Kenya",
+        "iso": "KE",
+        "dial_code": "+254",
+        "flag": "🇰🇪"
+    },
+    {
+        "name": "Kiribati",
+        "iso": "KI",
+        "dial_code": "+686",
+        "flag": "🇰🇮"
+    },
+    {
+        "name": "Kosovo",
+        "iso": "XK",
+        "dial_code": "+383",
+        "flag": "🇽🇰"
+    },
+    {
+        "name": "Kuwait",
+        "iso": "KW",
+        "dial_code": "+965",
+        "flag": "🇰🇼"
+    },
+    {
+        "name": "Kyrgyzstan",
+        "iso": "KG",
+        "dial_code": "+996",
+        "flag": "🇰🇬"
+    },
+    {
+        "name": "Laos",
+        "iso": "LA",
+        "dial_code": "+856",
+        "flag": "🇱🇦"
+    },
+    {
+        "name": "Latvia",
+        "iso": "LV",
+        "dial_code": "+371",
+        "flag": "🇱🇻"
+    },
+    {
+        "name": "Lebanon",
+        "iso": "LB",
+        "dial_code": "+961",
+        "flag": "🇱🇧"
+    },
+    {
+        "name": "Lesotho",
+        "iso": "LS",
+        "dial_code": "+266",
+        "flag": "🇱🇸"
+    },
+    {
+        "name": "Liberia",
+        "iso": "LR",
+        "dial_code": "+231",
+        "flag": "🇱🇷"
+    },
+    {
+        "name": "Libya",
+        "iso": "LY",
+        "dial_code": "+218",
+        "flag": "🇱🇾"
+    },
+    {
+        "name": "Liechtenstein",
+        "iso": "LI",
+        "dial_code": "+423",
+        "flag": "🇱🇮"
+    },
+    {
+        "name": "Lithuania",
+        "iso": "LT",
+        "dial_code": "+370",
+        "flag": "🇱🇹"
+    },
+    {
+        "name": "Luxembourg",
+        "iso": "LU",
+        "dial_code": "+352",
+        "flag": "🇱🇺"
+    },
+    {
+        "name": "Macau",
+        "iso": "MO",
+        "dial_code": "+853",
+        "flag": "🇲🇴"
+    },
+    {
+        "name": "Madagascar",
+        "iso": "MG",
+        "dial_code": "+261",
+        "flag": "🇲🇬"
+    },
+    {
+        "name": "Malawi",
+        "iso": "MW",
+        "dial_code": "+265",
+        "flag": "🇲🇼"
+    },
+    {
+        "name": "Malaysia",
+        "iso": "MY",
+        "dial_code": "+60",
+        "flag": "🇲🇾"
+    },
+    {
+        "name": "Maldives",
+        "iso": "MV",
+        "dial_code": "+960",
+        "flag": "🇲🇻"
+    },
+    {
+        "name": "Mali",
+        "iso": "ML",
+        "dial_code": "+223",
+        "flag": "🇲🇱"
+    },
+    {
+        "name": "Malta",
+        "iso": "MT",
+        "dial_code": "+356",
+        "flag": "🇲🇹"
+    },
+    {
+        "name": "Marshall Islands",
+        "iso": "MH",
+        "dial_code": "+692",
+        "flag": "🇲🇭"
+    },
+    {
+        "name": "Martinique",
+        "iso": "MQ",
+        "dial_code": "+596",
+        "flag": "🇲🇶"
+    },
+    {
+        "name": "Mauritania",
+        "iso": "MR",
+        "dial_code": "+222",
+        "flag": "🇲🇷"
+    },
+    {
+        "name": "Mauritius",
+        "iso": "MU",
+        "dial_code": "+230",
+        "flag": "🇲🇺"
+    },
+    {
+        "name": "Mayotte",
+        "iso": "YT",
+        "dial_code": "+262",
+        "flag": "🇾🇹"
+    },
+    {
+        "name": "Mexico",
+        "iso": "MX",
+        "dial_code": "+52",
+        "flag": "🇲🇽"
+    },
+    {
+        "name": "Micronesia",
+        "iso": "FM",
+        "dial_code": "+691",
+        "flag": "🇫🇲"
+    },
+    {
+        "name": "Moldova",
+        "iso": "MD",
+        "dial_code": "+373",
+        "flag": "🇲🇩"
+    },
+    {
+        "name": "Monaco",
+        "iso": "MC",
+        "dial_code": "+377",
+        "flag": "🇲🇨"
+    },
+    {
+        "name": "Mongolia",
+        "iso": "MN",
+        "dial_code": "+976",
+        "flag": "🇲🇳"
+    },
+    {
+        "name": "Montenegro",
+        "iso": "ME",
+        "dial_code": "+382",
+        "flag": "🇲🇪"
+    },
+    {
+        "name": "Montserrat",
+        "iso": "MS",
+        "dial_code": "+1664",
+        "flag": "🇲🇸"
+    },
+    {
+        "name": "Morocco",
+        "iso": "MA",
+        "dial_code": "+212",
+        "flag": "🇲🇦"
+    },
+    {
+        "name": "Mozambique",
+        "iso": "MZ",
+        "dial_code": "+258",
+        "flag": "🇲🇿"
+    },
+    {
+        "name": "Myanmar",
+        "iso": "MM",
+        "dial_code": "+95",
+        "flag": "🇲🇲"
+    },
+    {
+        "name": "Namibia",
+        "iso": "NA",
+        "dial_code": "+264",
+        "flag": "🇳🇦"
+    },
+    {
+        "name": "Nauru",
+        "iso": "NR",
+        "dial_code": "+674",
+        "flag": "🇳🇷"
+    },
+    {
+        "name": "Nepal",
+        "iso": "NP",
+        "dial_code": "+977",
+        "flag": "🇳🇵"
+    },
+    {
+        "name": "Netherlands",
+        "iso": "NL",
+        "dial_code": "+31",
+        "flag": "🇳🇱"
+    },
+    {
+        "name": "New Caledonia",
+        "iso": "NC",
+        "dial_code": "+687",
+        "flag": "🇳🇨"
+    },
+    {
+        "name": "New Zealand",
+        "iso": "NZ",
+        "dial_code": "+64",
+        "flag": "🇳🇿"
+    },
+    {
+        "name": "Nicaragua",
+        "iso": "NI",
+        "dial_code": "+505",
+        "flag": "🇳🇮"
+    },
+    {
+        "name": "Niger",
+        "iso": "NE",
+        "dial_code": "+227",
+        "flag": "🇳🇪"
+    },
+    {
+        "name": "Nigeria",
+        "iso": "NG",
+        "dial_code": "+234",
+        "flag": "🇳🇬"
+    },
+    {
+        "name": "Niue",
+        "iso": "NU",
+        "dial_code": "+683",
+        "flag": "🇳🇺"
+    },
+    {
+        "name": "North Korea",
+        "iso": "KP",
+        "dial_code": "+850",
+        "flag": "🇰🇵"
+    },
+    {
+        "name": "North Macedonia",
+        "iso": "MK",
+        "dial_code": "+389",
+        "flag": "🇲🇰"
+    },
+    {
+        "name": "Northern Mariana Islands",
+        "iso": "MP",
+        "dial_code": "+1670",
+        "flag": "🇲🇵"
+    },
+    {
+        "name": "Norway",
+        "iso": "NO",
+        "dial_code": "+47",
+        "flag": "🇳🇴"
+    },
+    {
+        "name": "Oman",
+        "iso": "OM",
+        "dial_code": "+968",
+        "flag": "🇴🇲"
+    },
+    {
+        "name": "Pakistan",
+        "iso": "PK",
+        "dial_code": "+92",
+        "flag": "🇵🇰"
+    },
+    {
+        "name": "Palau",
+        "iso": "PW",
+        "dial_code": "+680",
+        "flag": "🇵🇼"
+    },
+    {
+        "name": "Palestine",
+        "iso": "PS",
+        "dial_code": "+970",
+        "flag": "🇵🇸"
+    },
+    {
+        "name": "Panama",
+        "iso": "PA",
+        "dial_code": "+507",
+        "flag": "🇵🇦"
+    },
+    {
+        "name": "Papua New Guinea",
+        "iso": "PG",
+        "dial_code": "+675",
+        "flag": "🇵🇬"
+    },
+    {
+        "name": "Paraguay",
+        "iso": "PY",
+        "dial_code": "+595",
+        "flag": "🇵🇾"
+    },
+    {
+        "name": "Peru",
+        "iso": "PE",
+        "dial_code": "+51",
+        "flag": "🇵🇪"
+    },
+    {
+        "name": "Philippines",
+        "iso": "PH",
+        "dial_code": "+63",
+        "flag": "🇵🇭"
+    },
+    {
+        "name": "Poland",
+        "iso": "PL",
+        "dial_code": "+48",
+        "flag": "🇵🇱"
+    },
+    {
+        "name": "Portugal",
+        "iso": "PT",
+        "dial_code": "+351",
+        "flag": "🇵🇹"
+    },
+    {
+        "name": "Puerto Rico",
+        "iso": "PR",
+        "dial_code": "+1787",
+        "flag": "🇵🇷"
+    },
+    {
+        "name": "Puerto Rico",
+        "iso": "PR",
+        "dial_code": "+1939",
+        "flag": "🇵🇷"
+    },
+    {
+        "name": "Qatar",
+        "iso": "QA",
+        "dial_code": "+974",
+        "flag": "🇶🇦"
+    },
+    {
+        "name": "Reunion",
+        "iso": "RE",
+        "dial_code": "+262",
+        "flag": "🇷🇪"
+    },
+    {
+        "name": "Romania",
+        "iso": "RO",
+        "dial_code": "+40",
+        "flag": "🇷🇴"
+    },
+    {
+        "name": "Russia",
+        "iso": "RU",
+        "dial_code": "+7",
+        "flag": "🇷🇺"
+    },
+    {
+        "name": "Rwanda",
+        "iso": "RW",
+        "dial_code": "+250",
+        "flag": "🇷🇼"
+    },
+    {
+        "name": "Saint Barthelemy",
+        "iso": "BL",
+        "dial_code": "+590",
+        "flag": "🇧🇱"
+    },
+    {
+        "name": "Saint Helena",
+        "iso": "SH",
+        "dial_code": "+290",
+        "flag": "🇸🇭"
+    },
+    {
+        "name": "Saint Kitts and Nevis",
+        "iso": "KN",
+        "dial_code": "+1869",
+        "flag": "🇰🇳"
+    },
+    {
+        "name": "Saint Lucia",
+        "iso": "LC",
+        "dial_code": "+1758",
+        "flag": "🇱🇨"
+    },
+    {
+        "name": "Saint Martin",
+        "iso": "MF",
+        "dial_code": "+590",
+        "flag": "🇲🇫"
+    },
+    {
+        "name": "Saint Pierre and Miquelon",
+        "iso": "PM",
+        "dial_code": "+508",
+        "flag": "🇵🇲"
+    },
+    {
+        "name": "Saint Vincent and the Grenadines",
+        "iso": "VC",
+        "dial_code": "+1784",
+        "flag": "🇻🇨"
+    },
+    {
+        "name": "Samoa",
+        "iso": "WS",
+        "dial_code": "+685",
+        "flag": "🇼🇸"
+    },
+    {
+        "name": "San Marino",
+        "iso": "SM",
+        "dial_code": "+378",
+        "flag": "🇸🇲"
+    },
+    {
+        "name": "Sao Tome and Principe",
+        "iso": "ST",
+        "dial_code": "+239",
+        "flag": "🇸🇹"
+    },
+    {
+        "name": "Saudi Arabia",
+        "iso": "SA",
+        "dial_code": "+966",
+        "flag": "🇸🇦"
+    },
+    {
+        "name": "Senegal",
+        "iso": "SN",
+        "dial_code": "+221",
+        "flag": "🇸🇳"
+    },
+    {
+        "name": "Serbia",
+        "iso": "RS",
+        "dial_code": "+381",
+        "flag": "🇷🇸"
+    },
+    {
+        "name": "Seychelles",
+        "iso": "SC",
+        "dial_code": "+248",
+        "flag": "🇸🇨"
+    },
+    {
+        "name": "Sierra Leone",
+        "iso": "SL",
+        "dial_code": "+232",
+        "flag": "🇸🇱"
+    },
+    {
+        "name": "Singapore",
+        "iso": "SG",
+        "dial_code": "+65",
+        "flag": "🇸🇬"
+    },
+    {
+        "name": "Sint Maarten",
+        "iso": "SX",
+        "dial_code": "+1721",
+        "flag": "🇸🇽"
+    },
+    {
+        "name": "Slovakia",
+        "iso": "SK",
+        "dial_code": "+421",
+        "flag": "🇸🇰"
+    },
+    {
+        "name": "Slovenia",
+        "iso": "SI",
+        "dial_code": "+386",
+        "flag": "🇸🇮"
+    },
+    {
+        "name": "Solomon Islands",
+        "iso": "SB",
+        "dial_code": "+677",
+        "flag": "🇸🇧"
+    },
+    {
+        "name": "Somalia",
+        "iso": "SO",
+        "dial_code": "+252",
+        "flag": "🇸🇴"
+    },
+    {
+        "name": "South Africa",
+        "iso": "ZA",
+        "dial_code": "+27",
+        "flag": "🇿🇦"
+    },
+    {
+        "name": "South Korea",
+        "iso": "KR",
+        "dial_code": "+82",
+        "flag": "🇰🇷"
+    },
+    {
+        "name": "South Sudan",
+        "iso": "SS",
+        "dial_code": "+211",
+        "flag": "🇸🇸"
+    },
+    {
+        "name": "Spain",
+        "iso": "ES",
+        "dial_code": "+34",
+        "flag": "🇪🇸"
+    },
+    {
+        "name": "Sri Lanka",
+        "iso": "LK",
+        "dial_code": "+94",
+        "flag": "🇱🇰"
+    },
+    {
+        "name": "Sudan",
+        "iso": "SD",
+        "dial_code": "+249",
+        "flag": "🇸🇩"
+    },
+    {
+        "name": "Suriname",
+        "iso": "SR",
+        "dial_code": "+597",
+        "flag": "🇸🇷"
+    },
+    {
+        "name": "Svalbard and Jan Mayen",
+        "iso": "SJ",
+        "dial_code": "+47",
+        "flag": "🇸🇯"
+    },
+    {
+        "name": "Sweden",
+        "iso": "SE",
+        "dial_code": "+46",
+        "flag": "🇸🇪"
+    },
+    {
+        "name": "Switzerland",
+        "iso": "CH",
+        "dial_code": "+41",
+        "flag": "🇨🇭"
+    },
+    {
+        "name": "Syria",
+        "iso": "SY",
+        "dial_code": "+963",
+        "flag": "🇸🇾"
+    },
+    {
+        "name": "Taiwan",
+        "iso": "TW",
+        "dial_code": "+886",
+        "flag": "🇹🇼"
+    },
+    {
+        "name": "Tajikistan",
+        "iso": "TJ",
+        "dial_code": "+992",
+        "flag": "🇹🇯"
+    },
+    {
+        "name": "Tanzania",
+        "iso": "TZ",
+        "dial_code": "+255",
+        "flag": "🇹🇿"
+    },
+    {
+        "name": "Thailand",
+        "iso": "TH",
+        "dial_code": "+66",
+        "flag": "🇹🇭"
+    },
+    {
+        "name": "Timor-Leste",
+        "iso": "TL",
+        "dial_code": "+670",
+        "flag": "🇹🇱"
+    },
+    {
+        "name": "Togo",
+        "iso": "TG",
+        "dial_code": "+228",
+        "flag": "🇹🇬"
+    },
+    {
+        "name": "Tokelau",
+        "iso": "TK",
+        "dial_code": "+690",
+        "flag": "🇹🇰"
+    },
+    {
+        "name": "Tonga",
+        "iso": "TO",
+        "dial_code": "+676",
+        "flag": "🇹🇴"
+    },
+    {
+        "name": "Trinidad and Tobago",
+        "iso": "TT",
+        "dial_code": "+1868",
+        "flag": "🇹🇹"
+    },
+    {
+        "name": "Tunisia",
+        "iso": "TN",
+        "dial_code": "+216",
+        "flag": "🇹🇳"
+    },
+    {
+        "name": "Turkey",
+        "iso": "TR",
+        "dial_code": "+90",
+        "flag": "🇹🇷"
+    },
+    {
+        "name": "Turkmenistan",
+        "iso": "TM",
+        "dial_code": "+993",
+        "flag": "🇹🇲"
+    },
+    {
+        "name": "Turks and Caicos Islands",
+        "iso": "TC",
+        "dial_code": "+1649",
+        "flag": "🇹🇨"
+    },
+    {
+        "name": "Tuvalu",
+        "iso": "TV",
+        "dial_code": "+688",
+        "flag": "🇹🇻"
+    },
+    {
+        "name": "U.S. Virgin Islands",
+        "iso": "VI",
+        "dial_code": "+1340",
+        "flag": "🇻🇮"
+    },
+    {
+        "name": "Uganda",
+        "iso": "UG",
+        "dial_code": "+256",
+        "flag": "🇺🇬"
+    },
+    {
+        "name": "Ukraine",
+        "iso": "UA",
+        "dial_code": "+380",
+        "flag": "🇺🇦"
+    },
+    {
+        "name": "United Arab Emirates",
+        "iso": "AE",
+        "dial_code": "+971",
+        "flag": "🇦🇪"
+    },
+    {
+        "name": "United Kingdom",
+        "iso": "GB",
+        "dial_code": "+44",
+        "flag": "🇬🇧"
+    },
+    {
+        "name": "United States",
+        "iso": "US",
+        "dial_code": "+1",
+        "flag": "🇺🇸"
+    },
+    {
+        "name": "Uruguay",
+        "iso": "UY",
+        "dial_code": "+598",
+        "flag": "🇺🇾"
+    },
+    {
+        "name": "Uzbekistan",
+        "iso": "UZ",
+        "dial_code": "+998",
+        "flag": "🇺🇿"
+    },
+    {
+        "name": "Vanuatu",
+        "iso": "VU",
+        "dial_code": "+678",
+        "flag": "🇻🇺"
+    },
+    {
+        "name": "Vatican City",
+        "iso": "VA",
+        "dial_code": "+379",
+        "flag": "🇻🇦"
+    },
+    {
+        "name": "Venezuela",
+        "iso": "VE",
+        "dial_code": "+58",
+        "flag": "🇻🇪"
+    },
+    {
+        "name": "Vietnam",
+        "iso": "VN",
+        "dial_code": "+84",
+        "flag": "🇻🇳"
+    },
+    {
+        "name": "Wallis and Futuna",
+        "iso": "WF",
+        "dial_code": "+681",
+        "flag": "🇼🇫"
+    },
+    {
+        "name": "Western Sahara",
+        "iso": "EH",
+        "dial_code": "+212",
+        "flag": "🇪🇭"
+    },
+    {
+        "name": "Yemen",
+        "iso": "YE",
+        "dial_code": "+967",
+        "flag": "🇾🇪"
+    },
+    {
+        "name": "Zambia",
+        "iso": "ZM",
+        "dial_code": "+260",
+        "flag": "🇿🇲"
+    },
+    {
+        "name": "Zimbabwe",
+        "iso": "ZW",
+        "dial_code": "+263",
+        "flag": "🇿🇼"
+    }
+]

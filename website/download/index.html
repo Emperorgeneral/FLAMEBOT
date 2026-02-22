@@ -264,6 +264,10 @@
       <h1>FlameBot Downloads</h1>
       <p class="muted">FlameBot is a desktop companion that helps you set up and manage your trading automation on MetaTrader. Each bundle includes the FlameBot app plus the included MT4 + MT5 Expert Advisors (EAs).</p>
       <p class="muted">Download the desktop app bundle. The MT4 + MT5 EAs are included inside the same download.</p>
+      <div style="margin-top: 14px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+        <a class="btn" id="autoDownloadBtn" href="/download/">Download for your device</a>
+        <span class="muted" id="detectedOsLabel" style="font-size: 13px;"></span>
+      </div>
       <p class="muted" style="margin-top: 8px;">Windows users: download, open the app, and install the EAs from Settings.</p>
       <p class="muted" style="margin-top: 8px;">macOS users: download, unzip, move <code>FlameBot.app</code> to Applications, then copy the included EAs into MT4/MT5.</p>
     </div>
@@ -360,6 +364,40 @@
     (function () {
       const el = document.getElementById('year');
       if (el) el.textContent = String(new Date().getFullYear());
+    })();
+
+    // Auto-select the best download for the current device.
+    (function () {
+      const winUrl = 'https://github.com/Emperorgeneral/FLAMEBOT/releases/latest/download/FlameBot-Windows.zip';
+      const macUrl = 'https://github.com/Emperorgeneral/FLAMEBOT/releases/latest/download/FlameBot-macOS.zip';
+
+      const btn = document.getElementById('autoDownloadBtn');
+      const label = document.getElementById('detectedOsLabel');
+      if (!btn) return;
+
+      const ua = String(navigator.userAgent || '').toLowerCase();
+      const platform = String(navigator.platform || '').toLowerCase();
+
+      const isMac = platform.includes('mac') || ua.includes('mac os') || ua.includes('macintosh');
+      const isWin = platform.includes('win') || ua.includes('windows');
+
+      if (isMac) {
+        btn.href = macUrl;
+        btn.textContent = 'Download for macOS';
+        if (label) label.textContent = 'Detected: macOS';
+        return;
+      }
+      if (isWin) {
+        btn.href = winUrl;
+        btn.textContent = 'Download for Windows';
+        if (label) label.textContent = 'Detected: Windows';
+        return;
+      }
+
+      // Unknown device: keep the user on this page with both options visible.
+      btn.href = '#';
+      btn.textContent = 'Choose a download below';
+      if (label) label.textContent = '';
     })();
 
     // Hide missing screenshots so the page never shows broken image icons.

@@ -1,0 +1,120 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to build/release (e.g. v2026.02.22)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    env:
+      FLAMEBOT_TG_API_ID: ${{ secrets.FLAMEBOT_TG_API_ID }}
+      FLAMEBOT_TG_API_HASH: ${{ secrets.FLAMEBOT_TG_API_HASH }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Ensure managed Telegram API secrets present
+        shell: bash
+        run: |
+          if [[ -z "${FLAMEBOT_TG_API_ID}" || -z "${FLAMEBOT_TG_API_HASH}" ]]; then
+            echo "Missing secrets. Set FLAMEBOT_TG_API_ID and FLAMEBOT_TG_API_HASH in GitHub repo Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Write app/telegram_app.json
+        shell: bash
+        run: |
+          mkdir -p app
+          cat > app/telegram_app.json <<EOF
+          {
+            "api_id": ${FLAMEBOT_TG_API_ID},
+            "api_hash": "${FLAMEBOT_TG_API_HASH}"
+          }
+          EOF
+
+      - name: Build Windows zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./build_windows.ps1 -Python python
+
+      - name: Build macOS zip
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash build_macos.sh
+
+      - name: Upload release artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows
+          path: dist/FlameBot-Windows.zip
+          if-no-files-found: error
+
+      - name: Upload release artifact (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-macos
+          path: dist/FlameBot-macOS.zip
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: List artifacts
+        shell: bash
+        run: |
+          ls -la release
+
+      - name: Create release (tag push)
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/FlameBot-Windows.zip
+            release/FlameBot-macOS.zip
+
+      - name: Create release (workflow dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          draft: true
+          files: |
+            release/FlameBot-Windows.zip
+            release/FlameBot-macOS.zip

@@ -3,7 +3,7 @@
 This is a static website with:
 
 - `index.html` (front page / marketing)
-- `download.html` (downloads + setup)
+- `download/index.html` (downloads + setup)
 
 ## Deploy options
 
@@ -43,7 +43,7 @@ To show the in-page preview gallery, add 3 screenshots here:
 
 If any are missing, the gallery auto-hides those items (and hides the section if none exist).
 
-Note: screenshots are shown on `download.html`.
+Note: screenshots are shown on `/download/` (backed by `download/index.html`).
 
 ## Recommended hosting (simple)
 

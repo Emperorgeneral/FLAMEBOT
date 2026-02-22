@@ -18,6 +18,8 @@ From the `website/` folder:
 - `python -m http.server 5173`
 - Open `http://localhost:5173`
 
+Note: the Windows `py` launcher may not be installed on some PCs. If `py` fails, use `python`.
+
 ## Railway deploy (simple)
 
 This repo includes `website/package.json` so Railway can deploy the site as a small Node web service.
@@ -26,6 +28,13 @@ This repo includes `website/package.json` so Railway can deploy the site as a sm
 2) In the service settings, set **Root Directory** to `website`
 3) Railway will run `npm install` and then `npm start`
 4) Once deployed, open the Railway-provided URL
+
+### Security headers (recommended)
+
+This site is static, but it is deployed on Railway as a Node service so we can send security headers.
+
+- The HTTP headers are set by `server.js` (CSP, HSTS on HTTPS, anti-framing, etc.)
+- The `website/_headers` file is included for hosts like Cloudflare Pages/Netlify, but Railway does not apply it automatically.
 
 ## What to upload
 

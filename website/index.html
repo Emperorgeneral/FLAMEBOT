@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'self' mailto:; upgrade-insecure-requests" />
+  <meta name="referrer" content="no-referrer" />
   <title>FlameBot</title>
   <link rel="icon" href="/assets/icon.ico" sizes="any" />
   <link rel="icon" type="image/png" href="/assets/icon.png" />
@@ -46,6 +48,50 @@
       max-width: 1060px;
       margin: 0 auto;
       padding: 52px 18px 46px;
+    }
+
+    .topNav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 8px);
+      background: rgba(255, 255, 255, 0.03);
+      backdrop-filter: blur(8px);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .topNav a {
+      color: rgba(243, 244, 246, 0.88);
+      text-decoration: none;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+      padding-bottom: 1px;
+      font-size: 13px;
+    }
+
+    .topNav a[aria-current="page"] {
+      color: rgba(243, 244, 246, 1);
+      border-bottom-color: rgba(255, 255, 255, 0.28);
+      font-weight: 800;
+    }
+
+    .topNavBrand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 850;
+      letter-spacing: -0.01em;
+    }
+
+    .topNavLinks {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
     }
 
     .hero {
@@ -304,6 +350,20 @@
 </head>
 <body>
   <div class="wrap">
+    <div class="topNav" role="navigation" aria-label="Primary">
+      <div class="topNavBrand">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:999px;background:rgba(255,122,24,0.75);box-shadow:0 0 22px rgba(255,122,24,0.55);"></span>
+        <span>FlameBot</span>
+      </div>
+      <div class="topNavLinks">
+        <a href="/" aria-current="page">Home</a>
+        <a href="/download/">Downloads</a>
+        <a href="/about.html">About</a>
+        <a href="/contact.html">Contact</a>
+        <a href="/terms.html">Terms</a>
+        <a href="/privacy.html">Privacy</a>
+      </div>
+    </div>
     <div class="hero">
       <div class="heroGrid">
         <div>
@@ -348,16 +408,56 @@
       </div>
       <div class="cards">
         <div class="card">
-          <h3>Connect Telegram</h3>
-          <p class="muted">Log in and select the groups/channels you want to follow.</p>
+          <h3>Ingest signals</h3>
+          <p class="muted">Connect Telegram and select the groups/channels you want to follow. FlameBot reads new messages and prepares them for automation.</p>
         </div>
         <div class="card">
-          <h3>Route to MT4 / MT5</h3>
-          <p class="muted">Use the included EAs to execute trades on your MetaTrader terminal.</p>
+          <h3>Normalize to trade intent</h3>
+          <p class="muted">Messages are parsed into structured trade intent (symbol, direction, entry, SL, TP targets) so the automation layer can behave consistently.</p>
         </div>
         <div class="card">
-          <h3>Control the rules</h3>
-          <p class="muted">Manage lot size, symbols, and trade controls in one place.</p>
+          <h3>Execute with rules</h3>
+          <p class="muted">The included MT4/MT5 EAs execute trades and apply your configured risk, symbol filters, and trade controls (close / breakeven / secure-half).</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" aria-label="How automation works">
+      <div class="sectionHead">
+        <h2>How It Works (Technical)</h2>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <h3>Signal source</h3>
+          <p class="muted">Signals are typically produced by third-party providers and posted in Telegram. FlameBot does not “invent” trades — it automates execution of the messages you choose to follow.</p>
+        </div>
+        <div class="card">
+          <h3>Automation pipeline</h3>
+          <p class="muted">Telegram message → desktop ingestion → backend queue/state → MetaTrader EA poll → order placement + trade-state reporting.</p>
+        </div>
+        <div class="card">
+          <h3>Failure behavior</h3>
+          <p class="muted">Automation is best-effort: network latency, Telegram outages, broker execution rules, and MetaTrader configuration can affect fill quality and timing.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" aria-label="Platforms supported">
+      <div class="sectionHead">
+        <h2>Platforms Supported</h2>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <h3>Telegram</h3>
+          <p class="muted">Follows your selected groups/channels and processes new signal messages for automation.</p>
+        </div>
+        <div class="card">
+          <h3>MetaTrader 4</h3>
+          <p class="muted">MT4 EA execution. MT4 may require WebRequest URL whitelisting in terminal settings.</p>
+        </div>
+        <div class="card">
+          <h3>MetaTrader 5</h3>
+          <p class="muted">MT5 EA execution. Works with brokers/prop firms that support MT5 and allow automated trading.</p>
         </div>
       </div>
     </div>
@@ -377,6 +477,12 @@
 
     <div class="footer">
       <div>By downloading, you agree to use the software responsibly and in accordance with your broker/platform rules.</div>
+      <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+        <a href="/about.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">About</a>
+        <a href="/contact.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Contact</a>
+        <a href="/terms.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Terms</a>
+        <a href="/privacy.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Privacy</a>
+      </div>
     </div>
   </div>
 </body>

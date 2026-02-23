@@ -8013,10 +8013,8 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 pass
             try:
-                # If Telegram API credentials are managed, skip the now-useless
-                # credentials page entirely (start on phone page).
-                idx = 1 if bool(getattr(self, "_tg_api_managed", False)) else 0
-                self.stack.setCurrentIndex(int(idx))
+                # Two-step wizard: phone page is always index 0.
+                self.stack.setCurrentIndex(0)
             except Exception:
                 pass
             try:
@@ -9071,7 +9069,7 @@ class MainWindow(QtWidgets.QWidget):
 
         # Skip directly to the phone page.
         try:
-            self.stack.setCurrentIndex(1)
+            self.stack.setCurrentIndex(0)
         except Exception:
             pass
 
@@ -13148,9 +13146,9 @@ class MainWindow(QtWidgets.QWidget):
                 self.group_subtitle.setText("")
                 if bool(getattr(self, "_tg_api_managed", False)):
                     self.subtitle_label.setText("Connect your Telegram account in two simple steps.")
-                    self.stack.setCurrentIndex(1)
+                    self.stack.setCurrentIndex(0)
                 else:
-                    self.subtitle_label.setText("Connect your Telegram account in three simple steps.")
+                    self.subtitle_label.setText("Connect your Telegram account in two simple steps.")
                     self.stack.setCurrentIndex(0)
                 self.main_stack.setCurrentIndex(0)
             except Exception:

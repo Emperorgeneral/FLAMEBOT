@@ -8,16 +8,10 @@ on:
 
 jobs:
   build-macos:
-    name: Build on ${{ matrix.runner }} (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-13
-            arch: x64
-          - runner: macos-14
-            arch: arm64
+    # Note: GitHub-hosted Intel mac runners (macos-13) are not available on many accounts.
+    # We target macOS 14 (Apple Silicon) which is the default GitHub macOS runner.
+    name: Build on macOS 14 (arm64)
+    runs-on: macos-14
 
     steps:
       - name: Checkout
@@ -43,7 +37,7 @@ jobs:
       - name: Upload artifact (ZIP)
         uses: actions/upload-artifact@v4
         with:
-          name: FlameBot-macOS-${{ matrix.arch }}
+          name: FlameBot-macOS-arm64
           path: dist/FlameBot-macOS.zip
           if-no-files-found: error
 

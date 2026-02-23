@@ -285,6 +285,7 @@ def _safe_read_json_dict(path: Path) -> Optional[dict]:
 # Implementation:
 # - Prefer a local `telegram_app.json` file
 # - Optional env overrides remain as a developer-only escape hatch
+# - Embedded fallback constants (code-level) if no file/env present
 # ---------------------------------------------------------------------------
 
 _MANAGED_TG_APP_CACHE: dict = {
@@ -296,6 +297,12 @@ _MANAGED_TG_APP_CACHE: dict = {
 }
 
 _MANAGED_TG_APP_LOCK = threading.Lock()
+
+# Embedded fallback credentials (preferred when you don't want to ship a file).
+# These are used ONLY if no env vars and no telegram_app.json are found.
+# To rotate without rebuild, place a new file at SESSION_DIR/telegram_app.json.
+EMBEDDED_TG_API_ID: int = 29469742
+EMBEDDED_TG_API_HASH: str = "74dc4ae153e1222ad40fafdd30126d00"
 
 
 def _find_telegram_app_config_file() -> Optional[Path]:
@@ -383,6 +390,12 @@ def _get_managed_telegram_app_credentials() -> Tuple[int, str, str]:
 
     cfg = _find_telegram_app_config_file()
     if not cfg:
+        # Fallback to embedded credentials when no file is present
+        try:
+            if int(EMBEDDED_TG_API_ID or 0) > 0 and str(EMBEDDED_TG_API_HASH or "").strip():
+                return int(EMBEDDED_TG_API_ID), str(EMBEDDED_TG_API_HASH).strip(), "embedded"
+        except Exception:
+            pass
         return 0, "", ""
 
     try:
@@ -424,6 +437,12 @@ def _get_managed_telegram_app_credentials() -> Tuple[int, str, str]:
         api_hash_val = ""
 
     if api_id_val <= 0 or not api_hash_val:
+        # If the JSON is missing/invalid, use embedded fallback
+        try:
+            if int(EMBEDDED_TG_API_ID or 0) > 0 and str(EMBEDDED_TG_API_HASH or "").strip():
+                return int(EMBEDDED_TG_API_ID), str(EMBEDDED_TG_API_HASH).strip(), "embedded"
+        except Exception:
+            pass
         return 0, "", ""
 
     try:

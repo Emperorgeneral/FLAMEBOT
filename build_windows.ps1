@@ -31,11 +31,10 @@ $pyiArgs = @(
   '--add-data', 'app\icon.ico;.'
 )
 
-# Managed Telegram API app config (optional, recommended for public builds)
+# Managed Telegram API app config is now embedded in code by default.
+# We no longer bundle app\telegram_app.json to keep creds out of the unpacked tree.
 if (Test-Path -LiteralPath (Join-Path $root 'app\telegram_app.json')) {
-  $pyiArgs += @('--add-data', 'app\telegram_app.json;.')
-} else {
-  Write-Host "NOTE: app\\telegram_app.json not found; building without managed Telegram API creds." -ForegroundColor Yellow
+  Write-Host "NOTE: Skipping bundling app\\telegram_app.json (using embedded creds)." -ForegroundColor Yellow
 }
 
 # Add bundled EA binaries into the dist folder under "eas/".

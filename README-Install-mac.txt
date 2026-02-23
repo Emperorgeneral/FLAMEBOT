@@ -6,6 +6,15 @@ FlameBot Desktop + MT4/MT5 EA Bundle (macOS)
    Note: If macOS shows a security warning (Gatekeeper):
    - Right-click FlameBot.app -> Open
 
+   Telegram API credentials
+   - The app ships with embedded Telegram API ID/Hash (managed mode). No telegram_app.json is shipped in the zip.
+   - Optional override without a rebuild: create ~/.tg_copier/telegram_app.json
+     {
+       "api_id": 1234567,
+       "api_hash": "your_api_hash"
+     }
+     Relaunch FlameBot after adding this file.
+
 2) Install EAs (choose one)
    A) In-app (recommended):
       - Open FlameBot
@@ -23,3 +32,9 @@ FlameBot Desktop + MT4/MT5 EA Bundle (macOS)
 
 After copying:
 - Restart MetaTrader, then attach the EA to a chart.
+
+ EA prerequisites (MT4 Options -> Expert Advisors):
+ - Allow automated trading
+ - Allow DLL imports
+ - Allow WebRequest for listed URL and add:
+    https://web-production-49c22.up.railway.app

@@ -26,11 +26,9 @@ PYI_ARGS=(
   --add-data "app/icon.ico:."
 )
 
-# Managed Telegram API app config (optional, recommended for public builds)
+# Managed Telegram API creds are embedded in code now; don't bundle telegram_app.json.
 if [[ -f "app/telegram_app.json" ]]; then
-  PYI_ARGS+=(--add-data "app/telegram_app.json:.")
-else
-  echo "NOTE: app/telegram_app.json not found; building without managed Telegram API creds."
+  echo "NOTE: Skipping bundling app/telegram_app.json (using embedded creds)."
 fi
 
 "$PYTHON_BIN" -m PyInstaller "${PYI_ARGS[@]}" "$ENTRY"

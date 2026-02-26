@@ -36,6 +36,15 @@ jobs:
         run: |
           git config --global user.name "EmperorGeneral"
 
+      - name: Install Inno Setup (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          # Show location for logs (should be under Program Files (x86))
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if ($iscc) { Write-Host "ISCC: $($iscc.Source)" } else { throw "ISCC.exe not found after install" }
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:

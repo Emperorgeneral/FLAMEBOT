@@ -37,6 +37,18 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      # Ensure Inno Setup (ISCC.exe) is available on Windows runners so we can
+      # produce the installer EXE inside CI. Chocolatey is preinstalled on
+      # GitHub-hosted Windows images.
+      - name: Install Inno Setup (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          # Show ISCC location for logs
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if ($iscc) { Write-Host "ISCC: $($iscc.Source)" } else { Write-Error "ISCC not found after install" }
+
       - name: Ensure managed Telegram API secrets present
         shell: bash
         run: |

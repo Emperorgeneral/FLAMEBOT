@@ -95,7 +95,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-assets-macos
-          path: dist/FlameBot-macOS.zip
+          path: |
+            dist/FlameBot-macOS.zip
+            dist/FlameBot-macOS.dmg
           if-no-files-found: error
 
   release:
@@ -123,6 +125,7 @@ jobs:
             release/FlameBot-Setup-v*.exe
             release/FlameBot-Windows.zip
             release/FlameBot-macOS.zip
+            release/FlameBot-macOS.dmg
 
       - name: Create release (workflow dispatch)
         if: github.event_name == 'workflow_dispatch'
@@ -135,3 +138,4 @@ jobs:
             release/FlameBot-Setup-v*.exe
             release/FlameBot-Windows.zip
             release/FlameBot-macOS.zip
+            release/FlameBot-macOS.dmg

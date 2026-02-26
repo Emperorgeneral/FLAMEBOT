@@ -37,14 +37,24 @@ jobs:
           cp -R eas dist/FlameBot-macOS/eas
           cp -f README-Install-mac.txt dist/FlameBot-macOS/README-Install-mac.txt
 
-      - name: Create zip
+      - name: Create zip and DMG
         run: |
           cd dist
           ditto -c -k --sequesterRsrc --keepParent FlameBot-macOS FlameBot-macOS.zip
+          hdiutil create -volname "FlameBot" -srcfolder "FlameBot-macOS" -fs HFS+ -format UDRW tmp.dmg
+          hdiutil convert tmp.dmg -format UDZO -imagekey zlib-level=9 -o "FlameBot-macOS.dmg"
+          rm -f tmp.dmg
 
-      - name: Upload artifact
+      - name: Upload artifact (ZIP)
         uses: actions/upload-artifact@v4
         with:
           name: FlameBot-macOS
           path: dist/FlameBot-macOS.zip
+          if-no-files-found: error
+
+      - name: Upload artifact (DMG)
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlameBot-macOS-dmg
+          path: dist/FlameBot-macOS.dmg
           if-no-files-found: error

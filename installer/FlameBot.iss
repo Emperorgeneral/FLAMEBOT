@@ -39,11 +39,11 @@ Name: "{group}\FlameBot"; Filename: "{app}\{#MyAppExeName}"
 Name: "{commondesktop}\FlameBot"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "cmd.exe"; Parameters: /c netsh advfirewall firewall delete rule name=FlameBot_Outbound program={app}\{#MyAppExeName}; Flags: runhidden; StatusMsg: "Removing previous Windows Firewall rule (if any)..."
+Filename: "cmd.exe"; Parameters: "/c netsh advfirewall firewall delete rule name=FlameBot_Outbound program=""{app}\{#MyAppExeName}"""; Flags: runhidden; StatusMsg: "Removing previous Windows Firewall rule (if any)..."
 
-Filename: "cmd.exe"; Parameters: /c netsh advfirewall firewall add rule name=FlameBot_Outbound dir=out action=allow program={app}\{#MyAppExeName} enable=yes; Flags: runhidden; StatusMsg: "Creating Windows Firewall rule for FlameBot (outbound allow)..."
+Filename: "cmd.exe"; Parameters: "/c netsh advfirewall firewall add rule name=FlameBot_Outbound dir=out action=allow program=""{app}\{#MyAppExeName}"" enable=yes"; Flags: runhidden; StatusMsg: "Creating Windows Firewall rule for FlameBot (outbound allow)..."
 
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch FlameBot"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
-Filename: "cmd.exe"; Parameters: /c netsh advfirewall firewall delete rule name=FlameBot_Outbound program={app}\{#MyAppExeName}; Flags: runhidden
+Filename: "cmd.exe"; Parameters: "/c netsh advfirewall firewall delete rule name=FlameBot_Outbound program=""{app}\{#MyAppExeName}"""; Flags: runhidden

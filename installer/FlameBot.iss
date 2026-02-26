@@ -8,7 +8,7 @@
 #define MyAppExeName "FlameBot.exe"
 
 [Setup]
-AppId={{A5C8D6E4-2E1B-4AF1-9C31-5D8A9C1B7F42}
+AppId={{A5C8D6E4-2E1B-4AF1-9C31-5D8A9C1B7F42}} ; fixed missing closing brace
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=FlameCore

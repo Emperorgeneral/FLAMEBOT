@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'self' mailto:; upgrade-insecure-requests" />
+  <meta name="referrer" content="no-referrer" />
+  <title>FlameBot</title>
+  <meta name="description" content="FlameBot: Premium desktop companion that connects Telegram signal channels to MetaTrader automation (MT4/MT5 EAs included)." />
+  <link rel="canonical" href="https://www.flamebotapp.com/" />
+  <meta property="og:title" content="FlameBot" />
+  <meta property="og:description" content="Connect Telegram signal channels to MetaTrader automation. MT4/MT5 EAs included in the download." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://www.flamebotapp.com/" />
+  <meta property="og:image" content="/assets/logo.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <link rel="icon" href="/assets/icon.ico" sizes="any" />
+  <link rel="icon" type="image/png" href="/assets/icon.png" />
+  <link rel="apple-touch-icon" href="/assets/icon.png" />
+  <style>
+    :root {
+      color-scheme: dark;
+
+      /* Premium dark + tech glow */
+      --bg: #060814;
+      --bg-2: #070a1a;
+      --text: #f3f4f6;
+      --muted: rgba(243, 244, 246, 0.72);
+      --border: rgba(255, 255, 255, 0.10);
+      --border-2: rgba(255, 255, 255, 0.08);
+      --panel: rgba(255, 255, 255, 0.04);
+
+      /* Use system accent when available; fall back to a neon-violet. */
+      --accent: AccentColor;
+      --accent-fallback: #7c3aed;
+      --accent-2: #22d3ee;
+
+      --shadow-soft: 0 18px 45px rgba(0, 0, 0, 0.45);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 520px at 16% -8%, rgba(124, 58, 237, 0.35) 0%, rgba(124, 58, 237, 0) 60%),
+        radial-gradient(980px 540px at 90% 2%, rgba(34, 211, 238, 0.20) 0%, rgba(34, 211, 238, 0) 60%),
+        radial-gradient(880px 520px at 70% 110%, rgba(124, 58, 237, 0.18) 0%, rgba(124, 58, 237, 0) 55%),
+        linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+    }
+
+    .wrap {
+      max-width: 1060px;
+      margin: 0 auto;
+      padding: 52px 18px 46px;
+    }
+
+    .topNav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 8px);
+      background: rgba(255, 255, 255, 0.03);
+      backdrop-filter: blur(8px);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .topNav a {
+      color: rgba(243, 244, 246, 0.88);
+      text-decoration: none;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+      padding-bottom: 1px;
+      font-size: 13px;
+    }
+
+    .topNav a[aria-current="page"] {
+      color: rgba(243, 244, 246, 1);
+      border-bottom-color: rgba(255, 255, 255, 0.28);
+      font-weight: 800;
+    }
+
+    .topNavBrand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 850;
+      letter-spacing: -0.01em;
+    }
+
+    .topNavLinks {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 26px 22px;
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 8px);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.03) 100%);
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(8px);
+    }
+
+    .hero::before {
+      content: "";
+      position: absolute;
+      inset: -1px;
+      background:
+        radial-gradient(700px 240px at 18% 0%, rgba(124, 58, 237, 0.35) 0%, rgba(124, 58, 237, 0) 65%),
+        radial-gradient(640px 240px at 88% 0%, rgba(34, 211, 238, 0.20) 0%, rgba(34, 211, 238, 0) 70%);
+      pointer-events: none;
+      opacity: 0.85;
+    }
+
+    .hero > * { position: relative; }
+
+    .heroGrid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 18px;
+      align-items: center;
+    }
+
+    .kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: rgba(243, 244, 246, 0.76);
+      padding: 10px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.03);
+      width: fit-content;
+    }
+
+    .kickerDot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255, 122, 24, 0.75);
+      box-shadow: 0 0 22px rgba(255, 122, 24, 0.55);
+      flex: 0 0 auto;
+    }
+
+    h1 {
+      font-size: 46px;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+      margin: 12px 0 10px;
+    }
+
+    .titleAccent {
+      background: linear-gradient(90deg, rgba(124, 58, 237, 1) 0%, rgba(34, 211, 238, 1) 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    p { line-height: 1.55; margin: 10px 0; }
+
+    .muted {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .lead {
+      font-size: 15px;
+      color: rgba(243, 244, 246, 0.76);
+      max-width: 62ch;
+    }
+
+    .scrollHint {
+      margin-top: 14px;
+      font-size: 12px;
+      color: rgba(243, 244, 246, 0.60);
+    }
+
+    .scrollHint a {
+      color: rgba(243, 244, 246, 0.82);
+      text-decoration: none;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+      padding-bottom: 1px;
+    }
+
+    .graphic {
+      position: relative;
+      border-radius: calc(var(--radius) + 10px);
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.03);
+      overflow: hidden;
+      height: 280px;
+      box-shadow: 0 22px 60px rgba(0, 0, 0, 0.55);
+    }
+
+    .graphic::before {
+      content: "";
+      position: absolute;
+      inset: -1px;
+      background:
+        radial-gradient(560px 260px at 20% 20%, rgba(255, 122, 24, 0.16), transparent 55%),
+        radial-gradient(520px 240px at 80% 30%, rgba(34, 211, 238, 0.14), transparent 58%),
+        radial-gradient(520px 240px at 50% 105%, rgba(124, 58, 237, 0.16), transparent 60%);
+      opacity: 0.95;
+      pointer-events: none;
+    }
+
+    .graphic svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0.95;
+    }
+
+    .section {
+      margin-top: 18px;
+    }
+
+    .sectionHead {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin: 0 0 12px;
+    }
+
+    .sectionHead h2 {
+      margin: 0;
+      font-size: 12px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: rgba(243, 244, 246, 0.70);
+    }
+
+    .cards {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-top: 16px;
+    }
+
+    .card {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      background: var(--panel);
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(8px);
+      min-height: 110px;
+    }
+
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: -1px;
+      background:
+        radial-gradient(480px 190px at 16% 0%, rgba(124, 58, 237, 0.20) 0%, rgba(124, 58, 237, 0) 62%),
+        radial-gradient(460px 190px at 88% 0%, rgba(34, 211, 238, 0.12) 0%, rgba(34, 211, 238, 0) 70%);
+      opacity: 0.55;
+      pointer-events: none;
+    }
+
+    .card > * { position: relative; }
+
+    .card h3 { margin: 0 0 8px; font-size: 16px; letter-spacing: -0.01em; }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px 18px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.10) 0%, rgba(255, 255, 255, 0.04) 100%);
+      text-decoration: none;
+      color: var(--text);
+      font-weight: 750;
+      letter-spacing: -0.01em;
+      box-shadow: 0 14px 30px rgba(0, 0, 0, 0.45);
+      width: fit-content;
+    }
+
+    .btn:focus {
+      outline: 3px solid rgba(124, 58, 237, 0.35);
+      outline-offset: 2px;
+    }
+
+    .downloadCard {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 8px);
+      padding: 20px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.03) 100%);
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(8px);
+    }
+
+    .downloadCard::before {
+      content: "";
+      position: absolute;
+      inset: -1px;
+      background:
+        radial-gradient(760px 240px at 20% 0%, rgba(124, 58, 237, 0.26) 0%, transparent 65%),
+        radial-gradient(700px 240px at 84% 0%, rgba(34, 211, 238, 0.16) 0%, transparent 70%);
+      pointer-events: none;
+      opacity: 0.85;
+    }
+
+    .downloadCard > * { position: relative; }
+
+    .downloadGrid {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+    }
+
+    .footer {
+      margin-top: 22px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border-2);
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    @media (max-width: 980px) {
+      .heroGrid { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: 1fr; }
+      .downloadGrid { grid-template-columns: 1fr; }
+      .graphic { height: 240px; }
+    }
+
+    @media (max-width: 520px) {
+      .wrap { padding: 38px 14px 30px; }
+      .hero { padding: 18px 14px; }
+      h1 { font-size: 36px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topNav" role="navigation" aria-label="Primary">
+      <div class="topNavBrand">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:999px;background:rgba(255,122,24,0.75);box-shadow:0 0 22px rgba(255,122,24,0.55);"></span>
+        <span>FlameBot</span>
+      </div>
+      <div class="topNavLinks">
+        <a href="/" aria-current="page">Home</a>
+        <a href="/download/">Downloads</a>
+        <a href="/about.html">About</a>
+        <a href="/contact.html">Contact</a>
+        <a href="/terms.html">Terms</a>
+        <a href="/privacy.html">Privacy</a>
+      </div>
+    </div>
+    <div class="hero">
+      <div class="heroGrid">
+        <div>
+          <div class="kicker"><span class="kickerDot" aria-hidden="true"></span>Premium Desktop Signal Copier</div>
+          <h1><span class="titleAccent">FlameBot</span></h1>
+          <p class="lead">FlameBot is a desktop companion that helps you connect Telegram signal channels to MetaTrader automation. It guides setup, keeps everything organized, and ships with the included MT4 + MT5 Expert Advisors (EAs) inside the same bundle.</p>
+          <p class="muted">Built for clean setup, fast workflow, and a professional trading experience.</p>
+          <div class="scrollHint">Scroll down for the download button or <a href="#download">jump to download</a>.</div>
+        </div>
+
+        <div class="graphic" aria-hidden="true">
+          <svg viewBox="0 0 760 420" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="rgba(124,58,237,0.60)" />
+                <stop offset="45%" stop-color="rgba(34,211,238,0.40)" />
+                <stop offset="100%" stop-color="rgba(255,122,24,0.25)" />
+              </linearGradient>
+              <radialGradient id="g2" cx="50%" cy="38%" r="60%">
+                <stop offset="0%" stop-color="rgba(255,255,255,0.18)" />
+                <stop offset="55%" stop-color="rgba(255,255,255,0.06)" />
+                <stop offset="100%" stop-color="rgba(255,255,255,0.00)" />
+              </radialGradient>
+            </defs>
+            <rect x="0" y="0" width="760" height="420" fill="rgba(255,255,255,0.02)" />
+            <circle cx="420" cy="210" r="148" fill="url(#g2)" />
+            <circle cx="420" cy="210" r="170" fill="none" stroke="url(#g1)" stroke-width="2" opacity="0.75" />
+            <circle cx="420" cy="210" r="220" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="1" opacity="0.6" />
+            <path d="M110 285 C 190 170, 260 165, 345 220 C 430 275, 510 285, 650 170" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="2" />
+            <path d="M110 285 C 190 170, 260 165, 345 220 C 430 275, 510 285, 650 170" fill="none" stroke="rgba(255,122,24,0.20)" stroke-width="6" opacity="0.35" />
+            <circle cx="110" cy="285" r="6" fill="rgba(255,122,24,0.65)" />
+            <circle cx="345" cy="220" r="6" fill="rgba(34,211,238,0.60)" />
+            <circle cx="650" cy="170" r="6" fill="rgba(124,58,237,0.65)" />
+          </svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" aria-label="What FlameBot does">
+      <div class="sectionHead">
+        <h2>What FlameBot Does</h2>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <h3>Ingest signals</h3>
+          <p class="muted">Connect Telegram and select the groups/channels you want to follow. FlameBot reads new messages and prepares them for automation.</p>
+        </div>
+        <div class="card">
+          <h3>Normalize to trade intent</h3>
+          <p class="muted">Messages are parsed into structured trade intent (symbol, direction, entry, SL, TP targets) so the automation layer can behave consistently.</p>
+        </div>
+        <div class="card">
+          <h3>Execute with rules</h3>
+          <p class="muted">The included MT4/MT5 EAs execute trades and apply your configured risk, symbol filters, and trade controls (close / breakeven / secure-half).</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" aria-label="How automation works">
+      <div class="sectionHead">
+        <h2>How It Works (Technical)</h2>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <h3>Signal source</h3>
+          <p class="muted">Signals are typically produced by third-party providers and posted in Telegram. FlameBot does not “invent” trades — it automates execution of the messages you choose to follow.</p>
+        </div>
+        <div class="card">
+          <h3>Automation pipeline</h3>
+          <p class="muted">Telegram message → desktop ingestion → backend queue/state → MetaTrader EA poll → order placement + trade-state reporting.</p>
+        </div>
+        <div class="card">
+          <h3>Failure behavior</h3>
+          <p class="muted">Automation is best-effort: network latency, Telegram outages, broker execution rules, and MetaTrader configuration can affect fill quality and timing.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" aria-label="Platforms supported">
+      <div class="sectionHead">
+        <h2>Platforms Supported</h2>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <h3>Telegram</h3>
+          <p class="muted">Follows your selected groups/channels and processes new signal messages for automation.</p>
+        </div>
+        <div class="card">
+          <h3>MetaTrader 4</h3>
+          <p class="muted">MT4 EA execution. MT4 may require WebRequest URL whitelisting in terminal settings.</p>
+        </div>
+        <div class="card">
+          <h3>MetaTrader 5</h3>
+          <p class="muted">MT5 EA execution. Works with brokers/prop firms that support MT5 and allow automated trading.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" id="download" aria-label="Download">
+      <div class="downloadCard">
+        <div class="downloadGrid">
+          <div>
+            <div class="kicker"><span class="kickerDot" aria-hidden="true"></span>Download</div>
+            <h2 style="margin: 12px 0 8px; font-size: 24px; letter-spacing: -0.01em;">Get FlameBot</h2>
+            <p class="muted" style="margin: 0;">Choose Windows or macOS bundle. MT4/MT5 EAs are included inside the same download.</p>
+          </div>
+          <a class="btn" href="/download/">Go to download page</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div>By downloading, you agree to use the software responsibly and in accordance with your broker/platform rules.</div>
+      <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+        <a href="/about.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">About</a>
+        <a href="/contact.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Contact</a>
+        <a href="/terms.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Terms</a>
+        <a href="/privacy.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Privacy</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

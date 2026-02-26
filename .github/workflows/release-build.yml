@@ -37,18 +37,6 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # Ensure Inno Setup (ISCC.exe) is available on Windows runners so we can
-      # produce the installer EXE inside CI. Chocolatey is preinstalled on
-      # GitHub-hosted Windows images.
-      - name: Install Inno Setup (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install innosetup -y --no-progress
-          # Show ISCC location for logs
-          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-          if ($iscc) { Write-Host "ISCC: $($iscc.Source)" } else { Write-Error "ISCC not found after install" }
-
       - name: Ensure managed Telegram API secrets present
         shell: bash
         run: |
@@ -68,31 +56,17 @@ jobs:
           }
           EOF
 
-      - name: Build Windows (portable + installer)
+      - name: Build Windows (portable + package zip)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           ./build_windows.ps1 -Python python
-
-      - name: Build Windows installer (explicit)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (Test-Path .\dist\FlameBot-Setup-v*.exe) { Write-Host "Installer already built" } else { ./build_inno.ps1 }
 
       - name: Build macOS zip
         if: runner.os == 'macOS'
         shell: bash
         run: |
           bash build_macos.sh
-
-      - name: Upload release artifact (Windows installer)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-assets-windows
-          path: dist/FlameBot-Setup-v*.exe
-          if-no-files-found: error
 
       - name: Upload release artifact (Windows zip)
         if: runner.os == 'Windows'
@@ -102,14 +76,12 @@ jobs:
           path: dist/FlameBot-Windows.zip
           if-no-files-found: error
 
-      - name: Upload release artifact (macOS)
+      - name: Upload release artifact (macOS zip)
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: release-assets-macos
-          path: |
-            dist/FlameBot-macOS.zip
-            dist/FlameBot-macOS.dmg
+          path: dist/FlameBot-macOS.zip
           if-no-files-found: error
 
   release:
@@ -134,10 +106,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/FlameBot-Setup-v*.exe
             release/FlameBot-Windows.zip
             release/FlameBot-macOS.zip
-            release/FlameBot-macOS.dmg
 
       - name: Create release (workflow dispatch)
         if: github.event_name == 'workflow_dispatch'
@@ -147,7 +117,5 @@ jobs:
           name: ${{ inputs.tag }}
           draft: true
           files: |
-            release/FlameBot-Setup-v*.exe
             release/FlameBot-Windows.zip
             release/FlameBot-macOS.zip
-            release/FlameBot-macOS.dmg

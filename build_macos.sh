@@ -41,15 +41,9 @@ cp -R "dist/FlameBot.app" "dist/FlameBot-macOS/FlameBot.app"
 cp -R "eas" "dist/FlameBot-macOS/eas"
 cp -f "README-Install-mac.txt" "dist/FlameBot-macOS/README-Install-mac.txt"
 
-echo "[4/4] Creating zip and DMG"
+echo "[4/4] Creating zip"
 cd dist
 rm -f "FlameBot-macOS.zip"
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "FlameBot-macOS" "FlameBot-macOS.zip"
 
-# Create a DMG that contains the app and EAs
-rm -f "FlameBot-macOS.dmg"
-hdiutil create -volname "FlameBot" -srcfolder "FlameBot-macOS" -fs HFS+ -format UDRW tmp.dmg >/dev/null
-hdiutil convert tmp.dmg -format UDZO -imagekey zlib-level=9 -o "FlameBot-macOS.dmg" >/dev/null
-rm -f tmp.dmg
-
-echo "Done: dist/FlameBot-macOS.zip and dist/FlameBot-macOS.dmg"
+echo "Done: dist/FlameBot-macOS.zip"

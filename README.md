@@ -1,8 +1,9 @@
-# FlameBot Bundle (Windows)
+````markdown
+# FlameBot Releases (ZIP-only)
 
-This folder is a build workspace for producing Windows and macOS releases.
-On Windows, we now ship a single Inno Setup installer EXE that installs:
-On macOS, we ship both a `.zip` and a `.dmg` disk image containing `FlameBot.app` and `eas/`.
+This workspace builds release ZIPs for both Windows and macOS. Users download a ZIP and unzip locally to access the app and EAs.
+
+Contents included in ZIPs:
 - FlameBot desktop app (PyQt5 + Telethon)
 - MT4 EA binary (`.ex4`)
 - MT5 EA binary (`.ex5`)
@@ -11,18 +12,15 @@ On macOS, we ship both a `.zip` and a `.dmg` disk image containing `FlameBot.app
 
 ```powershell
 cd C:\Users\Michael Favour\Documents\FlameBot
-.\build_windows.ps1   # builds portable onedir and installer
+.\build_windows.ps1   # builds portable onedir and package ZIP
 ```
 
 Outputs:
 - Portable folder: `dist\\FlameBot` (for debugging)
-- Windows installer: `dist\\FlameBot-Setup-v<version>.exe` (primary)
-- Windows zip: `dist\\FlameBot-Windows.zip` (contains the installer + `eas/` + helper scripts)
- - macOS zip: `dist/FlameBot-macOS.zip`
- - macOS DMG: `dist/FlameBot-macOS.dmg`
+- Windows ZIP: `dist\\FlameBot-Windows.zip` (contains installer + `eas/` + helper scripts)
+- macOS ZIP: `dist/FlameBot-macOS.zip`
 
 ## What users download
 
-Ship either the installer EXE directly, or the ZIP package if you want users to access the EA files directly.
-- The installer sets up FlameBot under `Program Files\\FlameBot` with shortcuts.
-- The ZIP contains the installer EXE and the `eas/` folder for manual EA access.
+Download the ZIP for your OS and unzip it. On Windows, the ZIP also includes an installer EXE if you prefer a guided setup, but the release page only provides ZIP assets.
+````

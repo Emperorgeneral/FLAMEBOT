@@ -45,3 +45,4 @@ Name: "{commondesktop}\FlameBot"; Filename: "{app}\{#MyAppExeName}"; Tasks: desk
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Start FlameBot After Installation"; Flags: nowait postinstall skipifsilent
+

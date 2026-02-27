@@ -35,14 +35,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create Desktop Shortcut"; GroupDescription: "Additional Icons"; Flags: unchecked
 
 [Files]
-Source: "..\dist\FlameBot\*"
-DestDir: "{app}"
-Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "..\dist\FlameBot\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
-Name: "{group}\FlameBot"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Launch FlameBot"
+Name: "{group}\FlameBot"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
 
-Name: "{commondesktop}\FlameBot"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\{#MyAppExeName}"; Comment: "Launch FlameBot"
+Name: "{commondesktop}\FlameBot"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\{#MyAppExeName}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Start FlameBot After Installation"; Flags: nowait postinstall skipifsilent

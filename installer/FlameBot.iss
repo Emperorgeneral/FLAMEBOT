@@ -26,7 +26,6 @@ SolidCompression=yes
 
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
-SetupLogging=no
 PrivilegesRequired=admin
 
 [Languages]
@@ -34,8 +33,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: desktopicon
-Description: Create a desktop shortcut
-GroupDescription: Additional icons
+Description: Create Desktop Shortcut
+GroupDescription: Additional Icons
 Flags: unchecked
 
 [Files]
@@ -57,5 +56,5 @@ IconFilename: "{app}\{#MyAppExeName}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"
-Description: Launch FlameBot
+Description: "Start FlameBot After Installation"
 Flags: nowait postinstall skipifsilent runasoriginaluser

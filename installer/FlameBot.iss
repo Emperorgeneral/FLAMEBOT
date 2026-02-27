@@ -18,7 +18,8 @@ DefaultDirName={autopf}\FlameBot
 DefaultGroupName=FlameBot
 DisableProgramGroupPage=yes
 
-OutputDir=dist
+; Write installer EXE to repo-level dist/ so the packaging step can find it
+OutputDir=..\dist
 OutputBaseFilename=FlameBot-Setup-v{#MyAppVersion}
 
 Compression=lzma2/ultra64

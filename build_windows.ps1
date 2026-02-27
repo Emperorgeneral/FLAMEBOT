@@ -91,7 +91,14 @@ New-Item -ItemType Directory -Path $stageDir | Out-Null
 if (Test-Path $installerPath) {
   Copy-Item -Force $installerPath $stageDir
 } else {
-  Write-Host "WARNING: Installer not found at $installerPath. ZIP will omit installer." -ForegroundColor Yellow
+  Write-Host "WARNING: Installer not found at $installerPath. Falling back to portable bundle." -ForegroundColor Yellow
+  # Fallback: include the onedir portable app so users can still run without the installer
+  $portableSrc = Join-Path $root 'dist\FlameBot'
+  if (Test-Path $portableSrc) {
+    Copy-Item -Recurse -Force $portableSrc (Join-Path $stageDir 'FlameBot')
+  } else {
+    Write-Host "Portable folder not found at $portableSrc" -ForegroundColor Red
+  }
 }
 
 # Include EAs and helper files so users can access them directly
@@ -106,5 +113,5 @@ Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath
 
 Write-Host "Done. Artifacts:" -ForegroundColor Green
 Write-Host " - dist\\FlameBot (portable)" -ForegroundColor Green
-Write-Host " - dist\\FlameBot-Setup-v$version.exe (installer)" -ForegroundColor Green
-Write-Host " - dist\\FlameBot-Windows.zip (zip containing installer + EAs)" -ForegroundColor Green
+Write-Host " - dist\\FlameBot-Setup-v$version.exe (installer if built)" -ForegroundColor Green
+Write-Host " - dist\\FlameBot-Windows.zip (zip containing installer or portable + EAs)" -ForegroundColor Green

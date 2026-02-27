@@ -40,18 +40,9 @@ DestDir: "{app}"
 Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
-Name: "{group}\FlameBot"
-Filename: "{app}\{#MyAppExeName}"
-Description: "Launch FlameBot"
-IconFilename: "{app}\{#MyAppExeName}"
+Name: "{group}\FlameBot"; Filename: "{app}\{#MyAppExeName}"; Description: "Launch FlameBot"; IconFilename: "{app}\{#MyAppExeName}"
 
-Name: "{commondesktop}\FlameBot"
-Filename: "{app}\{#MyAppExeName}"
-Description: "Launch FlameBot"
-Tasks: desktopicon
-IconFilename: "{app}\{#MyAppExeName}"
+Name: "{commondesktop}\FlameBot"; Filename: "{app}\{#MyAppExeName}"; Description: "Launch FlameBot"; Tasks: desktopicon; IconFilename: "{app}\{#MyAppExeName}"
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"
-Description: "Start FlameBot After Installation"
-Flags: nowait postinstall skipifsilent runasoriginaluser
+Filename: "{app}\{#MyAppExeName}"; Description: "Start FlameBot After Installation"; Flags: nowait postinstall skipifsilent

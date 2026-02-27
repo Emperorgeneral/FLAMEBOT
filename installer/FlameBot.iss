@@ -32,7 +32,7 @@ PrivilegesRequired=admin
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: desktopicon
+Name: "desktopicon"; Description: "Create Desktop Shortcut"; GroupDescription: "Additional Icons"; Flags: unchecked
 Description: Create Desktop Shortcut
 GroupDescription: Additional Icons
 Flags: unchecked

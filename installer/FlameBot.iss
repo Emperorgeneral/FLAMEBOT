@@ -13,10 +13,10 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=FlameCore
 AppPublisherURL=https://github.com/Emperorgeneral/FLAMEBOT
-DefaultDirName={autopf}\FlameBot
+DefaultDirName={autopf}\\FlameBot
 DefaultGroupName=FlameBot
 DisableProgramGroupPage=yes
-OutputDir=..\dist
+OutputDir=..\\dist
 OutputBaseFilename=FlameBot-Setup-v{#MyAppVersion}
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -33,18 +33,16 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 ; Install everything from the built portable folder
-Source: "..\dist\FlameBot\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "..\\dist\\FlameBot\\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
-Name: "{group}\FlameBot"; Filename: "{app}\{#MyAppExeName}"
-Name: "{commondesktop}\FlameBot"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\\FlameBot"; Filename: "{app}\\{#MyAppExeName}"
+Name: "{commondesktop}\\FlameBot"; Filename: "{app}\\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{cmd}"; Parameters: "/c netsh advfirewall firewall delete rule name=""FlameBot Outbound"" program=""{app}\{#MyAppExeName}"""; Flags: runhidden; StatusMsg: "Removing previous Windows Firewall rule (if any)..."
-
-Filename: "{cmd}"; Parameters: "/c netsh advfirewall firewall add rule name=""FlameBot Outbound"" dir=out action=allow program=""{app}\{#MyAppExeName}"" enable=yes"; Flags: runhidden; StatusMsg: "Creating Windows Firewall rule for FlameBot (outbound allow)..."
-
+Filename: "{cmd}"; Parameters: /c "netsh advfirewall firewall delete rule name=""FlameBot Outbound"" program=""{app}\{#MyAppExeName}"""; Flags: runhidden; StatusMsg: "Removing previous Windows Firewall rule (if any)..."
+Filename: "{cmd}"; Parameters: /c "netsh advfirewall firewall add rule name=""FlameBot Outbound"" dir=out action=allow program=""{app}\{#MyAppExeName}"" enable=yes"; Flags: runhidden; StatusMsg: "Creating Windows Firewall rule for FlameBot (outbound allow)..."
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch FlameBot"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
-Filename: "{cmd}"; Parameters: "/c netsh advfirewall firewall delete rule name=""FlameBot Outbound"" program=""{app}\{#MyAppExeName}"""; Flags: runhidden
+Filename: "{cmd}"; Parameters: /c "netsh advfirewall firewall delete rule name=""FlameBot Outbound"" program=""{app}\{#MyAppExeName}"""; Flags: runhidden

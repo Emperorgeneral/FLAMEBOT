@@ -68,31 +68,12 @@ if hasattr(ctypes, "windll"):
     except Exception:
         pass
 
-# Resolve a per-user writable data directory (Windows: %LOCALAPPDATA%\FlameBot)
-def _user_data_dir() -> Path:
-    try:
-        if os.name == "nt":
-            base = os.getenv("LOCALAPPDATA") or str(Path.home())
-            return Path(base) / "FlameBot"
-    except Exception:
-        pass
-    # Fallback (non-Windows): ~/.flamebot
-    return Path.home() / ".flamebot"
-
-# All app state lives under the per-user dir; keep the legacy name for internal paths
-SESSION_DIR = _user_data_dir()
-# Ensure the directory exists early for settings/logs
-try:
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
-
-# Place settings and logs inside the user data dir (avoid Program Files writes)
-SETTINGS_FILE = SESSION_DIR / "settings.json"
-SETTINGS_FALLBACK_FILE = SETTINGS_FILE
+SESSION_DIR = Path.home() / ".tg_copier"
+SETTINGS_FILE = Path("settings.json")
+SETTINGS_FALLBACK_FILE = SESSION_DIR / "settings.json"
 
 # Local signal/message persistence (append-only).
-SIGNALS_NDJSON_FILE = SESSION_DIR / "signals.ndjson"
+SIGNALS_NDJSON_FILE = Path("signals.ndjson")
 SIGNALS_MAX_BYTES = int(os.environ.get("FLAMEBOT_SIGNALS_MAX_BYTES", str(1_000_000)))
 SIGNALS_BACKUPS = int(os.environ.get("FLAMEBOT_SIGNALS_BACKUPS", str(3)))
 SIGNALS_LOCK_WAIT_SEC = float(os.environ.get("FLAMEBOT_SIGNALS_LOCK_WAIT_SEC", "0.10"))
@@ -20850,5 +20831,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main() 
-     
      

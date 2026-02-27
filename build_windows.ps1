@@ -48,9 +48,15 @@ Copy-Item -Force .\README-Install.txt .\dist\FlameBot\README-Install.txt
 # Ensure EA binaries are shipped as visible files alongside the EXE.
 # (PyInstaller may tuck --add-data under _internal/, but we want eas/ at the bundle root
 # so both the PowerShell installer and the in-app installer can find it.)
-Write-Host "[3/4] Copying EA files" -ForegroundColor Cyan
+Write-Host "[3/4] Copying EA files (flattened)" -ForegroundColor Cyan
 if (Test-Path .\dist\FlameBot\eas) { Remove-Item -Recurse -Force .\dist\FlameBot\eas }
-Copy-Item -Recurse -Force .\eas .\dist\FlameBot\eas
+New-Item -ItemType Directory -Force -Path .\dist\FlameBot\eas | Out-Null
+# Copy top-level EAs
+Copy-Item -Force (Join-Path $root 'eas\*.ex4') .\dist\FlameBot\eas -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $root 'eas\*.ex5') .\dist\FlameBot\eas -ErrorAction SilentlyContinue
+# Also copy from mt4/mt5 subfolders if present, but flatten them
+Copy-Item -Force (Join-Path $root 'eas\mt4\*.ex4') .\dist\FlameBot\eas -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $root 'eas\mt5\*.ex5') .\dist\FlameBot\eas -ErrorAction SilentlyContinue
 
 Write-Host "[4/4] Building Inno Setup installer" -ForegroundColor Cyan
 try {
@@ -101,8 +107,13 @@ if (Test-Path $installerPath) {
   }
 }
 
-# Include EAs and helper files so users can access them directly
-Copy-Item -Recurse -Force .\eas (Join-Path $stageDir 'eas')
+# Include EAs and helper files so users can access them directly (flattened)
+$stageEas = Join-Path $stageDir 'eas'
+New-Item -ItemType Directory -Force -Path $stageEas | Out-Null
+Copy-Item -Force (Join-Path $root 'eas\*.ex4') $stageEas -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $root 'eas\*.ex5') $stageEas -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $root 'eas\mt4\*.ex4') $stageEas -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $root 'eas\mt5\*.ex5') $stageEas -ErrorAction SilentlyContinue
 Copy-Item -Force .\Install_EAs.ps1 $stageDir
 Copy-Item -Force .\README-Install.txt $stageDir
 

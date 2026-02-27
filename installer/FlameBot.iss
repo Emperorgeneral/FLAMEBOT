@@ -8,7 +8,7 @@
 #define MyAppExeName "FlameBot.exe"
 
 [Setup]
-AppId={{A5C8D6E4-2E1B-4AF1-9C31-5D8A9C1B7F42}}
+AppId={{A5C8D6E4-2E1B-4AF1-9C31-5D8A9C1B7F42}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=FlameCore
@@ -26,8 +26,7 @@ SolidCompression=yes
 
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
-SetupLogging=yes
-
+SetupLogging=no
 PrivilegesRequired=admin
 
 [Languages]
@@ -47,10 +46,14 @@ Flags: recursesubdirs createallsubdirs ignoreversion
 [Icons]
 Name: "{group}\FlameBot"
 Filename: "{app}\{#MyAppExeName}"
+Description: "Launch FlameBot"
+IconFilename: "{app}\{#MyAppExeName}"
 
 Name: "{commondesktop}\FlameBot"
 Filename: "{app}\{#MyAppExeName}"
+Description: "Launch FlameBot"
 Tasks: desktopicon
+IconFilename: "{app}\{#MyAppExeName}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"

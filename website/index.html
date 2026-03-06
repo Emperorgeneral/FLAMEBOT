@@ -485,6 +485,7 @@
 
     <div class="footer">
       <div>By downloading, you agree to use the software responsibly and in accordance with your broker/platform rules.</div>
+      <div style="margin-top: 10px;">© <span id="year"></span> FLAME CORE TECHNOLOGIES LTD. FlameBot. All rights reserved.</div>
       <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
         <a href="/about.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">About</a>
         <a href="/contact.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Contact</a>
@@ -493,5 +494,12 @@
       </div>
     </div>
   </div>
+
+  <script>
+    (function () {
+      const el = document.getElementById('year');
+      if (el) el.textContent = String(new Date().getFullYear());
+    })();
+  </script>
 </body>
 </html>

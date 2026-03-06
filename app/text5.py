@@ -68,31 +68,12 @@ if hasattr(ctypes, "windll"):
     except Exception:
         pass
 
-# Resolve a per-user writable data directory (Windows: %LOCALAPPDATA%\FlameBot)
-def _user_data_dir() -> Path:
-    try:
-        if os.name == "nt":
-            base = os.getenv("LOCALAPPDATA") or str(Path.home())
-            return Path(base) / "FlameBot"
-    except Exception:
-        pass
-    # Fallback (non-Windows): ~/.flamebot
-    return Path.home() / ".flamebot"
-
-# All app state lives under the per-user dir; keep the legacy name for internal paths
-SESSION_DIR = _user_data_dir()
-# Ensure the directory exists early for settings/logs
-try:
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
-
-# Place settings and logs inside the user data dir (avoid Program Files writes)
-SETTINGS_FILE = SESSION_DIR / "settings.json"
-SETTINGS_FALLBACK_FILE = SETTINGS_FILE
+SESSION_DIR = Path.home() / ".tg_copier"
+SETTINGS_FILE = Path("settings.json")
+SETTINGS_FALLBACK_FILE = SESSION_DIR / "settings.json"
 
 # Local signal/message persistence (append-only).
-SIGNALS_NDJSON_FILE = SESSION_DIR / "signals.ndjson"
+SIGNALS_NDJSON_FILE = Path("signals.ndjson")
 SIGNALS_MAX_BYTES = int(os.environ.get("FLAMEBOT_SIGNALS_MAX_BYTES", str(1_000_000)))
 SIGNALS_BACKUPS = int(os.environ.get("FLAMEBOT_SIGNALS_BACKUPS", str(3)))
 SIGNALS_LOCK_WAIT_SEC = float(os.environ.get("FLAMEBOT_SIGNALS_LOCK_WAIT_SEC", "0.10"))
@@ -3579,6 +3560,12 @@ class MessageLogWidget(QtWidgets.QScrollArea):
 
         # Telegram-like: show a scroll-to-bottom button when user scrolls up.
         self._user_near_bottom = True
+
+        # Coalesce expensive relayout/scroll work when many messages arrive.
+        self._deferred_layout_pending = False
+        self._deferred_layout_scroll = False
+        self._deferred_layout_scheduled = False
+
         self._scroll_btn = QtWidgets.QToolButton(self)
         self._scroll_btn.setObjectName("scroll_down_btn")
         self._scroll_btn.setText("⌄")
@@ -3593,6 +3580,80 @@ class MessageLogWidget(QtWidgets.QScrollArea):
             sb.rangeChanged.connect(lambda _min, _max: self._on_scroll_changed())
         except Exception:
             pass
+
+    def _request_deferred_layout(self, *, scroll_to_bottom: bool) -> None:
+        try:
+            self._deferred_layout_pending = True
+            if scroll_to_bottom:
+                self._deferred_layout_scroll = True
+        except Exception:
+            return
+
+        try:
+            if bool(getattr(self, "_deferred_layout_scheduled", False)):
+                return
+        except Exception:
+            pass
+
+        try:
+            self._deferred_layout_scheduled = True
+        except Exception:
+            pass
+
+        def _run() -> None:
+            try:
+                self._deferred_layout_scheduled = False
+            except Exception:
+                pass
+            try:
+                if not bool(getattr(self, "_deferred_layout_pending", False)):
+                    return
+            except Exception:
+                return
+
+            try:
+                self._deferred_layout_pending = False
+            except Exception:
+                pass
+
+            try:
+                content_lay = self._content.layout()
+                if content_lay is not None:
+                    content_lay.activate()
+            except Exception:
+                pass
+            try:
+                self._content.updateGeometry()
+                self._content.adjustSize()
+            except Exception:
+                pass
+
+            do_scroll = False
+            try:
+                do_scroll = bool(getattr(self, "_deferred_layout_scroll", False))
+            except Exception:
+                do_scroll = False
+            try:
+                self._deferred_layout_scroll = False
+            except Exception:
+                pass
+
+            # Only auto-scroll if the user was near the bottom.
+            if do_scroll:
+                try:
+                    self.scroll_to_bottom(force=False)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._on_scroll_changed()
+                except Exception:
+                    pass
+
+        try:
+            QtCore.QTimer.singleShot(0, _run)
+        except Exception:
+            _run()
 
     def _trim_old_bubbles(self) -> None:
         # Layout contains a trailing stretch item.
@@ -3817,6 +3878,7 @@ class MessageLogWidget(QtWidgets.QScrollArea):
         outgoing: bool = False,
         *,
         date_key: str = "",
+        defer_layout: bool = False,
     ) -> None:  # noqa: N802
         name = str(sender or "Unknown")
         msg = str(message or "")
@@ -3847,6 +3909,21 @@ class MessageLogWidget(QtWidgets.QScrollArea):
         bubble.setStyleSheet(self._bubble_style(accent, outgoing=outgoing_b))
         align = QtCore.Qt.AlignLeft
         self._layout.insertWidget(self._layout.count() - 1, bubble, 0, align)
+
+        # Fast-path for high-volume streams: do a minimal per-bubble sync and
+        # coalesce the expensive relayout/scroll into a single next-tick task.
+        if bool(defer_layout):
+            try:
+                if hasattr(bubble, "_sync_message_wrap_height"):
+                    bubble._sync_message_wrap_height()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            self._trim_old_bubbles()
+            try:
+                self._request_deferred_layout(scroll_to_bottom=bool(near_bottom_before))
+            except Exception:
+                pass
+            return
 
         def _relayout_after_insert() -> None:
             # Activate layouts after Qt assigns final widths.
@@ -4069,7 +4146,7 @@ class FlameSplash(QtWidgets.QWidget):
         branding_layout.setContentsMargins(0, 0, 0, 24)
         branding_layout.setSpacing(6)
         branding_layout.setAlignment(QtCore.Qt.AlignCenter)
-        self.title_label = QtWidgets.QLabel("FLAMEBOT — by FlameCore")
+        self.title_label = QtWidgets.QLabel("FLAMEBOT — by FLAME CORE TECHNOLOGIES LTD")
         self.title_label.setAlignment(QtCore.Qt.AlignCenter)
         self.title_label.setStyleSheet(
             "color: white; font-size: 32px; font-weight: 700; letter-spacing: 1.4px;"
@@ -4308,6 +4385,10 @@ class TelegramWorker(QtCore.QThread):
         self._persisted_last_ids: Dict[str, int] = {}
         self._cursor_save_handle = None
         self._load_persisted_cursors()
+
+        # Reply-chain resolution cache: "chat_id:reply_to_msg_id" -> root signal msg_id.
+        # Best-effort only; bounded to avoid unbounded growth.
+        self._reply_root_cache: Dict[str, int] = {}
 
     def _backend_outbox_key(self, endpoint: str, payload: dict) -> str:
         try:
@@ -5886,8 +5967,21 @@ class TelegramWorker(QtCore.QThread):
                         outgoing = bool(getattr(message, "out", False))
                         reply_to_msg_id = getattr(message, "reply_to_msg_id", None)
 
+                        resolved_reply_root = None
+                        try:
+                            resolved_reply_root = await self._resolve_reply_root_signal_id(chat_id, reply_to_msg_id)
+                        except Exception:
+                            resolved_reply_root = None
+
                         try:
                             self._save_message(chat_id, name, text, tg_time=timestamp, tg_ts=int(tg_ts or 0), outgoing=outgoing)
+                        except Exception:
+                            pass
+
+                        # Populate edit de-dup cache for catch-up replayed messages.
+                        try:
+                            cache_key = f"{chat_id}:{int(message_id or 0)}"
+                            self._last_message_text[cache_key] = self._normalize_text_for_edit_dedup(text)
                         except Exception:
                             pass
 
@@ -5895,7 +5989,7 @@ class TelegramWorker(QtCore.QThread):
                             chat_id=chat_id,
                             message_id=message_id,
                             text=text,
-                            reply_to_msg_id=reply_to_msg_id,
+                            reply_to_msg_id=resolved_reply_root,
                             is_edit=False,
                             tg_message_timestamp=tg_ts,
                         )
@@ -5904,7 +5998,7 @@ class TelegramWorker(QtCore.QThread):
                             message_id=message_id,
                             text=text,
                             is_edit=False,
-                            reply_to_msg_id=reply_to_msg_id,
+                            reply_to_msg_id=resolved_reply_root,
                             message_obj=message,
                             tg_message_timestamp=tg_ts,
                         )
@@ -6024,6 +6118,46 @@ class TelegramWorker(QtCore.QThread):
                 break
         
         return None
+
+    async def _resolve_reply_root_signal_id(self, chat_id: int, reply_to_msg_id: Optional[int]) -> Optional[int]:
+        """Resolve reply-to chains to the original/root signal message id.
+
+        If a root signal cannot be found, falls back to the immediate
+        `reply_to_msg_id` to preserve best-effort scoping.
+        """
+        try:
+            if reply_to_msg_id is None:
+                return None
+            parent_id = int(reply_to_msg_id)
+        except Exception:
+            return None
+        if parent_id <= 0:
+            return None
+
+        cache_key = f"{int(chat_id)}:{int(parent_id)}"
+        try:
+            cached = self._reply_root_cache.get(cache_key)
+            if isinstance(cached, int) and cached > 0:
+                return int(cached)
+        except Exception:
+            pass
+
+        root_id: Optional[int] = None
+        try:
+            root_id = await self._walk_to_signal(int(chat_id), int(parent_id))
+        except Exception:
+            root_id = None
+
+        resolved = int(root_id) if isinstance(root_id, int) and root_id > 0 else int(parent_id)
+        try:
+            self._reply_root_cache[cache_key] = int(resolved)
+            if len(self._reply_root_cache) > 5000:
+                for k in list(self._reply_root_cache.keys())[:1500]:
+                    self._reply_root_cache.pop(k, None)
+        except Exception:
+            pass
+
+        return int(resolved)
 
     def send_code(self, api_id: int, api_hash: str, phone: str) -> None:
         async def safe_send() -> dict:
@@ -6624,6 +6758,12 @@ class TelegramWorker(QtCore.QThread):
             message_id = event.message.id
             reply_to_msg_id = getattr(event.message, "reply_to_msg_id", None)
 
+            resolved_reply_root = None
+            try:
+                resolved_reply_root = await self._resolve_reply_root_signal_id(chat_id, reply_to_msg_id)
+            except Exception:
+                resolved_reply_root = None
+
             is_outgoing = bool(getattr(event, "out", False)) or bool(getattr(event.message, "out", False))
 
             tg_dt = getattr(event.message, "date", None)
@@ -6664,7 +6804,7 @@ class TelegramWorker(QtCore.QThread):
             # Cache last-seen text for reaction/edit de-dup.
             try:
                 cache_key = f"{chat_id}:{int(message_id or 0)}"
-                self._last_message_text[cache_key] = str(text or "")
+                self._last_message_text[cache_key] = self._normalize_text_for_edit_dedup(text)
             except Exception:
                 pass
             
@@ -6681,7 +6821,7 @@ class TelegramWorker(QtCore.QThread):
                         chat_id=chat_id,
                         message_id=message_id,
                         text=text,
-                        reply_to_msg_id=reply_to_msg_id,
+                        reply_to_msg_id=resolved_reply_root,
                         is_edit=False,
                         tg_message_timestamp=tg_ts,
                     )
@@ -6695,7 +6835,7 @@ class TelegramWorker(QtCore.QThread):
                         message_id=message_id,
                         text=text,
                         is_edit=False,
-                        reply_to_msg_id=reply_to_msg_id,
+                        reply_to_msg_id=resolved_reply_root,
                         message_obj=event.message,
                         event_type="new_message",
                         tg_message_timestamp=tg_ts,
@@ -6715,10 +6855,43 @@ class TelegramWorker(QtCore.QThread):
             text = event.message.message or ""
             message_id = event.message.id
             reply_to_msg_id = None
+
+            # Telegram can emit MessageEdited for non-text changes (reactions,
+            # view count, pin metadata). If the text is unchanged, do not show a
+            # duplicate "(edited)" entry in the UI and do not forward to backend.
+            cache_key = ""
+            prev_text = None
+            try:
+                cache_key = f"{chat_id}:{int(message_id or 0)}"
+                prev_text = self._last_message_text.get(cache_key)
+            except Exception:
+                cache_key = ""
+                prev_text = None
+
+            # Normalize to avoid false edits caused by invisible chars / whitespace.
+            norm_text = self._normalize_text_for_edit_dedup(text)
+
+            try:
+                # If we never saw the original message content, do not treat this
+                # as an edit (common when Telegram emits metadata-only updates).
+                if prev_text is None:
+                    if cache_key:
+                        self._last_message_text[cache_key] = str(norm_text or "")
+                    return
+                if str(prev_text) == str(norm_text or ""):
+                    return
+            except Exception:
+                pass
             
             # Extract reply_to_msg_id if this edited message is a reply
             if hasattr(event.message, 'reply_to') and event.message.reply_to:
                 reply_to_msg_id = getattr(event.message.reply_to, 'reply_to_msg_id', None)
+
+            resolved_reply_root = None
+            try:
+                resolved_reply_root = await self._resolve_reply_root_signal_id(chat_id, reply_to_msg_id)
+            except Exception:
+                resolved_reply_root = None
             
             tg_dt = getattr(event.message, "date", None)
             timestamp = _format_telegram_local_time(tg_dt)
@@ -6741,11 +6914,10 @@ class TelegramWorker(QtCore.QThread):
             else:
                 self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} ✏️ [{name}] (edited) {text}")
 
-            # Reaction updates often trigger MessageEdited even though the text is unchanged.
-            # Do not drop: forward ALL edits. Keep cache updated for debugging only.
+            # Update last-seen text cache now that we've accepted this as a real text edit.
             try:
-                cache_key = f"{chat_id}:{int(message_id or 0)}"
-                self._last_message_text[cache_key] = str(text or "")
+                if cache_key:
+                    self._last_message_text[cache_key] = str(norm_text or "")
             except Exception:
                 pass
             is_outgoing = bool(getattr(event, "out", False)) or bool(
@@ -6777,7 +6949,7 @@ class TelegramWorker(QtCore.QThread):
                         chat_id=chat_id,
                         message_id=message_id,
                         text=text,
-                        reply_to_msg_id=reply_to_msg_id,
+                        reply_to_msg_id=resolved_reply_root,
                         is_edit=True,
                         tg_message_timestamp=tg_ts,
                     )
@@ -6791,7 +6963,7 @@ class TelegramWorker(QtCore.QThread):
                         message_id=message_id,
                         text=text,
                         is_edit=True,
-                        reply_to_msg_id=reply_to_msg_id,
+                        reply_to_msg_id=resolved_reply_root,
                         message_obj=event.message,
                         event_type="message_edited",
                         tg_message_timestamp=tg_ts,
@@ -6839,6 +7011,12 @@ class TelegramWorker(QtCore.QThread):
 
                 message_id = getattr(image_msg, "id", None) or getattr(messages[0], "id", None)
                 reply_to_msg_id = getattr(image_msg, "reply_to_msg_id", None)
+
+                resolved_reply_root = None
+                try:
+                    resolved_reply_root = await self._resolve_reply_root_signal_id(chat_id, reply_to_msg_id)
+                except Exception:
+                    resolved_reply_root = None
                 timestamp_dt = getattr(image_msg, "date", None) or getattr(messages[0], "date", None)
                 timestamp = _format_telegram_local_time(timestamp_dt)
                 tg_ts = _telegram_utc_epoch_seconds(timestamp_dt)
@@ -6853,7 +7031,7 @@ class TelegramWorker(QtCore.QThread):
                             chat_id=chat_id,
                             message_id=int(message_id or 0),
                             text=text,
-                            reply_to_msg_id=reply_to_msg_id,
+                            reply_to_msg_id=resolved_reply_root,
                             is_edit=False,
                             tg_message_timestamp=tg_ts,
                         )
@@ -6867,7 +7045,7 @@ class TelegramWorker(QtCore.QThread):
                             message_id=int(message_id or 0),
                             text=text,
                             is_edit=False,
-                            reply_to_msg_id=reply_to_msg_id,
+                            reply_to_msg_id=resolved_reply_root,
                             message_obj=image_msg,
                             event_type="album",
                             tg_message_timestamp=tg_ts,
@@ -6905,6 +7083,13 @@ class TelegramWorker(QtCore.QThread):
                             tg_ts=int(tg_ts or 0),
                             outgoing=is_outgoing,
                         )
+                    except Exception:
+                        pass
+
+                    # Populate edit de-dup cache for album message ids.
+                    try:
+                        cache_key = f"{chat_id}:{int(message_id or 0)}"
+                        self._last_message_text[cache_key] = self._normalize_text_for_edit_dedup(text)
                     except Exception:
                         pass
                     self.message_received.emit(chat_id, name, text, timestamp, is_outgoing)
@@ -7044,6 +7229,65 @@ class TelegramWorker(QtCore.QThread):
         except Exception:
             pass
         return "Unknown"
+
+    @staticmethod
+    def _normalize_text_for_edit_dedup(text: Any) -> str:
+        """Normalize message text for edit de-duplication.
+
+        Telethon/Telegram may emit MessageEdited updates for metadata-only changes
+        (reactions, view count, link preview) or for changes that are invisible to
+        humans (e.g. bidi marks / zero-width chars). We normalize to avoid falsely
+        treating those as real text edits.
+        """
+        try:
+            s = "" if text is None else str(text)
+        except Exception:
+            s = ""
+
+        # Canonicalize line endings first.
+        try:
+            s = s.replace("\r\n", "\n").replace("\r", "\n")
+        except Exception:
+            pass
+
+        # Unicode normalization (best-effort).
+        try:
+            s = unicodedata.normalize("NFKC", s)
+        except Exception:
+            pass
+
+        # Strip common invisible formatting characters that can vary between updates.
+        # - ZWSP/ZWNJ/ZWJ/BOM/LRM/RLM/WORD JOINER
+        try:
+            s = s.translate(
+                {
+                    ord("\u200b"): None,
+                    ord("\u200c"): None,
+                    ord("\u200d"): None,
+                    ord("\ufeff"): None,
+                    ord("\u200e"): None,
+                    ord("\u200f"): None,
+                    ord("\u2060"): None,
+                }
+            )
+        except Exception:
+            pass
+        # Remove bidi embedding/isolate marks that can be injected by clients.
+        try:
+            s = re.sub(r"[\u202a-\u202e\u2066-\u2069]", "", s)
+        except Exception:
+            pass
+
+        # Ignore trailing whitespace changes (common when previews/entities refresh).
+        try:
+            s = "\n".join([ln.rstrip() for ln in s.split("\n")])
+        except Exception:
+            pass
+
+        try:
+            return str(s or "").strip()
+        except Exception:
+            return ""
 
     async def _stop_listening_async(self, chat_id: Optional[int]) -> None:
         """Remove Telethon handlers inside the worker event loop."""
@@ -7611,6 +7855,31 @@ class MainWindow(QtWidgets.QWidget):
         self._ndjson_follow_timer: Optional[QtCore.QTimer] = None
         self._ndjson_follow_partial: str = ""
         self._seen_message_keys_by_chat: Dict[int, Tuple[set, deque]] = {}
+
+        # UI performance: batch bubble rendering so busy chats don't freeze the UI.
+        self._ui_bubble_queue: Deque[Tuple[int, str, str, str, bool, str]] = deque()
+        self._ui_bubble_flush_timer = QtCore.QTimer(self)
+        self._ui_bubble_flush_timer.setSingleShot(False)
+        try:
+            self._ui_bubble_flush_timer.setInterval(
+                int(os.environ.get("FLAMEBOT_UI_BUBBLE_FLUSH_MS", "33") or 33)
+            )
+        except Exception:
+            self._ui_bubble_flush_timer.setInterval(33)
+        self._ui_bubble_flush_timer.timeout.connect(self._flush_ui_bubble_queue)
+
+        # Coalesce frequent group-row updates (preview/unread/timestamp) during bursts.
+        self._ui_dirty_group_rows: set[int] = set()
+        self._ui_group_row_flush_timer = QtCore.QTimer(self)
+        self._ui_group_row_flush_timer.setSingleShot(False)
+        try:
+            self._ui_group_row_flush_timer.setInterval(
+                int(os.environ.get("FLAMEBOT_UI_GROUPROW_FLUSH_MS", "120") or 120)
+            )
+        except Exception:
+            self._ui_group_row_flush_timer.setInterval(120)
+        self._ui_group_row_flush_timer.timeout.connect(self._flush_ui_dirty_group_rows)
+
         self._build_ui()
         self._connect_signals()
         self._init_toast()
@@ -8049,10 +8318,9 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 pass
             try:
-                # If Telegram API credentials are managed, skip the now-useless
-                # credentials page entirely (start on phone page).
-                idx = 1 if bool(getattr(self, "_tg_api_managed", False)) else 0
-                self.stack.setCurrentIndex(int(idx))
+                # This wizard now has only 2 steps: phone (index 0) then code (index 1).
+                # Always start on the phone page.
+                self.stack.setCurrentIndex(0)
             except Exception:
                 pass
             try:
@@ -9105,9 +9373,9 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
-        # Skip directly to the phone page.
+        # Ensure we start on the phone page (Step 1) in the 2-step wizard.
         try:
-            self.stack.setCurrentIndex(1)
+            self.stack.setCurrentIndex(0)
         except Exception:
             pass
 
@@ -12393,6 +12661,7 @@ class MainWindow(QtWidgets.QWidget):
                         str(ts or ""),
                         bool(outgoing),
                         date_key=date_key,
+                        defer_layout=True,
                     )
                 except Exception:
                     pass
@@ -12530,6 +12799,7 @@ class MainWindow(QtWidgets.QWidget):
                             str(ts or ""),
                             bool(outgoing),
                             date_key=date_key,
+                            defer_layout=True,
                         )
                     except Exception:
                         continue
@@ -12946,6 +13216,7 @@ class MainWindow(QtWidgets.QWidget):
         self._save_settings()
 
     def _perform_logout(self) -> None:
+        # Splash is only for app startup / first open, not logout.
         self.reset_user_state()
 
     def reset_user_state(self, *, preserve_telegram_session: bool = False, full_ui_reset: bool = True) -> None:
@@ -13182,12 +13453,9 @@ class MainWindow(QtWidgets.QWidget):
                 self.log.clear()
                 self.group_title.setText("Message Log")
                 self.group_subtitle.setText("")
-                if bool(getattr(self, "_tg_api_managed", False)):
-                    self.subtitle_label.setText("Connect your Telegram account in two simple steps.")
-                    self.stack.setCurrentIndex(1)
-                else:
-                    self.subtitle_label.setText("Connect your Telegram account in three simple steps.")
-                    self.stack.setCurrentIndex(0)
+                # Always restart the 2-step wizard on Step 1 (phone page).
+                self.subtitle_label.setText("Connect your Telegram account in two simple steps.")
+                self.stack.setCurrentIndex(0)
                 self.main_stack.setCurrentIndex(0)
             except Exception:
                 pass
@@ -13329,7 +13597,7 @@ class MainWindow(QtWidgets.QWidget):
         build_mode = QtWidgets.QLabel(
             "Build: Packaged (.exe/.app)" if bool(getattr(sys, "frozen", False)) else "Build: Source (python)"
         )
-        powered = QtWidgets.QLabel("Powered by FlameCore")
+        powered = QtWidgets.QLabel("Powered by FLAME CORE TECHNOLOGIES LTD")
         powered.setObjectName("muted")
 
         build_mode.setObjectName("muted")
@@ -13466,12 +13734,13 @@ class MainWindow(QtWidgets.QWidget):
                     # Match the desired UI: bubble header shows the chat's real title.
                     # (Sender is still stored in state.messages for history.)
                     bubble_title = str(getattr(state, "name", "") or "")
-                    self.log.appendMessage(
+                    self._enqueue_ui_bubble(
+                        int(chat_id),
                         bubble_title,
-                        text,
-                        timestamp,
+                        str(text or ""),
+                        str(timestamp or ""),
                         bool(outgoing),
-                        date_key=str(date_key or "").strip(),
+                        str(date_key or "").strip(),
                     )
             except Exception:
                 pass
@@ -13481,9 +13750,187 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 pass
 
-        self._update_group_widget(state)
+        try:
+            self._mark_group_row_dirty(int(getattr(state, "gid", chat_id)))
+        except Exception:
+            try:
+                self._update_group_widget(state)
+            except Exception:
+                pass
         if save_settings:
             self._save_settings()
+
+    def _enqueue_ui_bubble(
+        self,
+        chat_id: int,
+        bubble_title: str,
+        text: str,
+        timestamp: str,
+        outgoing: bool,
+        date_key: str,
+    ) -> None:
+        # Keep queue bounded so a stalled UI doesn't blow up memory.
+        try:
+            max_q = int(os.environ.get("FLAMEBOT_UI_BUBBLE_QUEUE_MAX", "1000") or 1000)
+        except Exception:
+            max_q = 1000
+
+        try:
+            if max_q > 0 and len(self._ui_bubble_queue) >= max_q:
+                # Drop oldest to keep UI responsive.
+                for _ in range(max(1, max_q // 10)):
+                    try:
+                        self._ui_bubble_queue.popleft()
+                    except Exception:
+                        break
+        except Exception:
+            pass
+
+        try:
+            self._ui_bubble_queue.append(
+                (
+                    int(chat_id),
+                    str(bubble_title or ""),
+                    str(text or ""),
+                    str(timestamp or ""),
+                    bool(outgoing),
+                    str(date_key or ""),
+                )
+            )
+        except Exception:
+            return
+
+        try:
+            if not self._ui_bubble_flush_timer.isActive():
+                self._ui_bubble_flush_timer.start()
+        except Exception:
+            pass
+
+    def _flush_ui_bubble_queue(self) -> None:
+        log_widget = getattr(self, "log", None)
+        if log_widget is None:
+            try:
+                if self._ui_bubble_flush_timer.isActive():
+                    self._ui_bubble_flush_timer.stop()
+            except Exception:
+                pass
+            return
+
+        # Time/size budget per tick to keep UI responsive.
+        try:
+            max_per_tick = int(os.environ.get("FLAMEBOT_UI_BUBBLES_PER_TICK", "30") or 30)
+        except Exception:
+            max_per_tick = 30
+        max_per_tick = max(5, min(200, int(max_per_tick)))
+        deadline = time.perf_counter() + 0.010  # ~10ms budget
+
+        processed = 0
+        try:
+            log_widget.setUpdatesEnabled(False)
+        except Exception:
+            pass
+
+        try:
+            while self._ui_bubble_queue and processed < max_per_tick:
+                try:
+                    if time.perf_counter() >= deadline:
+                        break
+                except Exception:
+                    pass
+
+                try:
+                    cid, title, text, ts, outgoing, dk = self._ui_bubble_queue.popleft()
+                except Exception:
+                    break
+
+                # If the user switched chats, don't append stale bubbles.
+                try:
+                    if int(getattr(self, "current_group_id", 0) or 0) != int(cid):
+                        continue
+                except Exception:
+                    continue
+
+                try:
+                    log_widget.appendMessage(
+                        str(title or ""),
+                        str(text or ""),
+                        str(ts or ""),
+                        bool(outgoing),
+                        date_key=str(dk or ""),
+                        defer_layout=True,
+                    )
+                except Exception:
+                    pass
+                processed += 1
+        finally:
+            try:
+                log_widget.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+        # Stop timer when idle.
+        if not self._ui_bubble_queue:
+            try:
+                self._ui_bubble_flush_timer.stop()
+            except Exception:
+                pass
+
+    def _mark_group_row_dirty(self, gid: int) -> None:
+        try:
+            self._ui_dirty_group_rows.add(int(gid))
+        except Exception:
+            return
+        try:
+            if not self._ui_group_row_flush_timer.isActive():
+                self._ui_group_row_flush_timer.start()
+        except Exception:
+            pass
+
+    def _flush_ui_dirty_group_rows(self) -> None:
+        try:
+            dirty = list(getattr(self, "_ui_dirty_group_rows", set()) or set())
+        except Exception:
+            dirty = []
+        if not dirty:
+            try:
+                self._ui_group_row_flush_timer.stop()
+            except Exception:
+                pass
+            return
+
+        try:
+            self._ui_dirty_group_rows.clear()
+        except Exception:
+            pass
+
+        try:
+            self.list_groups.setUpdatesEnabled(False)
+        except Exception:
+            pass
+        try:
+            for gid in dirty:
+                try:
+                    st = (getattr(self, "group_states", {}) or {}).get(int(gid))
+                except Exception:
+                    st = None
+                if not st:
+                    continue
+                try:
+                    self._update_group_widget(st)
+                except Exception:
+                    continue
+        finally:
+            try:
+                self.list_groups.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+        # Stop timer if we caught up.
+        try:
+            if not bool(getattr(self, "_ui_dirty_group_rows", set())):
+                self._ui_group_row_flush_timer.stop()
+        except Exception:
+            pass
 
     def _start_ndjson_follow(self) -> None:
         try:
@@ -15218,6 +15665,11 @@ class MainWindow(QtWidgets.QWidget):
                 self.scheduler_pause_time = getattr(self, "_saved_scheduler_pause_time", None)
                 self.scheduler_resume_day = getattr(self, "_saved_scheduler_resume_day", None)
                 self.scheduler_resume_time = getattr(self, "_saved_scheduler_resume_time", None)
+
+                self._scheduler_pause_hour = None
+                self._scheduler_pause_minute = None
+                self._scheduler_resume_hour = None
+                self._scheduler_resume_minute = None
                 self._apply_scheduler_state_to_ui()
             except Exception:
                 pass
@@ -16073,6 +16525,12 @@ class MainWindow(QtWidgets.QWidget):
                     self.scheduler_pause_time = getattr(self, "_saved_scheduler_pause_time", None)
                     self.scheduler_resume_day = getattr(self, "_saved_scheduler_resume_day", None)
                     self.scheduler_resume_time = getattr(self, "_saved_scheduler_resume_time", None)
+
+                    # Saved snapshot is authoritative on Cancel.
+                    self._scheduler_pause_hour = None
+                    self._scheduler_pause_minute = None
+                    self._scheduler_resume_hour = None
+                    self._scheduler_resume_minute = None
                     self._apply_scheduler_state_to_ui()
                 except Exception:
                     pass
@@ -17465,6 +17923,33 @@ class MainWindow(QtWidgets.QWidget):
         resume_day = getattr(self, "scheduler_resume_day", None)
         resume_time = (getattr(self, "scheduler_resume_time", None) or "").strip()
 
+        # When the UI uses hour/minute combos, the user selects values one at a time.
+        # If we immediately derive a full HH:MM string and then re-apply state, the
+        # incomplete state (hour selected, minute not yet selected) can cause the
+        # selection to snap back to placeholders. Keep partial selections so the
+        # dropdowns remain stable while the user is choosing.
+        pause_h_partial = getattr(self, "_scheduler_pause_hour", None)
+        pause_m_partial = getattr(self, "_scheduler_pause_minute", None)
+        resume_h_partial = getattr(self, "_scheduler_resume_hour", None)
+        resume_m_partial = getattr(self, "_scheduler_resume_minute", None)
+
+        if self._is_valid_hhmm(pause_time):
+            try:
+                pause_h_partial = int(pause_time[:2])
+                pause_m_partial = int(pause_time[3:])
+            except Exception:
+                pass
+            self._scheduler_pause_hour = pause_h_partial
+            self._scheduler_pause_minute = pause_m_partial
+        if self._is_valid_hhmm(resume_time):
+            try:
+                resume_h_partial = int(resume_time[:2])
+                resume_m_partial = int(resume_time[3:])
+            except Exception:
+                pass
+            self._scheduler_resume_hour = resume_h_partial
+            self._scheduler_resume_minute = resume_m_partial
+
         for prefix in ("gls", "psl"):
             cb = getattr(self, f"{prefix}_scheduler_active_checkbox", None)
             p_day = getattr(self, f"{prefix}_scheduler_pause_day", None)
@@ -17498,8 +17983,10 @@ class MainWindow(QtWidgets.QWidget):
                 elif p_hour is not None and p_min is not None:
                     p_hour.blockSignals(True)
                     p_min.blockSignals(True)
-                    self._set_int_combo_value(p_hour, None)
-                    self._set_int_combo_value(p_min, None)
+                    # Partial selection support: keep whichever value the user
+                    # already chose instead of snapping both to placeholders.
+                    self._set_int_combo_value(p_hour, pause_h_partial)
+                    self._set_int_combo_value(p_min, pause_m_partial)
                     p_hour.blockSignals(False)
                     p_min.blockSignals(False)
             except Exception:
@@ -17521,8 +18008,8 @@ class MainWindow(QtWidgets.QWidget):
                 elif r_hour is not None and r_min is not None:
                     r_hour.blockSignals(True)
                     r_min.blockSignals(True)
-                    self._set_int_combo_value(r_hour, None)
-                    self._set_int_combo_value(r_min, None)
+                    self._set_int_combo_value(r_hour, resume_h_partial)
+                    self._set_int_combo_value(r_min, resume_m_partial)
                     r_hour.blockSignals(False)
                     r_min.blockSignals(False)
             except Exception:
@@ -17554,6 +18041,10 @@ class MainWindow(QtWidgets.QWidget):
             if p_hour is not None and p_min is not None:
                 hh = self._get_int_combo_value(p_hour, 0, 23)
                 mm = self._get_int_combo_value(p_min, 0, 59)
+                # Preserve partial selection so the dropdown doesn't reset while
+                # the user is still choosing hour/minute.
+                self._scheduler_pause_hour = hh
+                self._scheduler_pause_minute = mm
                 self.scheduler_pause_time = f"{hh:02d}:{mm:02d}" if (hh is not None and mm is not None) else None
             else:
                 txt = (p_time.text() if p_time is not None else "").strip()
@@ -17568,6 +18059,8 @@ class MainWindow(QtWidgets.QWidget):
             if r_hour is not None and r_min is not None:
                 hh = self._get_int_combo_value(r_hour, 0, 23)
                 mm = self._get_int_combo_value(r_min, 0, 59)
+                self._scheduler_resume_hour = hh
+                self._scheduler_resume_minute = mm
                 self.scheduler_resume_time = f"{hh:02d}:{mm:02d}" if (hh is not None and mm is not None) else None
             else:
                 txt = (r_time.text() if r_time is not None else "").strip()
@@ -18515,6 +19008,13 @@ class MainWindow(QtWidgets.QWidget):
             self.scheduler_resume_day = int(rd) if rd is not None and str(rd).strip() != "" else None
             self.scheduler_pause_time = (str(response.get("scheduler_pause_time")) if response.get("scheduler_pause_time") is not None else "").strip() or None
             self.scheduler_resume_time = (str(response.get("scheduler_resume_time")) if response.get("scheduler_resume_time") is not None else "").strip() or None
+
+            # Backend snapshot is authoritative; clear any partial UI selections
+            # that may be left over from an in-progress edit.
+            self._scheduler_pause_hour = None
+            self._scheduler_pause_minute = None
+            self._scheduler_resume_hour = None
+            self._scheduler_resume_minute = None
 
             # Update saved snapshot from backend
             self._saved_scheduler_active = bool(self.scheduler_active)
@@ -20850,5 +21350,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main() 
-     
      

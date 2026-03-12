@@ -30,7 +30,7 @@ function Select-FromList {
 }
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$eaMt4 = Join-Path $root 'eas\mt4\FLAMEBOTMT4 EA.ex4'
+$eaMt4 = Join-Path $root 'eas\mt4\FLAMEBOT MT4 EA.ex4'
 $eaMt5 = Join-Path $root 'eas\mt5\FLAMEBOT MT5 EA.ex5'
 
 if (!(Test-Path $eaMt4)) { throw "Missing: $eaMt4" }

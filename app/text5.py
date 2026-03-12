@@ -15,8 +15,11 @@ import sys
 import re
 import socket
 import threading
+import weakref
+import faulthandler
 import contextlib
 import shutil
+import uuid
 import webbrowser
 import urllib.error
 import urllib.parse
@@ -36,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 import time
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 import copy
 from collections import OrderedDict, deque
 
@@ -586,11 +589,65 @@ HYDRATION_TTL = 30  # seconds of freshness before rehydrating settings
 TG_RECONNECT_POLL_CONNECTED_SEC = float(os.environ.get("FLAMEBOT_TG_POLL_CONNECTED", "2"))
 TG_RECONNECT_POLL_DISCONNECTED_SEC = float(os.environ.get("FLAMEBOT_TG_POLL_DISCONNECTED", "1"))
 TG_RECONNECT_BACKOFF_MAX_SEC = float(os.environ.get("FLAMEBOT_TG_POLL_BACKOFF_MAX", "20"))
+# Periodic catch-up interval: even when the Telethon connection looks healthy,
+# backfill any messages the update stream may have silently dropped.
+# Set FLAMEBOT_TG_PERIODIC_CATCHUP_SEC=0 to disable.
+TG_PERIODIC_CATCHUP_SEC = float(os.environ.get("FLAMEBOT_TG_PERIODIC_CATCHUP_SEC", "30"))
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(int(default))) or int(default))
+    except Exception:
+        return int(default)
+
+# UI queue tuning (responsiveness under bursty message flow)
+# - Faster flush cadence for lower perceived message latency.
+# - Larger queue headroom to reduce drop risk during short UI stalls.
+# - Aggressive defaults for high-volume Telegram groups with continuous message flow.
+UI_BUBBLE_FLUSH_MS_DEFAULT = _env_int("FLAMEBOT_UI_BUBBLE_FLUSH_MS", 25)
+UI_BUBBLE_QUEUE_MAX_DEFAULT = _env_int("FLAMEBOT_UI_BUBBLE_QUEUE_MAX", 3000)
+UI_BUBBLES_PER_TICK_DEFAULT = _env_int("FLAMEBOT_UI_BUBBLES_PER_TICK", 40)
+UI_LOG_MAX_BUBBLES_DEFAULT = _env_int("FLAMEBOT_UI_LOG_MAX_BUBBLES", 800)
+CHAT_HISTORY_MAX_MESSAGES_DEFAULT = _env_int("FLAMEBOT_CHAT_MAX_MESSAGES", 800)
+CHAT_RENDER_RECENT_MAX_DEFAULT = _env_int("FLAMEBOT_CHAT_RENDER_RECENT_MAX", 350)
+CHAT_RENDER_SYNC_THRESHOLD_DEFAULT = _env_int("FLAMEBOT_UI_SYNC_RENDER_THRESHOLD", 60)
+CHAT_RENDER_INITIAL_CHUNK_DEFAULT = _env_int("FLAMEBOT_UI_RENDER_INITIAL_CHUNK", 12)
+CHAT_RENDER_CHUNK_DEFAULT = _env_int("FLAMEBOT_UI_RENDER_CHUNK", 20)
+LIVE_BUBBLE_DIRECT_WINDOW_MS_DEFAULT = _env_int("FLAMEBOT_UI_LIVE_DIRECT_WINDOW_MS", 8)
+
+# Optional Qt global threadpool scaling for non-UI/network QRunnable tasks.
+# This helps prevent thread starvation when probes/polls/refresh tasks overlap.
+QT_GLOBAL_MAX_THREADS = _env_int("FLAMEBOT_QT_POOL_MAX_THREADS", 16)
 
 # Network calls must never block the Qt UI thread.
 # Default timeout for backend HTTP requests. 3s is often too low for TLS handshakes
 # on slower connections/VPNs and can cause intermittent "handshake timed out".
 DEFAULT_HTTP_TIMEOUT = float(os.environ.get("FLAMEBOT_HTTP_TIMEOUT", "8"))
+
+
+def _prepare_chat_render_entries(items: Sequence[object]) -> List[Tuple[str, str, str, bool, str]]:
+    prepared: List[Tuple[str, str, str, bool, str]] = []
+    try:
+        iterable = list(items or [])
+    except Exception:
+        iterable = []
+
+    for raw in iterable:
+        try:
+            sender, text, ts, outgoing, *rest = raw  # type: ignore[misc]
+            date_key = str(rest[0] or "") if rest else ""
+            prepared.append(
+                (
+                    str(sender or ""),
+                    str(text or ""),
+                    str(ts or ""),
+                    bool(outgoing),
+                    date_key,
+                )
+            )
+        except Exception:
+            continue
+    return prepared
 
 
 def _friendly_network_error_message(exc: BaseException) -> str:
@@ -957,6 +1014,334 @@ def _install_crash_protection_hooks() -> None:
             sys.unraisablehook = _unraisablehook  # type: ignore[assignment]
     except Exception:
         pass
+
+
+def _configure_freeze_logging() -> logging.Logger:
+    """Dedicated log for intermittent UI hangs.
+
+    This is intentionally separate from dev/crash logs so support can ask users
+    for a single file: `flamebot-ui-freeze.log`.
+    """
+    logger = logging.getLogger("flame_ui_freeze")
+
+    # Production default: freeze diagnostics are opt-in.
+    try:
+        enabled = (os.environ.get("FLAMEBOT_FREEZE_DIAG", "0") == "1") or (
+            os.environ.get("FLAMEBOT_DEBUG", "0") == "1"
+        )
+    except Exception:
+        enabled = False
+    if not enabled:
+        try:
+            logger.disabled = True
+            logger.propagate = False
+            if not logger.handlers:
+                logger.addHandler(logging.NullHandler())
+        except Exception:
+            pass
+        return logger
+
+    # Ensure the logger is active when enabled.
+    try:
+        logger.disabled = False
+    except Exception:
+        pass
+    try:
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    except Exception:
+        pass
+
+    # If the logger is already configured, ensure we still have a terminal handler.
+    try:
+        if logger.handlers:
+            try:
+                has_stream = any(isinstance(h, logging.StreamHandler) for h in (logger.handlers or []))
+            except Exception:
+                has_stream = False
+            if not has_stream:
+                try:
+                    sh = logging.StreamHandler(stream=sys.stderr)
+                    sh.setLevel(logging.INFO)
+                    sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+                    logger.addHandler(sh)
+                except Exception:
+                    pass
+            return logger
+    except Exception:
+        return logger
+
+    try:
+        log_dir = SESSION_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "flamebot-ui-freeze.log"
+        handler = RotatingFileHandler(
+            str(log_path),
+            maxBytes=1_500_000,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logger.addHandler(handler)
+    except Exception:
+        # Never crash the UI due to logging.
+        pass
+
+    # Also emit diagnostics to the terminal (stderr) when available.
+    try:
+        has_stream = any(isinstance(h, logging.StreamHandler) for h in (logger.handlers or []))
+    except Exception:
+        has_stream = False
+    if not has_stream:
+        try:
+            sh = logging.StreamHandler(stream=sys.stderr)
+            sh.setLevel(logging.INFO)
+            sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+            logger.addHandler(sh)
+        except Exception:
+            pass
+
+    return logger
+
+
+def _wrap_ui_slot(owner: object, name: str, fn):  # type: ignore[no-untyped-def]
+    """Wrap a UI-thread slot to record duration + last-running slot.
+
+    This helps identify which callback the GUI was executing when it froze.
+    """
+
+    # In production, do not wrap slots (no overhead, no diagnostics).
+    try:
+        if not ((os.environ.get("FLAMEBOT_FREEZE_DIAG", "0") == "1") or (os.environ.get("FLAMEBOT_DEBUG", "0") == "1")):
+            return fn
+    except Exception:
+        return fn
+
+    def _wrapped(*args, **kwargs):  # type: ignore[no-untyped-def]
+        try:
+            if bool(getattr(owner, "_closing", False)):
+                return
+        except Exception:
+            pass
+
+        try:
+            start = float(time.monotonic())
+        except Exception:
+            start = 0.0
+
+        try:
+            owner._ui_last_slot_name = str(name or "")  # type: ignore[attr-defined]
+            owner._ui_last_slot_started_monotonic = float(start)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            try:
+                logging.getLogger("flame_ui").exception("UI slot failed: %s", str(name or ""))
+            except Exception:
+                pass
+            return
+        finally:
+            try:
+                end = float(time.monotonic())
+            except Exception:
+                end = start
+            try:
+                owner._ui_last_slot_finished_monotonic = float(end)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+            try:
+                slow_sec = float(os.environ.get("FLAMEBOT_UI_SLOW_SLOT_SEC", "0.35") or 0.35)
+            except Exception:
+                slow_sec = 0.35
+            try:
+                dur = float(end) - float(start)
+            except Exception:
+                dur = 0.0
+            if dur >= max(0.01, float(slow_sec)):
+                try:
+                    _configure_freeze_logging().warning("Slow UI slot %s took %.3fs", str(name or ""), float(dur))
+                except Exception:
+                    pass
+
+    return _wrapped
+
+
+class UIFreezeWatchdog:
+    """Detect when the Qt event loop is stalled and dump thread stack traces."""
+
+    def __init__(self, window: QtWidgets.QWidget) -> None:
+        self._logger = _configure_freeze_logging()
+        self._window_ref = weakref.ref(window)
+        self._stop_evt = threading.Event()
+
+        try:
+            self._stall_sec = float(os.environ.get("FLAMEBOT_UI_FREEZE_STALL_SEC", "10") or 10)
+        except Exception:
+            self._stall_sec = 10.0
+        # Allow diagnosing brief hangs (e.g., during search typing).
+        self._stall_sec = max(0.75, float(self._stall_sec))
+
+        try:
+            beat_ms = int(os.environ.get("FLAMEBOT_UI_HEARTBEAT_MS", "250") or 250)
+        except Exception:
+            beat_ms = 250
+        beat_ms = max(80, min(2000, int(beat_ms)))
+
+        self._last_beat_monotonic = 0.0
+        self._last_dump_monotonic = 0.0
+
+        # Heartbeat runs on the UI thread.
+        self._timer = QtCore.QTimer(window)
+        self._timer.setSingleShot(False)
+        self._timer.setInterval(int(beat_ms))
+        self._timer.timeout.connect(self._beat)
+        self._timer.start()
+
+        # Monitor runs off the UI thread.
+        self._thread = threading.Thread(target=self._run, name="FlameUIFreezeWatchdog", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        try:
+            self._stop_evt.set()
+        except Exception:
+            pass
+        try:
+            if self._timer is not None and self._timer.isActive():
+                self._timer.stop()
+        except Exception:
+            pass
+
+    def _beat(self) -> None:
+        try:
+            self._last_beat_monotonic = float(time.monotonic())
+        except Exception:
+            self._last_beat_monotonic = 0.0
+
+    def _dump_all_threads(self, *, reason: str) -> None:
+        try:
+            log_dir = SESSION_DIR / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            p = log_dir / "flamebot-ui-freeze.log"
+        except Exception:
+            p = None
+
+        if p is None:
+            return
+
+        # Always try to write to the freeze log file.
+        try:
+            with p.open("a", encoding="utf-8", errors="replace") as fh:
+                try:
+                    fh.write("\n===== UI FREEZE DETECTED =====\n")
+                    fh.write(f"reason={reason}\n")
+                except Exception:
+                    pass
+                try:
+                    faulthandler.dump_traceback(file=fh, all_threads=True)
+                except Exception:
+                    pass
+                try:
+                    fh.write("===== END FREEZE DUMP =====\n")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Also print to terminal (stderr) so it can be captured live.
+        try:
+            sys.stderr.write("\n===== UI FREEZE DETECTED =====\n")
+            sys.stderr.write(f"reason={reason}\n")
+        except Exception:
+            pass
+        try:
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+        try:
+            sys.stderr.write("===== END FREEZE DUMP =====\n")
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        # Poll periodically; do not spin.
+        while True:
+            try:
+                if self._stop_evt.wait(1.0):
+                    return
+            except Exception:
+                # If wait() fails, best-effort keep running.
+                pass
+
+            w = None
+            try:
+                w = self._window_ref()
+            except Exception:
+                w = None
+            if w is None:
+                return
+
+            try:
+                if bool(getattr(w, "_closing", False)):
+                    return
+            except Exception:
+                pass
+
+            try:
+                now = float(time.monotonic())
+            except Exception:
+                continue
+
+            try:
+                last = float(getattr(self, "_last_beat_monotonic", 0.0) or 0.0)
+            except Exception:
+                last = 0.0
+
+            if last <= 0.0:
+                continue
+
+            stalled_for = now - last
+            if stalled_for < float(self._stall_sec):
+                continue
+
+            # Avoid spamming dumps if the UI remains hung.
+            try:
+                if (now - float(self._last_dump_monotonic or 0.0)) < float(self._stall_sec):
+                    continue
+            except Exception:
+                pass
+            self._last_dump_monotonic = now
+
+            try:
+                last_slot = str(getattr(w, "_ui_last_slot_name", "") or "")
+            except Exception:
+                last_slot = ""
+            try:
+                slot_started = float(getattr(w, "_ui_last_slot_started_monotonic", 0.0) or 0.0)
+            except Exception:
+                slot_started = 0.0
+
+            slot_age = (now - slot_started) if slot_started > 0 else 0.0
+
+            try:
+                self._logger.critical(
+                    "UI event loop stalled: stalled_for=%.1fs last_slot=%r slot_age=%.1fs",
+                    float(stalled_for),
+                    str(last_slot),
+                    float(slot_age),
+                )
+            except Exception:
+                pass
+
+            try:
+                self._dump_all_threads(reason=f"stalled_for={stalled_for:.1f}s last_slot={last_slot!r} slot_age={slot_age:.1f}s")
+            except Exception:
+                pass
 
 
 def _read_pinned_requirements(req_path: Path) -> Dict[str, str]:
@@ -2355,6 +2740,32 @@ class _BackendRefreshSymbolsTask(QtCore.QRunnable):
             self.signals.error.emit(self.seq, self.auth_params, str(e))
 
 
+class _ChatRenderPrepSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(int, int, str, object)  # seq, gid, bubble_title, prepared_items
+    error = QtCore.pyqtSignal(int, int, str)             # seq, gid, message
+
+
+class _ChatRenderPrepTask(QtCore.QRunnable):
+    def __init__(self, seq: int, gid: int, bubble_title: str, items: Sequence[object]) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self.seq = int(seq)
+        self.gid = int(gid)
+        self.bubble_title = str(bubble_title or "")
+        try:
+            self.items = list(items or [])
+        except Exception:
+            self.items = []
+        self.signals = _ChatRenderPrepSignals()
+
+    def run(self) -> None:
+        try:
+            prepared = _prepare_chat_render_entries(self.items)
+            self.signals.finished.emit(self.seq, self.gid, self.bubble_title, prepared)
+        except Exception as e:
+            self.signals.error.emit(self.seq, self.gid, f"{e.__class__.__name__}: {e}")
+
+
 def is_windows_dark_mode() -> bool:
     """Return True if Windows is using dark app mode."""
     if winreg is None:
@@ -3244,10 +3655,465 @@ class GroupState:
     username: str = ""
     listening: bool = False
     unread: int = 0
+    # Unix epoch seconds (UTC) of the most recent message seen for this group.
+    # Used to keep the group list ordered like Telegram/WhatsApp.
+    last_message_ts: int = 0
     # Messages are stored as (sender, text, hhmm, outgoing, date_key).
     messages: Deque[Tuple[str, str, str, bool, str]] = field(default_factory=deque)
     # Distance from bottom of the scroll area; 0 means at bottom.
     scroll_anchor: int = 0
+
+
+class GroupListModel(QtCore.QAbstractListModel):
+    """Lightweight model for large Telegram group lists.
+
+    Stores only ordered gids; the UI pulls live state from `main.group_states`.
+    """
+
+    def __init__(self, main: QtWidgets.QWidget, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self._main = main
+        self._gids: List[int] = []
+        self._row_by_gid: Dict[int, int] = {}
+
+    def rowCount(self, parent: QtCore.QModelIndex = QtCore.QModelIndex()) -> int:  # noqa: N802
+        if parent.isValid():
+            return 0
+        return len(self._gids)
+
+    def data(self, index: QtCore.QModelIndex, role: int = QtCore.Qt.DisplayRole) -> Any:  # noqa: ANN401
+        if not index.isValid():
+            return None
+        row = int(index.row())
+        if row < 0 or row >= len(self._gids):
+            return None
+        gid = int(self._gids[row])
+        if role in (QtCore.Qt.UserRole,):
+            return gid
+        if role in (QtCore.Qt.DisplayRole, QtCore.Qt.ToolTipRole):
+            try:
+                st = (getattr(self._main, "group_states", {}) or {}).get(gid)
+                if st is not None:
+                    return str(getattr(st, "name", "") or "")
+            except Exception:
+                pass
+            return str(gid)
+        return None
+
+    def flags(self, index: QtCore.QModelIndex) -> QtCore.Qt.ItemFlags:  # noqa: N802
+        if not index.isValid():
+            return QtCore.Qt.NoItemFlags
+        return QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
+
+    def set_gids(self, gids: List[int]) -> None:
+        self.beginResetModel()
+        try:
+            self._gids = [int(x) for x in (gids or [])]
+        except Exception:
+            self._gids = []
+        try:
+            self._row_by_gid = {int(gid): i for i, gid in enumerate(self._gids)}
+        except Exception:
+            self._row_by_gid = {}
+        self.endResetModel()
+
+    def move_gid_to_front(self, gid: int) -> None:
+        """Move a gid to row 0 (Telegram/WhatsApp ordering) without resetting."""
+        try:
+            gid_i = int(gid)
+        except Exception:
+            return
+        try:
+            old_row = self._row_by_gid.get(gid_i)
+        except Exception:
+            old_row = None
+        if old_row is None:
+            return
+        if int(old_row) <= 0:
+            return
+        try:
+            self.beginMoveRows(QtCore.QModelIndex(), int(old_row), int(old_row), QtCore.QModelIndex(), 0)
+        except Exception:
+            # Fallback: reset if move is not supported.
+            try:
+                order = list(self._gids or [])
+            except Exception:
+                order = []
+            try:
+                if gid_i in order:
+                    order.remove(gid_i)
+                    order.insert(0, gid_i)
+                self.set_gids(order)
+            except Exception:
+                pass
+            return
+        try:
+            v = self._gids.pop(int(old_row))
+            self._gids.insert(0, int(v))
+            self._row_by_gid = {int(g): i for i, g in enumerate(self._gids)}
+        finally:
+            try:
+                self.endMoveRows()
+            except Exception:
+                pass
+
+    def row_for_gid(self, gid: int) -> Optional[int]:
+        try:
+            return self._row_by_gid.get(int(gid))
+        except Exception:
+            return None
+
+    def update_gid(self, gid: int) -> None:
+        row = self.row_for_gid(gid)
+        if row is None:
+            return
+        idx = self.index(int(row), 0)
+        try:
+            self.dataChanged.emit(
+                idx,
+                idx,
+                [QtCore.Qt.DisplayRole, QtCore.Qt.ToolTipRole, QtCore.Qt.UserRole],
+            )
+        except Exception:
+            try:
+                self.dataChanged.emit(idx, idx)
+            except Exception:
+                pass
+
+    def update_gids(self, gids: Sequence[int]) -> None:
+        try:
+            rows = sorted(
+                int(row)
+                for row in (
+                    self.row_for_gid(int(gid)) for gid in (gids or [])
+                )
+                if row is not None
+            )
+        except Exception:
+            rows = []
+        if not rows:
+            return
+
+        start = rows[0]
+        prev = rows[0]
+        for row in rows[1:]:
+            if int(row) == int(prev) + 1:
+                prev = int(row)
+                continue
+            top_left = self.index(int(start), 0)
+            bottom_right = self.index(int(prev), 0)
+            try:
+                self.dataChanged.emit(
+                    top_left,
+                    bottom_right,
+                    [QtCore.Qt.DisplayRole, QtCore.Qt.ToolTipRole, QtCore.Qt.UserRole],
+                )
+            except Exception:
+                try:
+                    self.dataChanged.emit(top_left, bottom_right)
+                except Exception:
+                    pass
+            start = int(row)
+            prev = int(row)
+
+        top_left = self.index(int(start), 0)
+        bottom_right = self.index(int(prev), 0)
+        try:
+            self.dataChanged.emit(
+                top_left,
+                bottom_right,
+                [QtCore.Qt.DisplayRole, QtCore.Qt.ToolTipRole, QtCore.Qt.UserRole],
+            )
+        except Exception:
+            try:
+                self.dataChanged.emit(top_left, bottom_right)
+            except Exception:
+                pass
+
+
+class GroupFilterProxyModel(QtCore.QSortFilterProxyModel):
+    def __init__(self, main: QtWidgets.QWidget, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self._main = main
+        self._term = ""
+
+    def setFilterText(self, text: str) -> None:  # noqa: N802
+        try:
+            t0 = float(time.perf_counter())
+        except Exception:
+            t0 = 0.0
+        try:
+            self._term = _normalize_search_text(text)
+        except Exception:
+            self._term = str(text or "").strip().lower()
+        try:
+            self.invalidateFilter()
+        except Exception:
+            pass
+
+        # Diagnostics: on large lists, proxy invalidation can synchronously call
+        # `filterAcceptsRow` many times (Python -> C++ -> Python), which can stall
+        # the UI briefly while typing.
+        try:
+            t1 = float(time.perf_counter())
+        except Exception:
+            t1 = t0
+        try:
+            dur = float(t1) - float(t0)
+        except Exception:
+            dur = 0.0
+        if dur >= 0.07:
+            src_rows = None
+            try:
+                src = self.sourceModel()
+                if src is not None:
+                    src_rows = int(src.rowCount())
+            except Exception:
+                src_rows = None
+            try:
+                _configure_freeze_logging().warning(
+                    "Group proxy invalidateFilter slow: %.3fs term_len=%d src_rows=%r",
+                    float(dur),
+                    int(len(str(getattr(self, "_term", "") or ""))),
+                    src_rows,
+                )
+            except Exception:
+                pass
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QtCore.QModelIndex) -> bool:  # noqa: N802
+        term = str(getattr(self, "_term", "") or "")
+        if not term:
+            return True
+        try:
+            src = self.sourceModel()
+            if src is None:
+                return True
+            idx = src.index(int(source_row), 0, source_parent)
+            gid = idx.data(QtCore.Qt.UserRole)
+        except Exception:
+            return True
+        if gid is None:
+            return True
+        try:
+            hay = str((getattr(self._main, "_group_search_index", {}) or {}).get(int(gid), "") or "")
+        except Exception:
+            hay = ""
+        return (term in hay) if hay else True
+
+
+class GroupListDelegate(QtWidgets.QStyledItemDelegate):
+    def __init__(self, main: QtWidgets.QWidget, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self._main = main
+
+    def sizeHint(self, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex) -> QtCore.QSize:  # noqa: N802
+        # Match the old widget's density.
+        return QtCore.QSize(int(option.rect.width()), 54)
+
+    def _rects(self, r: QtCore.QRect) -> Dict[str, QtCore.QRect]:
+        # Layout constants (in px). Keep simple and stable.
+        pad_x = 10
+        pad_y = 6
+        icon = 34
+        gap = 10
+        ts_w = 56
+        badge_w = 28
+        headset_w = 36
+        rr = r.adjusted(pad_x, pad_y, -pad_x, -pad_y)
+        icon_rect = QtCore.QRect(rr.left(), rr.top() + (rr.height() - icon) // 2, icon, icon)
+        right = rr.right()
+        headset_rect = QtCore.QRect(right - headset_w + 1, rr.top(), headset_w, rr.height())
+        right = headset_rect.left() - gap
+        badge_rect = QtCore.QRect(right - badge_w + 1, rr.top(), badge_w, rr.height())
+        right = badge_rect.left() - gap
+        ts_rect = QtCore.QRect(right - ts_w + 1, rr.top(), ts_w, rr.height())
+        text_left = icon_rect.right() + gap
+        text_rect = QtCore.QRect(text_left, rr.top(), max(0, ts_rect.left() - gap - text_left), rr.height())
+        return {
+            "icon": icon_rect,
+            "text": text_rect,
+            "timestamp": ts_rect,
+            "badge": badge_rect,
+            "headset": headset_rect,
+        }
+
+    def paint(self, painter: QtGui.QPainter, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex) -> None:  # noqa: N802
+        gid = index.data(QtCore.Qt.UserRole)
+        try:
+            st = (getattr(self._main, "group_states", {}) or {}).get(int(gid)) if gid is not None else None
+        except Exception:
+            st = None
+
+        painter.save()
+        try:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+        except Exception:
+            pass
+
+        # Background for hover/selection.
+        try:
+            if option.state & QtWidgets.QStyle.State_Selected:
+                c = option.palette.color(QtGui.QPalette.Highlight)
+                c.setAlpha(55)
+                painter.fillRect(option.rect, c)
+            elif option.state & QtWidgets.QStyle.State_MouseOver:
+                c = option.palette.color(QtGui.QPalette.AlternateBase)
+                c.setAlpha(45)
+                painter.fillRect(option.rect, c)
+        except Exception:
+            pass
+
+        rects = self._rects(option.rect)
+
+        name = ""
+        preview = ""
+        ts = ""
+        unread = 0
+        listening = False
+        icon_path = None
+        if st is not None:
+            try:
+                name = str(getattr(st, "name", "") or "")
+            except Exception:
+                name = ""
+            try:
+                preview = str(self._main._last_preview(st) or "")
+            except Exception:
+                preview = ""
+            try:
+                ts = str(self._main._last_timestamp(st) or "")
+            except Exception:
+                ts = ""
+            try:
+                unread = int(getattr(st, "unread", 0) or 0)
+            except Exception:
+                unread = 0
+            try:
+                listening = bool(getattr(st, "listening", False))
+            except Exception:
+                listening = False
+            try:
+                icon_path = getattr(st, "icon_path", None)
+            except Exception:
+                icon_path = None
+
+        # Icon.
+        try:
+            pix = self._main._circle_icon(icon_path, 34)
+        except Exception:
+            pix = None
+        if pix is not None:
+            painter.drawPixmap(rects["icon"], pix)
+
+        # Text block.
+        text_rect = rects["text"]
+        fm = QtGui.QFontMetrics(option.font)
+        line_h = fm.height()
+
+        name_font = QtGui.QFont(option.font)
+        try:
+            name_font.setBold(True)
+        except Exception:
+            pass
+        name_fm = QtGui.QFontMetrics(name_font)
+        name_line = name_fm.elidedText(name, QtCore.Qt.ElideRight, text_rect.width())
+        preview_line = fm.elidedText(preview, QtCore.Qt.ElideRight, text_rect.width())
+
+        name_rect = QtCore.QRect(text_rect.left(), text_rect.top(), text_rect.width(), line_h + 2)
+        preview_rect = QtCore.QRect(text_rect.left(), name_rect.bottom() + 2, text_rect.width(), line_h + 2)
+
+        painter.setFont(name_font)
+        painter.setPen(option.palette.color(QtGui.QPalette.Text))
+        painter.drawText(name_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, name_line)
+
+        painter.setFont(option.font)
+        try:
+            painter.setPen(option.palette.color(QtGui.QPalette.Disabled, QtGui.QPalette.Text))
+        except Exception:
+            painter.setPen(option.palette.color(QtGui.QPalette.Mid))
+        painter.drawText(preview_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, preview_line)
+
+        # Timestamp.
+        painter.setFont(option.font)
+        try:
+            painter.setPen(option.palette.color(QtGui.QPalette.Disabled, QtGui.QPalette.Text))
+        except Exception:
+            painter.setPen(option.palette.color(QtGui.QPalette.Mid))
+        painter.drawText(rects["timestamp"], QtCore.Qt.AlignRight | QtCore.Qt.AlignTop, ts)
+
+        # Unread badge.
+        if unread > 0:
+            badge_rect = rects["badge"]
+            badge_r = QtCore.QRect(badge_rect.center().x() - 11, badge_rect.center().y() - 9, 22, 18)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor("#ff7a2f"))
+            painter.drawRoundedRect(badge_r, 9, 9)
+            painter.setPen(QtGui.QColor("white"))
+            painter.drawText(badge_r, QtCore.Qt.AlignCenter, str(unread))
+
+        # Headset toggle (paint only; click handled in editorEvent).
+        headset_rect = rects["headset"]
+        headset_text = "🎧" if listening else "🎤"
+        painter.setFont(option.font)
+        painter.setPen(QtGui.QColor("#ff7a2f" if listening else "#888888"))
+        painter.drawText(headset_rect, QtCore.Qt.AlignCenter, headset_text)
+
+        painter.restore()
+
+    def editorEvent(
+        self,
+        event: QtCore.QEvent,
+        model: QtCore.QAbstractItemModel,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> bool:
+        # IMPORTANT: The headset region should toggle on the *first* click.
+        # If we don't consume the press, the view treats it as a normal row
+        # click (selection), which makes toggling feel like it needs multiple
+        # clicks.
+        try:
+            et = event.type()
+        except Exception:
+            return False
+        if et not in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonRelease, QtCore.QEvent.MouseButtonDblClick):
+            return False
+
+        try:
+            me = event  # type: ignore[assignment]
+            pos = me.pos()
+        except Exception:
+            return False
+
+        gid = index.data(QtCore.Qt.UserRole)
+        if gid is None:
+            return False
+        try:
+            rects = self._rects(option.rect)
+        except Exception:
+            return False
+
+        # Toggle listening when clicking the headset region.
+        if rects.get("headset") is not None and rects["headset"].contains(pos):
+            try:
+                st = (getattr(self._main, "group_states", {}) or {}).get(int(gid))
+            except Exception:
+                st = None
+            if st is None:
+                return True
+            try:
+                checked = not bool(getattr(st, "listening", False))
+            except Exception:
+                checked = True
+            # Toggle on press for instant feedback and to avoid selection-swallowing.
+            if et in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonDblClick):
+                try:
+                    self._main.on_group_listen_toggled(int(gid), bool(checked))
+                except Exception:
+                    pass
+            return True
+
+        return False
 
 
 class ElidedLabel(QtWidgets.QLabel):
@@ -3540,20 +4406,13 @@ class MessageLogWidget(QtWidgets.QScrollArea):
         self._dark_mode = True
         self.set_theme(True)
 
-        self._content = QtWidgets.QWidget(self)
-        self._content.setObjectName("message_log_content")
-        self._layout = QtWidgets.QVBoxLayout(self._content)
-        self._layout.setContentsMargins(4, 4, 8, 4)
-        self._layout.setSpacing(10)
-        self._layout.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
-        self._layout.addStretch(1)
-        self.setWidget(self._content)
+        self._install_content_widget(None)
 
         # Prevent unbounded widget growth (long-running sessions).
         try:
-            self._max_bubbles = int(os.environ.get("FLAMEBOT_UI_LOG_MAX_BUBBLES", "500"))
+            self._max_bubbles = int(UI_LOG_MAX_BUBBLES_DEFAULT)
         except Exception:
-            self._max_bubbles = 500
+            self._max_bubbles = 800
 
         # Track last rendered date for Telegram-style day separators.
         self._last_date_key: Optional[str] = None
@@ -3578,6 +4437,54 @@ class MessageLogWidget(QtWidgets.QScrollArea):
             sb = self.verticalScrollBar()
             sb.valueChanged.connect(self._on_scroll_changed)
             sb.rangeChanged.connect(lambda _min, _max: self._on_scroll_changed())
+        except Exception:
+            pass
+
+    def _install_content_widget(self, old_widget: Optional[QtWidgets.QWidget]) -> None:
+        self._content = QtWidgets.QWidget(self)
+        self._content.setObjectName("message_log_content")
+        self._layout = QtWidgets.QVBoxLayout(self._content)
+        self._layout.setContentsMargins(4, 4, 8, 4)
+        self._layout.setSpacing(10)
+        self._layout.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self._layout.addStretch(1)
+        self.setWidget(self._content)
+        if old_widget is not None:
+            try:
+                old_widget.hide()
+            except Exception:
+                pass
+            try:
+                old_widget.deleteLater()
+            except Exception:
+                pass
+
+    def prepare_for_chat_switch(self) -> None:
+        old_widget: Optional[QtWidgets.QWidget] = None
+        try:
+            old_widget = self.takeWidget()
+        except Exception:
+            old_widget = getattr(self, "_content", None)
+        self._install_content_widget(old_widget)
+        try:
+            self._last_date_key = None
+        except Exception:
+            pass
+        try:
+            self._user_near_bottom = True
+            self._deferred_layout_pending = False
+            self._deferred_layout_scroll = False
+            self._deferred_layout_scheduled = False
+        except Exception:
+            pass
+        try:
+            sb = self.verticalScrollBar()
+            sb.setValue(sb.minimum())
+        except Exception:
+            pass
+        try:
+            self._position_scroll_button()
+            self._scroll_btn.hide()
         except Exception:
             pass
 
@@ -3658,9 +4565,9 @@ class MessageLogWidget(QtWidgets.QScrollArea):
     def _trim_old_bubbles(self) -> None:
         # Layout contains a trailing stretch item.
         try:
-            limit = int(getattr(self, "_max_bubbles", 500) or 0)
+            limit = int(getattr(self, "_max_bubbles", UI_LOG_MAX_BUBBLES_DEFAULT) or 0)
         except Exception:
-            limit = 500
+            limit = 800
         if limit <= 0:
             return
 
@@ -3705,11 +4612,23 @@ class MessageLogWidget(QtWidgets.QScrollArea):
             pass
 
     def clear(self) -> None:  # noqa: A003 - Qt API compatibility
-        while self._layout.count() > 1:
-            item = self._layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
+        try:
+            self.setUpdatesEnabled(False)
+            self.viewport().setUpdatesEnabled(False)
+        except Exception:
+            pass
+        try:
+            while self._layout.count() > 1:
+                item = self._layout.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.deleteLater()
+        finally:
+            try:
+                self.setUpdatesEnabled(True)
+                self.viewport().setUpdatesEnabled(True)
+            except Exception:
+                pass
         try:
             self._last_date_key = None
         except Exception:
@@ -4084,6 +5003,11 @@ class FlameSplash(QtWidgets.QWidget):
             self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         except Exception:
             pass
+
+        # Tool + frameless windows can behave oddly with native maximize on Windows.
+        # Track a pseudo-maximized state by resizing to available screen geometry.
+        self._pseudo_maximized = False
+        self._restore_geometry: Optional[QtCore.QRect] = None
         self.resize(900, 600)
         self.setWindowIcon(QtGui.QIcon(resolve_resource_path("icon.ico")))
         screen = QtWidgets.QApplication.primaryScreen().geometry()
@@ -4185,10 +5109,68 @@ class FlameSplash(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(5000, self.start_transition)
 
     def toggle_max_restore(self) -> None:
-        if self.isMaximized():
-            self.showNormal()
-        else:
+        # For Tool+Frameless windows, `showMaximized()` is not always reliable.
+        # Implement a robust pseudo-maximize by resizing to the screen work area.
+        try:
+            if self.isMinimized():
+                try:
+                    self.showNormal()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            if bool(getattr(self, "_pseudo_maximized", False)):
+                self._pseudo_maximized = False
+                geom = getattr(self, "_restore_geometry", None)
+                if isinstance(geom, QtCore.QRect):
+                    try:
+                        self.setGeometry(geom)
+                        return
+                    except Exception:
+                        pass
+                try:
+                    self.showNormal()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+        # Enter pseudo-maximized state.
+        try:
+            self._restore_geometry = self.geometry()
+        except Exception:
+            self._restore_geometry = None
+
+        rect = None
+        try:
+            screen = QtWidgets.QApplication.primaryScreen()
+            if screen is not None:
+                rect = screen.availableGeometry()
+        except Exception:
+            rect = None
+
+        if rect is None:
+            try:
+                rect = QtWidgets.QApplication.desktop().availableGeometry(self)
+            except Exception:
+                rect = None
+
+        if rect is not None:
+            try:
+                self.setGeometry(rect)
+                self._pseudo_maximized = True
+                return
+            except Exception:
+                pass
+
+        # Final fallback.
+        try:
             self.showMaximized()
+        except Exception:
+            pass
 
     def start_transition(self) -> None:
         if self._sequence_started:
@@ -4301,7 +5283,8 @@ class TelegramWorker(QtCore.QThread):
     auto_login_resolved = QtCore.pyqtSignal(bool)
     error = QtCore.pyqtSignal(str)
     groups_ready = QtCore.pyqtSignal(list)
-    message_received = QtCore.pyqtSignal(int, str, str, str, bool)
+    # (chat_id, sender, text, local_time_str, outgoing, tg_ts_epoch)
+    message_received = QtCore.pyqtSignal(int, str, str, str, bool, int)
     icon_ready = QtCore.pyqtSignal(int, str)
     password_required = QtCore.pyqtSignal()
     # emit: (display_name, phone, telegram_id)
@@ -4335,7 +5318,10 @@ class TelegramWorker(QtCore.QThread):
         # Reconnect/watchdog state (created inside the worker's asyncio loop)
         self._reconnect_lock = None
         self._last_healthcheck_monotonic: float = 0.0
-        self._healthcheck_interval_sec: float = float(os.environ.get("FLAMEBOT_TG_HEALTHCHECK_SEC", "5"))
+        # Lower default from 5 → 3 s so dead sockets are detected faster.
+        self._healthcheck_interval_sec: float = float(os.environ.get("FLAMEBOT_TG_HEALTHCHECK_SEC", "3"))
+        # Tracks the last time ANY update was received (used by periodic catch-up).
+        self._last_catchup_monotonic: float = 0.0
         # Track in-flight run_coroutine_threadsafe futures so UI can cancel them
         # immediately when connectivity drops.
         self._pending_futures: List[asyncio.Future] = []
@@ -4352,9 +5338,16 @@ class TelegramWorker(QtCore.QThread):
         self._album_handlers: Dict[int, Any] = {}
 
         # Backend forwarding must not block the Telethon event loop.
-        # Use a background queue + worker with retries.
+        # Use a background queue + worker pool with retries.
         self._backend_post_queue: Optional[asyncio.Queue] = None
-        self._backend_post_task: Optional[asyncio.Task] = None
+        self._backend_post_tasks: List[asyncio.Task] = []
+        # Run many in-flight backend posts so desktop sender can saturate backend.
+        # Default target from throughput tuning requirement.
+        # Set FLAMEBOT_BACKEND_POST_WORKERS to override.
+        try:
+            self._backend_post_workers: int = max(1, min(512, int(os.environ.get("FLAMEBOT_BACKEND_POST_WORKERS", "64") or 64)))
+        except Exception:
+            self._backend_post_workers = 64
         self._backend_post_retries: int = max(3, int(os.environ.get("FLAMEBOT_BACKEND_RETRIES", "3")))
         self._backend_post_timeout: float = float(os.environ.get("FLAMEBOT_BACKEND_TIMEOUT", str(DEFAULT_HTTP_TIMEOUT)))
 
@@ -4741,7 +5734,14 @@ class TelegramWorker(QtCore.QThread):
                     reply_to_msg_id = getattr(message, "reply_to_msg_id", None)
 
                     try:
-                        self._save_message(chat_id, name, text, tg_time=timestamp, tg_ts=int(tg_ts or 0), outgoing=outgoing)
+                        await self._save_message_async(
+                            chat_id,
+                            name,
+                            text,
+                            tg_time=timestamp,
+                            tg_ts=int(tg_ts or 0),
+                            outgoing=outgoing,
+                        )
                     except Exception:
                         pass
 
@@ -4784,7 +5784,7 @@ class TelegramWorker(QtCore.QThread):
                         pass
 
                     try:
-                        self.message_received.emit(chat_id, name, text, timestamp, outgoing)
+                        self.message_received.emit(chat_id, name, text, timestamp, outgoing, int(tg_ts or 0))
                     except Exception:
                         pass
 
@@ -4880,10 +5880,19 @@ class TelegramWorker(QtCore.QThread):
         if self._backend_post_queue is None:
             # Unbounded queue to avoid blocking Telethon event handlers.
             self._backend_post_queue = asyncio.Queue()
-        if self._backend_post_task is None or self._backend_post_task.done():
-            self._backend_post_task = asyncio.create_task(self._backend_post_worker_loop())
+        try:
+            # Keep only currently running workers.
+            self._backend_post_tasks = [t for t in list(self._backend_post_tasks or []) if not t.done()]
+        except Exception:
+            self._backend_post_tasks = []
+
+        # Ensure worker pool is at configured size.
+        while len(self._backend_post_tasks) < int(self._backend_post_workers):
+            worker_idx = len(self._backend_post_tasks) + 1
+            t = asyncio.create_task(self._backend_post_worker_loop(worker_idx))
+            self._backend_post_tasks.append(t)
             # Backend posting is independent of Telethon client lifetime.
-            self._track_background_task(self._backend_post_task, client_bound=False)
+            self._track_background_task(t, client_bound=False)
 
         # After restarts, replay durable outbox entries.
         try:
@@ -4969,7 +5978,7 @@ class TelegramWorker(QtCore.QThread):
                 body = ""
             return status_code, body
 
-    async def _backend_post_worker_loop(self) -> None:
+    async def _backend_post_worker_loop(self, worker_index: int = 0) -> None:
         assert self._backend_post_queue is not None
         while not self._stopped:
             try:
@@ -5122,7 +6131,7 @@ class TelegramWorker(QtCore.QThread):
                     except Exception:
                         pass
             except Exception as e:
-                self._dev_log_exc("backend_post_worker", e)
+                self._dev_log_exc(f"backend_post_worker[{int(worker_index)}]", e)
             finally:
                 try:
                     self._backend_post_queue.task_done()
@@ -5440,6 +6449,23 @@ class TelegramWorker(QtCore.QThread):
         except Exception:
             pass
 
+        # Stop backend POST worker pool explicitly.
+        try:
+            tasks = list(getattr(self, "_backend_post_tasks", []) or [])
+            for t in tasks:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            if tasks:
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                except Exception:
+                    pass
+            self._backend_post_tasks = []
+        except Exception:
+            pass
+
         # Cancel worker-created background tasks (e.g., icon loaders).
         try:
             for t in list(self._background_tasks):
@@ -5587,10 +6613,20 @@ class TelegramWorker(QtCore.QThread):
 
         If this task crashes (like the messagebox KeyError/RuntimeError you saw),
         the client can remain 'connected' but stop receiving updates.
+        Checks a broad list of attribute names used across Telethon versions.
         """
         if not self.client:
             return None
-        for attr in ("_updates_task", "_update_loop_task", "_updates_handle"):
+        for attr in (
+            "_updates_task",
+            "_update_loop_task",
+            "_updates_handle",
+            "_recv_loop_task",
+            "_dispatch_update_task",
+            "_task_update",
+            "_task_updates",
+            "_update_task",
+        ):
             try:
                 task = getattr(self.client, attr, None)
                 if isinstance(task, asyncio.Task):
@@ -5694,6 +6730,9 @@ class TelegramWorker(QtCore.QThread):
             lang_code="en",
         )
         await self.client.connect()
+        # Reset health-check timestamp so the next reconnect-loop poll fires an
+        # immediate get_me() ping instead of waiting out the throttle window.
+        self._last_healthcheck_monotonic = 0.0
         self.api_id = api_id
         self.api_hash = api_hash
         self.phone = phone
@@ -5788,11 +6827,29 @@ class TelegramWorker(QtCore.QThread):
                             f"update loop stopped ({exc.__class__.__name__ if exc else 'unknown'})"
                         )
                         backoff_sec = max(0.5, float(TG_RECONNECT_POLL_DISCONNECTED_SEC or 2.0))
+                        self._last_catchup_monotonic = time.monotonic()
                     else:
                         healthy = await self._is_client_healthy()
                         if not healthy:
                             await self._restart_client_and_catch_up("health-check failed")
                             backoff_sec = max(0.5, float(TG_RECONNECT_POLL_DISCONNECTED_SEC or 2.0))
+                            self._last_catchup_monotonic = time.monotonic()
+
+                # Periodic catch-up: even when healthy, backfill any messages that
+                # the update stream may have silently dropped (frozen subscription,
+                # dead TCP socket that still passes get_me(), etc.).
+                # Runs outside the lock so it doesn't block reconnect attempts.
+                try:
+                    _catchup_interval = max(15.0, float(TG_PERIODIC_CATCHUP_SEC or 30.0))
+                    if (
+                        _catchup_interval > 0
+                        and self._listening_chats
+                        and (time.monotonic() - float(self._last_catchup_monotonic or 0.0)) >= _catchup_interval
+                    ):
+                        await self._catch_up_after_reconnect()
+                        self._last_catchup_monotonic = time.monotonic()
+                except Exception:
+                    pass
 
                 # When healthy/connected, poll less frequently (events deliver instantly).
                 await asyncio.sleep(max(1.0, float(TG_RECONNECT_POLL_CONNECTED_SEC or 5.0)))
@@ -5974,7 +7031,14 @@ class TelegramWorker(QtCore.QThread):
                             resolved_reply_root = None
 
                         try:
-                            self._save_message(chat_id, name, text, tg_time=timestamp, tg_ts=int(tg_ts or 0), outgoing=outgoing)
+                            await self._save_message_async(
+                                chat_id,
+                                name,
+                                text,
+                                tg_time=timestamp,
+                                tg_ts=int(tg_ts or 0),
+                                outgoing=outgoing,
+                            )
                         except Exception:
                             pass
 
@@ -6026,7 +7090,7 @@ class TelegramWorker(QtCore.QThread):
                             pass
 
                         try:
-                            self.message_received.emit(chat_id, name, text, timestamp, outgoing)
+                            self.message_received.emit(chat_id, name, text, timestamp, outgoing, int(tg_ts or 0))
                         except Exception:
                             pass
 
@@ -6788,7 +7852,7 @@ class TelegramWorker(QtCore.QThread):
             else:
                 self.log_message.emit(f"📩CID={int(chat_id)} OUT={out_i} [{name}] {text}")
             try:
-                self._save_message(
+                await self._save_message_async(
                     chat_id,
                     name,
                     text,
@@ -6810,7 +7874,7 @@ class TelegramWorker(QtCore.QThread):
             
             # UI must update immediately. Backend forwarding must never block UI.
             try:
-                self.message_received.emit(chat_id, name, text, timestamp, is_outgoing)
+                self.message_received.emit(chat_id, name, text, timestamp, is_outgoing, int(tg_ts or 0))
             except Exception:
                 pass
 
@@ -6925,7 +7989,7 @@ class TelegramWorker(QtCore.QThread):
             )
 
             try:
-                self._save_message(
+                await self._save_message_async(
                     chat_id,
                     name,
                     f"(edited) {text}",
@@ -6938,7 +8002,7 @@ class TelegramWorker(QtCore.QThread):
             
             # UI update first (must not block on backend).
             try:
-                self.message_received.emit(chat_id, name, f"(edited) {text}", timestamp, is_outgoing)
+                self.message_received.emit(chat_id, name, f"(edited) {text}", timestamp, is_outgoing, int(tg_ts or 0))
             except Exception:
                 pass
 
@@ -7075,7 +8139,7 @@ class TelegramWorker(QtCore.QThread):
                     except Exception:
                         pass
                     try:
-                        self._save_message(
+                        await self._save_message_async(
                             chat_id,
                             name,
                             text,
@@ -7092,7 +8156,7 @@ class TelegramWorker(QtCore.QThread):
                         self._last_message_text[cache_key] = self._normalize_text_for_edit_dedup(text)
                     except Exception:
                         pass
-                    self.message_received.emit(chat_id, name, text, timestamp, is_outgoing)
+                    self.message_received.emit(chat_id, name, text, timestamp, is_outgoing, int(tg_ts or 0))
             except Exception:
                 return
 
@@ -7437,6 +8501,35 @@ class TelegramWorker(QtCore.QThread):
             except Exception:
                 pass
 
+    async def _save_message_async(
+        self,
+        chat_id: int,
+        sender: str,
+        text: str,
+        *,
+        tg_time: str = "",
+        tg_ts: int = 0,
+        outgoing: bool = False,
+    ) -> None:
+        """Persist a message off the TelegramWorker event loop.
+
+        File IO and cross-process lock waits can block for noticeable time under
+        bursty traffic; run persistence in a thread to keep incoming handlers
+        responsive.
+        """
+        try:
+            await asyncio.to_thread(
+                self._save_message,
+                int(chat_id),
+                str(sender or ""),
+                str(text or ""),
+                tg_time=str(tg_time or ""),
+                tg_ts=int(tg_ts or 0),
+                outgoing=bool(outgoing),
+            )
+        except Exception:
+            pass
+
     def logout(self) -> None:
         self._auto_reconnect_enabled = False
         self._auto_reconnect_started = False
@@ -7511,6 +8604,29 @@ class MainWindow(QtWidgets.QWidget):
         super().__init__()
         # Set very early so any timer/slot can check during shutdown.
         self._closing: bool = False
+
+        # Freeze diagnostics are opt-in only (debug/troubleshooting).
+        self._ui_freeze_watchdog = None
+        try:
+            _freeze_enabled = (os.environ.get("FLAMEBOT_FREEZE_DIAG", "0") == "1") or (os.environ.get("FLAMEBOT_DEBUG", "0") == "1")
+        except Exception:
+            _freeze_enabled = False
+        if _freeze_enabled:
+            # Freeze forensics: track the last UI slot we ran and capture stacks if the
+            # event loop stops processing.
+            self._ui_last_slot_name: str = ""
+            self._ui_last_slot_started_monotonic: float = 0.0
+            self._ui_last_slot_finished_monotonic: float = 0.0
+            try:
+                # Starts immediately and writes a traceback dump if the UI thread stops
+                # processing events for long enough.
+                self._ui_freeze_watchdog = UIFreezeWatchdog(self)
+                try:
+                    _configure_freeze_logging().info("UI freeze diagnostics enabled")
+                except Exception:
+                    pass
+            except Exception:
+                self._ui_freeze_watchdog = None
         # Logging / UX flags
         self._debug_enabled = os.environ.get("FLAMEBOT_DEBUG", "0") == "1"
         # Global boot state (required): block routing until resolved.
@@ -7546,9 +8662,9 @@ class MainWindow(QtWidgets.QWidget):
         # Bound in-memory per-chat history to keep RAM stable in long sessions.
         # Set to 0/negative to disable.
         try:
-            self._chat_history_max_messages = int(os.environ.get("FLAMEBOT_CHAT_MAX_MESSAGES", "200"))
+            self._chat_history_max_messages = int(CHAT_HISTORY_MAX_MESSAGES_DEFAULT)
         except Exception:
-            self._chat_history_max_messages = 200
+            self._chat_history_max_messages = 800
         self.settings = self._load_settings()
 
         # Durable settings outbox: if settings saves fail due to transient
@@ -7694,6 +8810,21 @@ class MainWindow(QtWidgets.QWidget):
 
         # Async backend polling (prevents UI freezes)
         self._backend_pool = QtCore.QThreadPool.globalInstance()
+        try:
+            target_threads = int(QT_GLOBAL_MAX_THREADS or 0)
+        except Exception:
+            target_threads = 0
+        if target_threads > 0:
+            try:
+                cur_threads = int(self._backend_pool.maxThreadCount())
+            except Exception:
+                cur_threads = 0
+            # Only scale up by default; never forcefully reduce Qt defaults.
+            if target_threads > cur_threads:
+                try:
+                    self._backend_pool.setMaxThreadCount(target_threads)
+                except Exception:
+                    pass
         self._backend_poll_seq = 0
         self._backend_poll_inflight = False
 
@@ -7815,7 +8946,9 @@ class MainWindow(QtWidgets.QWidget):
         self._tg_worker_started_at_monotonic: float = 0.0
         self._tg_worker_restart_timer = QtCore.QTimer(self)
         self._tg_worker_restart_timer.setSingleShot(True)
-        self._tg_worker_restart_timer.timeout.connect(self._restart_telegram_worker_now)
+        self._tg_worker_restart_timer.timeout.connect(
+            _wrap_ui_slot(self, "tg_worker_restart", self._restart_telegram_worker_now)
+        )
 
         self.worker = TelegramWorker()
         self.worker.set_platform(self.platform)  # Pass platform to worker
@@ -7857,19 +8990,50 @@ class MainWindow(QtWidgets.QWidget):
         self._seen_message_keys_by_chat: Dict[int, Tuple[set, deque]] = {}
 
         # UI performance: batch bubble rendering so busy chats don't freeze the UI.
+        self._ui_live_bubble_queue: Deque[Tuple[int, str, str, str, bool, str]] = deque()
         self._ui_bubble_queue: Deque[Tuple[int, str, str, str, bool, str]] = deque()
+        self._ui_bubble_flush_in_progress = False
+        self._ui_live_flush_pending = False
+        self._last_live_bubble_render_monotonic = 0.0
         self._ui_bubble_flush_timer = QtCore.QTimer(self)
         self._ui_bubble_flush_timer.setSingleShot(False)
         try:
             self._ui_bubble_flush_timer.setInterval(
-                int(os.environ.get("FLAMEBOT_UI_BUBBLE_FLUSH_MS", "33") or 33)
+                int(UI_BUBBLE_FLUSH_MS_DEFAULT)
             )
         except Exception:
-            self._ui_bubble_flush_timer.setInterval(33)
-        self._ui_bubble_flush_timer.timeout.connect(self._flush_ui_bubble_queue)
+            self._ui_bubble_flush_timer.setInterval(30)
+        # Always connect (previously this only happened on exception, which could
+        # prevent new messages from appearing in the Message Log).
+        self._ui_bubble_flush_timer.timeout.connect(
+            _wrap_ui_slot(self, "ui_bubble_flush", self._flush_ui_bubble_queue)
+        )
+
+        # Queue backpressure monitor (dev/debug visibility only).
+        self._queue_monitor_last_warn_monotonic: float = 0.0
+        self._queue_monitor_timer = QtCore.QTimer(self)
+        self._queue_monitor_timer.setSingleShot(False)
+        try:
+            self._queue_monitor_timer.setInterval(
+                int(os.environ.get("FLAMEBOT_QUEUE_MONITOR_MS", "2000") or 2000)
+            )
+        except Exception:
+            self._queue_monitor_timer.setInterval(2000)
+        self._queue_monitor_timer.timeout.connect(
+            _wrap_ui_slot(self, "queue_backpressure_monitor", self._monitor_queue_backpressure)
+        )
+        try:
+            self._queue_monitor_timer.start()
+        except Exception:
+            pass
+
+        self._chat_render_request_seq = 0
+        self._chat_render_bubble_title = ""
 
         # Coalesce frequent group-row updates (preview/unread/timestamp) during bursts.
         self._ui_dirty_group_rows: set[int] = set()
+        # Coalesce chat reorders (Telegram/WhatsApp ordering) during bursts.
+        self._ui_dirty_group_reorders: set[int] = set()
         self._ui_group_row_flush_timer = QtCore.QTimer(self)
         self._ui_group_row_flush_timer.setSingleShot(False)
         try:
@@ -7878,7 +9042,9 @@ class MainWindow(QtWidgets.QWidget):
             )
         except Exception:
             self._ui_group_row_flush_timer.setInterval(120)
-        self._ui_group_row_flush_timer.timeout.connect(self._flush_ui_dirty_group_rows)
+        self._ui_group_row_flush_timer.timeout.connect(
+            _wrap_ui_slot(self, "ui_group_row_flush", self._flush_ui_dirty_group_rows)
+        )
 
         self._build_ui()
         self._connect_signals()
@@ -7959,7 +9125,9 @@ class MainWindow(QtWidgets.QWidget):
         self.backend_timer = QtCore.QTimer(self)
         self.backend_timer.setInterval(5000)
         # Poll MT4 and MT5 continuously once user is logged in.
-        self.backend_timer.timeout.connect(self._poll_backend_state_all_platforms)
+        self.backend_timer.timeout.connect(
+            _wrap_ui_slot(self, "backend_poll_all_platforms", self._poll_backend_state_all_platforms)
+        )
 
         # Poll intervals (seconds) per resource
         self._poll_intervals: Dict[str, float] = {
@@ -7976,12 +9144,16 @@ class MainWindow(QtWidgets.QWidget):
         # Debounce heavy symbol grid rebuilds during window resize.
         self._symbol_resize_timer = QtCore.QTimer(self)
         self._symbol_resize_timer.setSingleShot(True)
-        self._symbol_resize_timer.timeout.connect(self._refresh_symbol_list)
+        self._symbol_resize_timer.timeout.connect(
+            _wrap_ui_slot(self, "symbol_resize_refresh", self._refresh_symbol_list)
+        )
 
         # Debounce symbol filtering during typing (prevents full rebuild per keystroke).
         self._symbol_filter_timer = QtCore.QTimer(self)
         self._symbol_filter_timer.setSingleShot(True)
-        self._symbol_filter_timer.timeout.connect(self._refresh_symbol_list)
+        self._symbol_filter_timer.timeout.connect(
+            _wrap_ui_slot(self, "symbol_filter_refresh", self._refresh_symbol_list)
+        )
 
         # Per-platform backend poll tracking (MT4 and MT5 can poll concurrently)
         self._backend_poll_inflight_by_platform: Dict[str, bool] = {"mt4": False, "mt5": False}
@@ -8038,6 +9210,17 @@ class MainWindow(QtWidgets.QWidget):
         self._group_build_pending_gids: Deque[int] = deque()
         self._group_build_term: str = ""
         self._group_build_target_gid: Optional[int] = None
+
+        # Incremental icon hydration for group rows. Loading/decoding/scaling many
+        # avatars can still stall the UI even if row widgets are built in chunks.
+        try:
+            self._group_icon_hydrate_timer = QtCore.QTimer(self)
+            self._group_icon_hydrate_timer.setSingleShot(True)
+            self._group_icon_hydrate_timer.timeout.connect(self._continue_group_icon_hydration)
+        except Exception:
+            self._group_icon_hydrate_timer = None
+        self._group_icon_hydrate_pending_gids: Deque[int] = deque()
+        self._group_build_fast_mode: bool = False
 
     def _schedule_groups_fetch_retry(self, delay_ms: int = 1500) -> None:
         try:
@@ -8364,6 +9547,7 @@ class MainWindow(QtWidgets.QWidget):
         try:
             self.profile_btn.setEnabled(True)
             self.settings_btn.setEnabled(True)
+            self.trade_bunker_btn.setEnabled(True)
             self.subscription_btn.setEnabled(True)
             self.expert_btn.setEnabled(True)
         except Exception:
@@ -10055,14 +11239,53 @@ class MainWindow(QtWidgets.QWidget):
         self._group_filter_timer = QtCore.QTimer(self)
         self._group_filter_timer.setSingleShot(True)
         self._group_filter_timer.setInterval(180)
-        self._group_filter_timer.timeout.connect(self._apply_pending_group_filter)
+        self._group_filter_timer.timeout.connect(
+            _wrap_ui_slot(self, "group_filter_apply", self._apply_pending_group_filter)
+        )
         self.loading_label = QtWidgets.QLabel("Loading groups...")
         self.loading_label.setObjectName("muted")
         self.loading_label.setAlignment(QtCore.Qt.AlignCenter)
         self.loading_label.setVisible(False)
         sidebar_layout.addWidget(self.loading_label)
-        self.list_groups = QtWidgets.QListWidget()
+        self.list_groups = QtWidgets.QListView()
         self.list_groups.setObjectName("group_list")
+        # Performance: reduce relayout cost for large lists.
+        try:
+            self.list_groups.setUniformItemSizes(True)
+        except Exception:
+            pass
+        try:
+            # Let Qt batch geometry work instead of single-pass relayout per insertion.
+            self.list_groups.setLayoutMode(QtWidgets.QListView.Batched)
+            self.list_groups.setBatchSize(250)
+        except Exception:
+            pass
+        try:
+            self.list_groups.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            self.list_groups.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        except Exception:
+            pass
+        try:
+            self.list_groups.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        except Exception:
+            pass
+        try:
+            self.list_groups.setViewportUpdateMode(QtWidgets.QAbstractItemView.MinimalViewportUpdate)
+        except Exception:
+            pass
+
+        # Model/View setup for large chat lists.
+        try:
+            self._group_model = GroupListModel(self, self)
+            self._group_proxy = GroupFilterProxyModel(self, self)
+            self._group_proxy.setSourceModel(self._group_model)
+            self.list_groups.setModel(self._group_proxy)
+            self._group_delegate = GroupListDelegate(self, self.list_groups)
+            self.list_groups.setItemDelegate(self._group_delegate)
+        except Exception:
+            self._group_model = None
+            self._group_proxy = None
+            self._group_delegate = None
         # Telegram-like: hover/selected shading for custom row widgets.
         try:
             self.list_groups.setMouseTracking(True)
@@ -10954,6 +12177,222 @@ class MainWindow(QtWidgets.QWidget):
         # Add the container to the main content stack
         self.content_stack.addWidget(self.settings_wizard)
 
+        # --- Trade Bunker (UI only) ---
+        # Wizard flow: Platform → Account → Dashboard
+        tb_platform_page = QtWidgets.QWidget()
+        tb_platform_layout = QtWidgets.QVBoxLayout(tb_platform_page)
+        tb_platform_layout.setContentsMargins(12, 12, 12, 12)
+        tb_platform_title = QtWidgets.QLabel("Select Platform")
+        tb_platform_title.setObjectName("title")
+        tb_platform_layout.addWidget(tb_platform_title)
+        self.tb_mt5 = QtWidgets.QPushButton("🟦 MT5")
+        self.tb_mt5.setObjectName("primary")
+        self.tb_mt5.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.tb_mt5.setMinimumHeight(40)
+        self.tb_mt4 = QtWidgets.QPushButton("⬜ MT4")
+        self.tb_mt4.setObjectName("primary")
+        self.tb_mt4.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.tb_mt4.setMinimumHeight(40)
+        tb_platform_layout.addWidget(self.tb_mt5)
+        tb_platform_layout.addWidget(self.tb_mt4)
+        tb_platform_layout.addStretch()
+
+        tb_account_page = QtWidgets.QWidget()
+        tb_account_layout = QtWidgets.QVBoxLayout(tb_account_page)
+        tb_account_layout.setContentsMargins(12, 12, 12, 12)
+        tb_account_title = QtWidgets.QLabel("Select Account Type")
+        tb_account_title.setObjectName("title")
+        tb_account_layout.addWidget(tb_account_title)
+        self.tb_prop = QtWidgets.QPushButton("🏦 Prop Account")
+        self.tb_prop.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.tb_prop.setMinimumHeight(40)
+        self.tb_normal = QtWidgets.QPushButton("💼 Normal Account")
+        self.tb_normal.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.tb_normal.setMinimumHeight(40)
+        tb_account_layout.addWidget(self.tb_prop)
+        tb_account_layout.addWidget(self.tb_normal)
+        tb_account_layout.addStretch()
+
+        tb_dashboard_page = QtWidgets.QWidget()
+        tb_dash_layout = QtWidgets.QVBoxLayout(tb_dashboard_page)
+        tb_dash_layout.setContentsMargins(12, 12, 12, 12)
+        tb_dash_layout.setSpacing(10)
+        tb_header = QtWidgets.QLabel("Trade Bunker")
+        tb_header.setObjectName("title")
+        tb_dash_layout.addWidget(tb_header)
+
+        self.trade_bunker_table = QtWidgets.QTableWidget(0, 11)
+        self.trade_bunker_table.setHorizontalHeaderLabels([
+            "Ticket",
+            "Symbol",
+            "Kind",
+            "Side",
+            "Volume",
+            "Price",
+            "SL",
+            "TP",
+            "P/L",
+            "Close",
+            "B.E.",
+        ])
+        self.trade_bunker_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.trade_bunker_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.trade_bunker_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        try:
+            # Remove left-side row numbering (1,2,3...) and ensure the row fully fills the frame.
+            self.trade_bunker_table.verticalHeader().setVisible(False)
+
+            hh = self.trade_bunker_table.horizontalHeader()
+            hh.setStretchLastSection(False)
+            # Ensure important columns don't truncate (Ticket + Close button).
+            hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)   # Ticket
+            hh.setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeToContents)   # Close
+            hh.setSectionResizeMode(10, QtWidgets.QHeaderView.ResizeToContents)  # B.E.
+            for _col in range(1, 9):
+                hh.setSectionResizeMode(_col, QtWidgets.QHeaderView.Stretch)
+
+            # Header labels: black; cell text: white (better contrast on dark background).
+            self.trade_bunker_table.setStyleSheet(
+                "QTableWidget { color: white; }\n"
+                "QHeaderView::section { color: black; }\n"
+            )
+        except Exception:
+            pass
+        # Let the table consume remaining vertical space so bottom bars stay anchored.
+        tb_dash_layout.addWidget(self.trade_bunker_table, 1)
+
+        # --- Account stats bar (anchored at bottom, like MT4/MT5) ---
+        self.tb_account_stats_bar = QtWidgets.QFrame()
+        self.tb_account_stats_bar.setObjectName("tb_account_stats_bar")
+        try:
+            self.tb_account_stats_bar.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        except Exception:
+            pass
+        stats_layout = QtWidgets.QHBoxLayout(self.tb_account_stats_bar)
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setSpacing(10)
+
+        lbl_profit = QtWidgets.QLabel("Total Profit")
+        self.tb_stat_profit = QtWidgets.QLabel("—")
+        try:
+            self.tb_stat_profit.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        except Exception:
+            pass
+
+        stats_layout.addWidget(lbl_profit)
+        stats_layout.addWidget(self.tb_stat_profit)
+        stats_layout.addStretch(1)
+
+        # Keep bar readable on dark background.
+        try:
+            self.tb_account_stats_bar.setStyleSheet("QLabel { color: white; }")
+        except Exception:
+            pass
+
+        tb_dash_layout.addWidget(self.tb_account_stats_bar, 0)
+
+        editor = QtWidgets.QFrame()
+        editor_layout = QtWidgets.QGridLayout(editor)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.setHorizontalSpacing(10)
+        editor_layout.setVerticalSpacing(6)
+
+        self.tb_selected_ticket_label = QtWidgets.QLabel("No trade selected")
+        self.tb_selected_ticket_label.setObjectName("muted")
+        editor_layout.addWidget(self.tb_selected_ticket_label, 0, 0, 1, 4)
+
+        self.tb_sl_input = QtWidgets.QLineEdit()
+        self.tb_sl_input.setPlaceholderText("SL (blank = no change; null = clear)")
+        self.tb_tp_input = QtWidgets.QLineEdit()
+        self.tb_tp_input.setPlaceholderText("TP (blank = no change; null = clear)")
+        self.tb_modify_btn = QtWidgets.QPushButton("Modify")
+        self.tb_apply_btn = QtWidgets.QPushButton("Apply")
+
+        editor_layout.addWidget(QtWidgets.QLabel("SL"), 1, 0)
+        editor_layout.addWidget(self.tb_sl_input, 1, 1)
+        editor_layout.addWidget(QtWidgets.QLabel("TP"), 1, 2)
+        editor_layout.addWidget(self.tb_tp_input, 1, 3)
+        # Modify under SL side, Apply under TP side (side-by-side).
+        editor_layout.addWidget(self.tb_modify_btn, 2, 1)
+        editor_layout.addWidget(self.tb_apply_btn, 2, 3)
+        tb_dash_layout.addWidget(editor)
+
+        # Trade Bunker safeguard: SL/TP can only be edited after clicking Modify.
+        try:
+            self.tb_sl_input.setEnabled(False)
+            self.tb_tp_input.setEnabled(False)
+            self.tb_apply_btn.setEnabled(False)
+        except Exception:
+            pass
+
+        self.trade_bunker_stack = QtWidgets.QStackedWidget()
+        self.trade_bunker_stack.addWidget(tb_platform_page)
+        self.trade_bunker_stack.addWidget(tb_account_page)
+        self.trade_bunker_stack.addWidget(tb_dashboard_page)
+
+        self.trade_bunker_context_label = QtWidgets.QLabel("")
+        self.trade_bunker_context_label.setObjectName("muted")
+        self.trade_bunker_context_label.setStyleSheet("font-size: 12px;")
+
+        def _update_trade_bunker_context_indicator() -> None:
+            try:
+                idx = self.trade_bunker_stack.currentIndex()
+            except Exception:
+                idx = 0
+            platform = getattr(self, "tb_selected_platform", None) or getattr(self, "platform", None)
+            platform_txt = (platform or "").upper() or "—"
+            if idx == 0:
+                text = ""
+            elif idx == 1:
+                text = f"Platform: {platform_txt}"
+            else:
+                acct = getattr(self, "tb_selected_account", None)
+                if acct == "prop":
+                    acct_txt = "Prop"
+                elif acct == "normal":
+                    acct_txt = "Normal"
+                else:
+                    acct_txt = "—"
+                text = f"{platform_txt} – {acct_txt}"
+            try:
+                self.trade_bunker_context_label.setText(text)
+            except Exception:
+                pass
+
+        self._update_trade_bunker_context_indicator = _update_trade_bunker_context_indicator
+        def _tb_stack_changed(_i: int) -> None:
+            try:
+                _update_trade_bunker_context_indicator()
+            except Exception:
+                pass
+            try:
+                if int(getattr(self.trade_bunker_stack, "currentIndex", lambda: 0)()) == 2:
+                    self._trade_bunker_start_refresh()
+                else:
+                    self._trade_bunker_stop_refresh()
+            except Exception:
+                pass
+        try:
+            self.trade_bunker_stack.currentChanged.connect(_tb_stack_changed)
+        except Exception:
+            pass
+        _tb_stack_changed(0)
+
+        self.trade_bunker_wizard = QtWidgets.QWidget()
+        tb_outer = QtWidgets.QVBoxLayout(self.trade_bunker_wizard)
+        tb_outer.setSpacing(8)
+        tb_outer.setContentsMargins(0, 0, 0, 0)
+        self.tb_back = QtWidgets.QPushButton("Back")
+        self.tb_back.setMaximumWidth(120)
+        tb_hdr_row = QtWidgets.QHBoxLayout()
+        tb_hdr_row.addWidget(self.tb_back)
+        tb_hdr_row.addStretch()
+        tb_hdr_row.addWidget(self.trade_bunker_context_label, alignment=QtCore.Qt.AlignRight)
+        tb_outer.addLayout(tb_hdr_row)
+        tb_outer.addWidget(self.trade_bunker_stack)
+
+        self.content_stack.addWidget(self.trade_bunker_wizard)
+
         # --- Subscription page (UI only) ---
         self.subscription_page = QtWidgets.QWidget()
         subscription_layout = QtWidgets.QVBoxLayout(self.subscription_page)
@@ -11059,6 +12498,45 @@ class MainWindow(QtWidgets.QWidget):
             else:
                 self.content_stack.setCurrentWidget(self.message_log_page)
         self.wizard_back.clicked.connect(_wizard_back)
+
+        # Trade Bunker wiring
+        self.tb_mt5.clicked.connect(lambda: self._on_trade_bunker_platform_selected('mt5'))
+        self.tb_mt4.clicked.connect(lambda: self._on_trade_bunker_platform_selected('mt4'))
+        self.tb_prop.clicked.connect(lambda: self._on_trade_bunker_account_selected('prop'))
+        self.tb_normal.clicked.connect(lambda: self._on_trade_bunker_account_selected('normal'))
+        try:
+            self.trade_bunker_table.itemSelectionChanged.connect(self._on_trade_bunker_selection_changed)
+        except Exception:
+            pass
+        try:
+            self.tb_modify_btn.clicked.connect(self._trade_bunker_modify_or_cancel)
+        except Exception:
+            pass
+        self.tb_apply_btn.clicked.connect(self._trade_bunker_apply_changes)
+        def _tb_back():
+            idx = self.trade_bunker_stack.currentIndex()
+            if idx > 0:
+                if idx == 2:
+                    try:
+                        self._trade_bunker_stop_refresh()
+                    except Exception:
+                        pass
+                    try:
+                        self._trade_bunker_exit_modify_mode()
+                    except Exception:
+                        pass
+                self.trade_bunker_stack.setCurrentIndex(idx - 1)
+            else:
+                try:
+                    self._trade_bunker_stop_refresh()
+                except Exception:
+                    pass
+                try:
+                    self._trade_bunker_exit_modify_mode()
+                except Exception:
+                    pass
+                self.content_stack.setCurrentWidget(self.message_log_page)
+        self.tb_back.clicked.connect(_tb_back)
         self.dashboard_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.dashboard_splitter.setHandleWidth(6)
         self.dashboard_splitter.setChildrenCollapsible(False)
@@ -11147,6 +12625,11 @@ class MainWindow(QtWidgets.QWidget):
         self.settings_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.settings_btn.setEnabled(False)
 
+        self.trade_bunker_btn = QtWidgets.QToolButton()
+        self.trade_bunker_btn.setText(" 📊   Trade Bunker")
+        self.trade_bunker_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.trade_bunker_btn.setEnabled(False)
+
         self.subscription_btn = QtWidgets.QToolButton()
         self.subscription_btn.setText(" 💳   Subscription")
         self.subscription_btn.setCursor(QtCore.Qt.PointingHandCursor)
@@ -11157,7 +12640,7 @@ class MainWindow(QtWidgets.QWidget):
         self.expert_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.expert_btn.setEnabled(False)
 
-        for btn in (self.profile_btn, self.expert_btn, self.settings_btn, self.subscription_btn):
+        for btn in (self.profile_btn, self.expert_btn, self.settings_btn, self.trade_bunker_btn, self.subscription_btn):
             btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
             btn.setIconSize(QtCore.QSize(18, 18))
             btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
@@ -11550,13 +13033,26 @@ class MainWindow(QtWidgets.QWidget):
             try:
                 if event.type() == QtCore.QEvent.MouseMove:
                     pos = event.pos()
-                    item = list_groups.itemAt(pos)
-                    gid = int(item.data(QtCore.Qt.UserRole)) if item else None
-                    self._schedule_group_row_hover(gid)
+                    gid = None
+                    try:
+                        # QListView
+                        idx = list_groups.indexAt(pos)
+                        gid = int(idx.data(QtCore.Qt.UserRole)) if idx and idx.isValid() else None
+                    except Exception:
+                        # QListWidget (legacy)
+                        try:
+                            item = list_groups.itemAt(pos)
+                            gid = int(item.data(QtCore.Qt.UserRole)) if item else None
+                        except Exception:
+                            gid = None
+                    # Delegate draws hover; keep scheduler for legacy widget-based rows only.
+                    if not bool(getattr(self, "_group_model", None)):
+                        self._schedule_group_row_hover(gid)
                 elif event.type() == QtCore.QEvent.Wheel:
                     # Telegram-like: don't treat wheel-scrolling as hover.
                     # Otherwise the hover highlight appears to "move" while scrolling.
-                    self._set_group_row_hover(None)
+                    if not bool(getattr(self, "_group_model", None)):
+                        self._set_group_row_hover(None)
                 elif event.type() == QtCore.QEvent.Leave:
                     try:
                         t = getattr(self, "_group_row_hover_timer", None)
@@ -11564,7 +13060,8 @@ class MainWindow(QtWidgets.QWidget):
                             t.stop()
                     except Exception:
                         pass
-                    self._set_group_row_hover(None)
+                    if not bool(getattr(self, "_group_model", None)):
+                        self._set_group_row_hover(None)
             except Exception:
                 pass
 
@@ -11617,6 +13114,13 @@ class MainWindow(QtWidgets.QWidget):
             self._set_group_row_hover(gid)
 
     def _set_group_row_selected(self, gid: Optional[int]) -> None:
+        # Under Model/View the delegate paints selection; no per-row QWidget exists.
+        if bool(getattr(self, "_group_model", None)):
+            try:
+                self._group_row_selected_gid = gid
+            except Exception:
+                pass
+            return
         try:
             old = getattr(self, "_group_row_selected_gid", None)
         except Exception:
@@ -11648,6 +13152,13 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
     def _set_group_row_hover(self, gid: Optional[int]) -> None:
+        # Under Model/View the delegate paints hover; no per-row QWidget exists.
+        if bool(getattr(self, "_group_model", None)):
+            try:
+                self._group_row_hover_gid = gid
+            except Exception:
+                pass
+            return
         try:
             old = getattr(self, "_group_row_hover_gid", None)
         except Exception:
@@ -11691,8 +13202,14 @@ class MainWindow(QtWidgets.QWidget):
         self.phone.textChanged.connect(self._on_phone_text_changed)
         self.btn_send.clicked.connect(self.on_send)
         self.btn_login.clicked.connect(self.on_login)
-        self.list_groups.currentItemChanged.connect(self.on_group_selected)
-        self.group_search.textChanged.connect(self.on_filter_groups)
+        try:
+            # Model/View selection signal.
+            self.list_groups.selectionModel().currentChanged.connect(self._on_group_current_changed)
+        except Exception:
+            pass
+        self.group_search.textChanged.connect(
+            _wrap_ui_slot(self, "group_search_text_changed", self.on_filter_groups)
+        )
         self.menu_button.clicked.connect(lambda: self._toggle_drawer())
         self.night_toggle.toggled.connect(self._on_night_toggle)
         self.system_sync_btn.clicked.connect(self._sync_with_system)
@@ -11703,6 +13220,7 @@ class MainWindow(QtWidgets.QWidget):
         # opens the Settings page (backup behaviour).
         self.expert_btn.clicked.connect(self._show_expert)
         self.settings_btn.clicked.connect(self._show_settings_wizard)
+        self.trade_bunker_btn.clicked.connect(self._show_trade_bunker_wizard)
         self.subscription_btn.clicked.connect(self._show_subscription)
         self.subscription_method_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(0))
         self.subscription_status_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(1))
@@ -11731,7 +13249,9 @@ class MainWindow(QtWidgets.QWidget):
         self.symbol_custom.toggled.connect(
             lambda checked: self._set_symbol_mode("custom", checked)
         )
-        self.symbol_search.textChanged.connect(lambda _t: self._symbol_filter_timer.start(120))
+        self.symbol_search.textChanged.connect(
+            _wrap_ui_slot(self, "symbol_search_text_changed", lambda _t: self._symbol_filter_timer.start(120))
+        )
         self.psl_search.textChanged.connect(self._refresh_psl_list)
         # Manual refresh buttons (fast-path; does not replace polling)
         try:
@@ -11779,7 +13299,7 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
         try:
-            worker.message_received.connect(self.on_message, QtCore.Qt.QueuedConnection)
+            worker.message_received.connect(self._on_worker_message_received, QtCore.Qt.QueuedConnection)
         except Exception:
             pass
         try:
@@ -11790,6 +13310,27 @@ class MainWindow(QtWidgets.QWidget):
             worker.user_ready.connect(self.on_user_ready, QtCore.Qt.QueuedConnection)
         except Exception:
             pass
+
+    def _on_worker_message_received(self, chat_id: int, sender: str, text: str, timestamp: str, outgoing: bool, *rest: object) -> None:
+        """Adapter for TelegramWorker.message_received.
+
+        Keeps the UI compatible with both the legacy 5-arg form and the newer
+        6-arg form that includes epoch seconds.
+        """
+        tg_ts = 0
+        try:
+            if rest:
+                tg_ts = int(rest[0] or 0)
+        except Exception:
+            tg_ts = 0
+        try:
+            self.on_message(int(chat_id), str(sender or ""), str(text or ""), str(timestamp or ""), bool(outgoing), int(tg_ts or 0))
+        except Exception:
+            # Last-resort: call without tg_ts.
+            try:
+                self.on_message(int(chat_id), str(sender or ""), str(text or ""), str(timestamp or ""), bool(outgoing))
+            except Exception:
+                pass
 
     def _on_telegram_worker_finished(self) -> None:
         """Called whenever the TelegramWorker thread exits.
@@ -12257,6 +13798,7 @@ class MainWindow(QtWidgets.QWidget):
         self.menu_button.show()
         self.profile_btn.setEnabled(True)
         self.settings_btn.setEnabled(True)
+        self.trade_bunker_btn.setEnabled(True)
         self.subscription_btn.setEnabled(True)
         self.expert_btn.setEnabled(True)
         self._show_message_log()
@@ -12472,7 +14014,13 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
-        self.list_groups.clear()
+        try:
+            if bool(getattr(self, "_group_model", None)):
+                self._group_model.set_gids([])
+            else:
+                self.list_groups.clear()
+        except Exception:
+            pass
         self.group_states = {}
         self.group_widgets = {}
         self.groups_cache = groups
@@ -12496,7 +14044,8 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
         unread_map = self.settings.get("unread", {}) or {}
-        target_group_id = self.settings.get("last_group_id")
+        # IMPORTANT UX: do not auto-select/open a group on load.
+        target_group_id = None
         try:
             saved_listening_ids = self.settings.get("listening_ids", []) or []
         except Exception:
@@ -12507,9 +14056,9 @@ class MainWindow(QtWidgets.QWidget):
             saved_listening_set = set()
 
         try:
-            cap = int(getattr(self, "_chat_history_max_messages", 200) or 0)
+            cap = int(getattr(self, "_chat_history_max_messages", CHAT_HISTORY_MAX_MESSAGES_DEFAULT) or 0)
         except Exception:
-            cap = 200
+            cap = 800
         for row in (groups or []):
             try:
                 name, gid, icon_path, username = row  # type: ignore[misc]
@@ -12566,6 +14115,16 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+        # Telegram/WhatsApp ordering: most recently active chats first.
+        try:
+            self.group_order = sorted(
+                list(getattr(self, "group_order", []) or []),
+                key=lambda g: int(getattr((getattr(self, "group_states", {}) or {}).get(int(g)), "last_message_ts", 0) or 0),
+                reverse=True,
+            )
+        except Exception:
+            pass
+
         # Resume listening for groups that were ON before the app was closed.
         # Best-effort: worker will no-op if not ready yet.
         try:
@@ -12575,8 +14134,53 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
-        # Build list incrementally to keep UI responsive.
-        self._begin_group_list_build(filter_text=self.group_search.text(), target_gid=target_group_id)
+        # Populate the group list.
+        try:
+            if bool(getattr(self, "_group_model", None)):
+                # Block selection changes while resetting the model; otherwise Qt
+                # may auto-pick row 0 and emit `currentChanged`.
+                try:
+                    sel = self.list_groups.selectionModel()
+                except Exception:
+                    sel = None
+                blocker = None
+                if sel is not None:
+                    try:
+                        blocker = QtCore.QSignalBlocker(sel)
+                    except Exception:
+                        blocker = None
+
+                try:
+                    self._group_model.set_gids(list(self.group_order or []))
+                    self._refresh_group_list(self.group_search.text())
+                    # Ensure nothing is selected/current by default.
+                    if sel is not None:
+                        sel.clearSelection()
+                        sel.setCurrentIndex(QtCore.QModelIndex(), QtCore.QItemSelectionModel.Clear)
+                finally:
+                    try:
+                        if blocker is not None:
+                            del blocker
+                    except Exception:
+                        pass
+                try:
+                    self.current_group_id = None
+                except Exception:
+                    pass
+                try:
+                    self._set_group_row_selected(None)
+                except Exception:
+                    pass
+                try:
+                    self._render_message_log_for_group(None)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+        # Fallback: Build list incrementally to keep UI responsive.
+        self._begin_group_list_build(filter_text=self.group_search.text(), target_gid=None)
 
     def _format_chat_log_line(self, sender: str, text: str, timestamp: str) -> str:
         s = str(sender or "Unknown")
@@ -12597,8 +14201,94 @@ class MainWindow(QtWidgets.QWidget):
             self._chat_render_gid = None
             self._chat_render_items = []
             self._chat_render_index = 0
+            self._chat_render_bubble_title = ""
         except Exception:
             pass
+
+    def _normalize_render_history_for_group(self, gid: int, state: object) -> List[Tuple[str, str, str, bool, str]]:
+        try:
+            items = list(getattr(state, "messages", []) or [])
+        except Exception:
+            items = []
+
+        try:
+            recent_cap = int(CHAT_RENDER_RECENT_MAX_DEFAULT)
+        except Exception:
+            recent_cap = 350
+        try:
+            anchor = int(getattr(state, "scroll_anchor", 0) or 0)
+        except Exception:
+            anchor = 0
+
+        if recent_cap > 0 and anchor <= 0 and len(items) > recent_cap:
+            items = items[-recent_cap:]
+        return _prepare_chat_render_entries(items)
+
+    def _start_async_chat_render(self, gid: int, bubble_title: str, items: Sequence[object]) -> bool:
+        try:
+            seq = int(getattr(self, "_chat_render_request_seq", 0) or 0) + 1
+            self._chat_render_request_seq = seq
+        except Exception:
+            seq = 1
+            self._chat_render_request_seq = seq
+
+        try:
+            pool = getattr(self, "_backend_pool", None) or QtCore.QThreadPool.globalInstance()
+        except Exception:
+            pool = QtCore.QThreadPool.globalInstance()
+        if pool is None:
+            return False
+
+        try:
+            task = _ChatRenderPrepTask(seq, int(gid), str(bubble_title or ""), items)
+            task.signals.finished.connect(self._on_chat_render_prepared, QtCore.Qt.QueuedConnection)
+            task.signals.error.connect(self._on_chat_render_prepare_error, QtCore.Qt.QueuedConnection)
+            pool.start(task)
+            return True
+        except Exception:
+            return False
+
+    def _on_chat_render_prepared(self, seq: int, gid: int, bubble_title: str, prepared: object) -> None:
+        try:
+            if int(seq or 0) != int(getattr(self, "_chat_render_request_seq", 0) or 0):
+                return
+        except Exception:
+            return
+        try:
+            if int(getattr(self, "current_group_id", 0) or 0) != int(gid or 0):
+                return
+        except Exception:
+            return
+
+        try:
+            self._chat_render_gid = int(gid)
+            self._chat_render_bubble_title = str(bubble_title or "")
+            self._chat_render_items = list(prepared or [])
+            self._chat_render_index = 0
+        except Exception:
+            self._cancel_chat_render()
+            return
+
+        try:
+            initial_count = int(CHAT_RENDER_INITIAL_CHUNK_DEFAULT)
+        except Exception:
+            initial_count = 12
+        self._add_chat_render_chunk(count=max(6, initial_count), deadline=(time.perf_counter() + 0.004))
+
+    def _on_chat_render_prepare_error(self, seq: int, gid: int, _message: str) -> None:
+        try:
+            if int(seq or 0) != int(getattr(self, "_chat_render_request_seq", 0) or 0):
+                return
+        except Exception:
+            return
+        try:
+            state = (getattr(self, "group_states", {}) or {}).get(int(gid))
+            bubble_title = str(getattr(state, "name", "") or "") if state is not None else ""
+            prepared = self._normalize_render_history_for_group(int(gid), state) if state is not None else []
+        except Exception:
+            prepared = []
+            bubble_title = ""
+        self._on_chat_render_prepared(int(seq or 0), int(gid or 0), bubble_title, prepared)
 
     def _add_chat_render_chunk(self, *, count: int = 40, deadline: Optional[float] = None) -> None:
         log_widget = getattr(self, "log", None)
@@ -12635,10 +14325,13 @@ class MainWindow(QtWidgets.QWidget):
         added = 0
         bubble_title = ""
         try:
-            state = (getattr(self, "group_states", {}) or {}).get(int(gid))
-            bubble_title = str(getattr(state, "name", "") or "")
+            bubble_title = str(getattr(self, "_chat_render_bubble_title", "") or "")
         except Exception:
-            bubble_title = ""
+            try:
+                state = (getattr(self, "group_states", {}) or {}).get(int(gid))
+                bubble_title = str(getattr(state, "name", "") or "")
+            except Exception:
+                bubble_title = ""
 
         try:
             log_widget.setUpdatesEnabled(False)
@@ -12685,7 +14378,12 @@ class MainWindow(QtWidgets.QWidget):
                 if t is None:
                     t = QtCore.QTimer(self)
                     t.setSingleShot(True)
-                    t.timeout.connect(lambda: self._add_chat_render_chunk(count=40, deadline=(time.perf_counter() + 0.008)))
+                    t.timeout.connect(
+                        lambda: self._add_chat_render_chunk(
+                            count=max(8, int(CHAT_RENDER_CHUNK_DEFAULT)),
+                            deadline=(time.perf_counter() + 0.004),
+                        )
+                    )
                     self._chat_render_timer = t
                 if not t.isActive():
                     t.start(0)
@@ -12772,18 +14470,16 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
         try:
-            items = list(getattr(state, "messages", []) or [])
+            items = self._normalize_render_history_for_group(int(gid), state)
         except Exception:
             items = []
 
-        # Default to synchronous render (history is bounded, usually small).
-        # Only use incremental rendering when history is unusually large.
         try:
-            incremental_threshold = int(os.environ.get("FLAMEBOT_UI_INCREMENTAL_RENDER_THRESHOLD", "500") or 500)
+            sync_threshold = int(CHAT_RENDER_SYNC_THRESHOLD_DEFAULT)
         except Exception:
-            incremental_threshold = 500
+            sync_threshold = 60
 
-        if len(items) <= max(50, incremental_threshold):
+        if len(items) <= max(12, sync_threshold):
             try:
                 log_widget.setUpdatesEnabled(False)
             except Exception:
@@ -12824,19 +14520,97 @@ class MainWindow(QtWidgets.QWidget):
                     pass
             return
 
-        # Incremental render for very large histories.
+        # Incremental render for navigation: prepare in background and render in
+        # small UI chunks so chat switching never blocks the main thread.
         try:
             log_widget.clear()
         except Exception:
             pass
+        if not self._start_async_chat_render(int(gid), bubble_title, items):
+            try:
+                self._chat_render_gid = int(gid)
+                self._chat_render_bubble_title = str(bubble_title or "")
+                self._chat_render_items = items
+                self._chat_render_index = 0
+                self._add_chat_render_chunk(count=max(8, int(CHAT_RENDER_INITIAL_CHUNK_DEFAULT)), deadline=(time.perf_counter() + 0.004))
+            except Exception:
+                pass
+
+    def _purge_ui_bubble_queues_for_navigation(self, active_gid: int) -> None:
         try:
-            self._chat_render_gid = int(gid)
-            self._chat_render_items = items
-            self._chat_render_index = 0
+            keep_gid = int(active_gid or 0)
         except Exception:
-            return
+            keep_gid = 0
         try:
-            self._add_chat_render_chunk(count=50, deadline=(time.perf_counter() + 0.010))
+            self._ui_live_bubble_queue = deque(
+                item for item in (getattr(self, "_ui_live_bubble_queue", deque()) or deque())
+                if int(item[0]) == keep_gid
+            )
+        except Exception:
+            try:
+                self._ui_live_bubble_queue = deque()
+            except Exception:
+                pass
+        try:
+            self._ui_bubble_queue = deque(
+                item for item in (getattr(self, "_ui_bubble_queue", deque()) or deque())
+                if int(item[0]) == keep_gid
+            )
+        except Exception:
+            try:
+                self._ui_bubble_queue = deque()
+            except Exception:
+                pass
+        try:
+            if not self._ui_live_bubble_queue and not self._ui_bubble_queue and self._ui_bubble_flush_timer.isActive():
+                self._ui_bubble_flush_timer.stop()
+        except Exception:
+            pass
+
+    def _prepare_chat_switch_view(self, gid: int, state: object) -> None:
+        try:
+            self._chat_render_request_seq = int(getattr(self, "_chat_render_request_seq", 0) or 0) + 1
+        except Exception:
+            self._chat_render_request_seq = 1
+        try:
+            self._cancel_chat_render()
+        except Exception:
+            pass
+        try:
+            self._ui_live_flush_pending = False
+            self._ui_bubble_flush_in_progress = False
+        except Exception:
+            pass
+        try:
+            self._purge_ui_bubble_queues_for_navigation(int(gid))
+        except Exception:
+            pass
+        try:
+            self._suspend_scroll_tracking = True
+        except Exception:
+            pass
+        try:
+            stack = getattr(self, "content_stack", None)
+            page = getattr(self, "message_log_page", None)
+            if stack is not None and page is not None:
+                stack.setCurrentWidget(page)
+        except Exception:
+            pass
+        try:
+            stack = getattr(self, "message_log_stack", None)
+            if stack is not None:
+                stack.setCurrentIndex(1 if gid else 0)
+        except Exception:
+            pass
+        try:
+            self.group_title.setText(str(getattr(state, "name", "") or "Message Log"))
+            self.group_subtitle.setText("Listening" if bool(getattr(state, "listening", False)) else "Not listening")
+        except Exception:
+            pass
+        try:
+            log_widget = getattr(self, "log", None)
+            if log_widget is not None:
+                log_widget.prepare_for_chat_switch()
         except Exception:
             pass
 
@@ -12944,6 +14718,15 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 pass
 
+            # Maintain last_message_ts for correct chat ordering.
+            try:
+                if tg_ts and int(tg_ts) > 0:
+                    cur = int(getattr(state, "last_message_ts", 0) or 0)
+                    if int(tg_ts) > cur:
+                        state.last_message_ts = int(tg_ts)
+            except Exception:
+                pass
+
     def _restore_message_log_from_ndjson(self) -> None:
         # Restore chat bubbles into the Message Log panel.
         # Best-effort and idempotent: only run once per app session.
@@ -12967,9 +14750,9 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
         try:
-            cap = int(getattr(log_widget, "_max_bubbles", 500) or 0)
+            cap = int(getattr(log_widget, "_max_bubbles", UI_LOG_MAX_BUBBLES_DEFAULT) or 0)
         except Exception:
-            cap = 500
+            cap = 800
         if cap <= 0:
             return
 
@@ -13070,19 +14853,61 @@ class MainWindow(QtWidgets.QWidget):
                 pass
 
     def _select_group_by_id(self, gid: int) -> None:
-        for index in range(self.list_groups.count()):
-            item = self.list_groups.item(index)
-            if item.data(QtCore.Qt.UserRole) == gid:
-                self.list_groups.setCurrentItem(item)
-                break
+        # Model/View path.
+        if bool(getattr(self, "_group_model", None)) and bool(getattr(self, "_group_proxy", None)):
+            try:
+                row = self._group_model.row_for_gid(int(gid))
+            except Exception:
+                row = None
+            if row is None:
+                return
+            try:
+                src_idx = self._group_model.index(int(row), 0)
+                proxy_idx = self._group_proxy.mapFromSource(src_idx)
+                if proxy_idx.isValid():
+                    self.list_groups.setCurrentIndex(proxy_idx)
+                    return
+            except Exception:
+                return
 
-    def on_group_selected(self, current: Optional[QtWidgets.QListWidgetItem]) -> None:
-        if not current:
+        # Legacy QListWidget path.
+        try:
+            for index in range(self.list_groups.count()):
+                item = self.list_groups.item(index)
+                if item.data(QtCore.Qt.UserRole) == gid:
+                    self.list_groups.setCurrentItem(item)
+                    break
+        except Exception:
+            pass
+
+    def _on_group_current_changed(self, current: QtCore.QModelIndex, previous: QtCore.QModelIndex) -> None:
+        """Handle group selection changes from the QListView selection model."""
+        try:
+            if bool(getattr(self, "_suspend_group_current_changed", False)):
+                return
+        except Exception:
+            pass
+        try:
+            if current is None or (not current.isValid()):
+                return
+        except Exception:
             return
-        gid = current.data(QtCore.Qt.UserRole)
+
+        try:
+            gid = current.data(QtCore.Qt.UserRole)
+        except Exception:
+            gid = None
+        if gid is None:
+            return
+
+        self._on_group_selected_gid(int(gid))
+
+    def _on_group_selected_gid(self, gid: int) -> None:
+        """Core selection logic shared by both QListWidget and QListView."""
         state = self.group_states.get(gid)
         if not state:
             return
+
         try:
             prev_gid = getattr(self, "current_group_id", None)
         except Exception:
@@ -13095,12 +14920,16 @@ class MainWindow(QtWidgets.QWidget):
 
         self.current_group_id = gid
         try:
+            self._prepare_chat_switch_view(int(gid), state)
+        except Exception:
+            pass
+        try:
             self._set_group_row_selected(int(gid))
         except Exception:
             pass
+
         state.unread = 0
         self._update_group_widget(state)
-        # Make selection feel instant: update highlight immediately, then render.
         try:
             QtCore.QTimer.singleShot(0, lambda _gid=gid: self._render_message_log_for_group(_gid))
         except Exception:
@@ -13109,6 +14938,16 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 pass
         self._save_settings()
+
+    def on_group_selected(self, current: Optional[QtWidgets.QListWidgetItem]) -> None:
+        # Legacy QListWidget selection handler (kept for compatibility).
+        if not current:
+            return
+        try:
+            gid = int(current.data(QtCore.Qt.UserRole))
+        except Exception:
+            return
+        self._on_group_selected_gid(gid)
 
     def _save_scroll_anchor_for_group(self, gid: int) -> None:
         log_widget = getattr(self, "log", None)
@@ -13343,7 +15182,13 @@ class MainWindow(QtWidgets.QWidget):
             pass
         try:
             if hasattr(self, "list_groups"):
-                self.list_groups.clear()
+                if bool(getattr(self, "_group_model", None)):
+                    try:
+                        self._group_model.set_gids([])
+                    except Exception:
+                        pass
+                else:
+                    self.list_groups.clear()
         except Exception:
             pass
         try:
@@ -13487,6 +15332,7 @@ class MainWindow(QtWidgets.QWidget):
             try:
                 self.profile_btn.setEnabled(False)
                 self.settings_btn.setEnabled(False)
+                self.trade_bunker_btn.setEnabled(False)
                 self.subscription_btn.setEnabled(False)
                 self.expert_btn.setEnabled(False)
             except Exception:
@@ -13619,14 +15465,135 @@ class MainWindow(QtWidgets.QWidget):
 
     def _apply_pending_group_filter(self) -> None:
         try:
-            self._refresh_group_list(getattr(self, "_pending_group_filter_text", ""))
+            started = float(time.perf_counter())
         except Exception:
-            pass
+            started = 0.0
+
+        try:
+            term = str(getattr(self, "_pending_group_filter_text", "") or "")
+        except Exception:
+            term = ""
+        try:
+            self._refresh_group_list(term)
+        except Exception:
+            return
+        finally:
+            try:
+                ended = float(time.perf_counter())
+            except Exception:
+                ended = started
+            try:
+                dur = float(ended) - float(started)
+            except Exception:
+                dur = 0.0
+            if dur >= 0.25:
+                src_rows = None
+                proxy_rows = None
+                try:
+                    if getattr(self, "_group_model", None) is not None:
+                        src_rows = int(self._group_model.rowCount())
+                except Exception:
+                    src_rows = None
+                try:
+                    if getattr(self, "_group_proxy", None) is not None:
+                        proxy_rows = int(self._group_proxy.rowCount())
+                except Exception:
+                    proxy_rows = None
+
+                try:
+                    _configure_freeze_logging().warning(
+                        "Group search filter applied slowly: %.3fs term_len=%d src_rows=%r proxy_rows=%r",
+                        float(dur),
+                        int(len(term)),
+                        src_rows,
+                        proxy_rows,
+                    )
+                except Exception:
+                    pass
 
     def on_message(
-        self, chat_id: int, sender: str, text: str, timestamp: str, outgoing: bool
+        self,
+        chat_id: int,
+        sender: str,
+        text: str,
+        timestamp: str,
+        outgoing: bool,
+        tg_ts: int = 0,
     ) -> None:
-        self._ingest_message(chat_id, sender, text, timestamp, outgoing, save_settings=True)
+        self._ingest_message(chat_id, sender, text, timestamp, outgoing, tg_ts=int(tg_ts or 0), save_settings=True)
+
+    def _bump_group_to_top(self, gid: int) -> None:
+        """Move the group row to the top (Telegram/WhatsApp behavior)."""
+        try:
+            gid_i = int(gid)
+        except Exception:
+            return
+
+        # Update the canonical order used across the UI.
+        try:
+            order = list(getattr(self, "group_order", []) or [])
+        except Exception:
+            order = []
+        if not order or gid_i not in order:
+            return
+        if int(order[0]) != gid_i:
+            try:
+                order.remove(gid_i)
+                order.insert(0, gid_i)
+                self.group_order = order
+            except Exception:
+                pass
+
+        # Model/View path: move row efficiently.
+        if bool(getattr(self, "_group_model", None)):
+            try:
+                self._group_model.move_gid_to_front(gid_i)
+            except Exception:
+                pass
+            return
+
+        # Legacy QListWidget path.
+        try:
+            item = (getattr(self, "_group_items", {}) or {}).get(gid_i)
+        except Exception:
+            item = None
+        if item is None:
+            return
+        try:
+            lw = getattr(self, "list_groups", None)
+        except Exception:
+            lw = None
+        if lw is None or not hasattr(lw, "row") or not hasattr(lw, "takeItem"):
+            return
+        try:
+            old_row = int(lw.row(item))
+        except Exception:
+            old_row = -1
+        if old_row <= 0:
+            return
+        try:
+            lw.setUpdatesEnabled(False)
+        except Exception:
+            pass
+        try:
+            taken = lw.takeItem(old_row)
+            if taken is None:
+                return
+            lw.insertItem(0, taken)
+            try:
+                w = (getattr(self, "group_widgets", {}) or {}).get(gid_i)
+            except Exception:
+                w = None
+            if w is not None and hasattr(lw, "setItemWidget"):
+                try:
+                    lw.setItemWidget(taken, w)
+                except Exception:
+                    pass
+        finally:
+            try:
+                lw.setUpdatesEnabled(True)
+            except Exception:
+                pass
 
     def _seen_key_hit(self, chat_id: int, key: str) -> bool:
         """Return True if message key was already ingested recently."""
@@ -13669,6 +15636,7 @@ class MainWindow(QtWidgets.QWidget):
         outgoing: bool,
         *,
         date_key: str = "",
+        tg_ts: int = 0,
         save_settings: bool = True,
     ) -> None:
         state = self.group_states.get(chat_id)
@@ -13679,7 +15647,7 @@ class MainWindow(QtWidgets.QWidget):
         try:
             key = (
                 f"{int(chat_id)}\n{str(sender or '')}\n{str(text or '')}\n"
-                f"{str(timestamp or '')}\n{int(bool(outgoing))}\n{str(date_key or '')}"
+                f"{str(timestamp or '')}\n{int(bool(outgoing))}"
             )
         except Exception:
             key = str(time.time())
@@ -13691,9 +15659,9 @@ class MainWindow(QtWidgets.QWidget):
 
         # Ensure messages buffer is bounded and deque-backed.
         try:
-            cap = int(getattr(self, "_chat_history_max_messages", 200) or 0)
+            cap = int(getattr(self, "_chat_history_max_messages", CHAT_HISTORY_MAX_MESSAGES_DEFAULT) or 0)
         except Exception:
-            cap = 200
+            cap = 800
         try:
             msgs = getattr(state, "messages", None)
         except Exception:
@@ -13719,6 +15687,35 @@ class MainWindow(QtWidgets.QWidget):
             state.messages.append((sender, text, timestamp, outgoing, str(date_key or "").strip()))
         except Exception:
             return
+
+        # Track per-group last message epoch for Telegram-like ordering.
+        prev_last = 0
+        try:
+            prev_last = int(getattr(state, "last_message_ts", 0) or 0)
+        except Exception:
+            prev_last = 0
+        new_epoch = 0
+        try:
+            new_epoch = int(tg_ts or 0)
+        except Exception:
+            new_epoch = 0
+        if new_epoch <= 0:
+            # Fallback: still allow real-time reordering even if a worker
+            # message lacks a Telegram timestamp.
+            try:
+                new_epoch = int(time.time())
+            except Exception:
+                new_epoch = prev_last
+        if new_epoch > prev_last:
+            try:
+                state.last_message_ts = int(new_epoch)
+            except Exception:
+                pass
+            # Queue reorder to coalesce bursts and avoid visible list flicker.
+            try:
+                self._mark_group_reorder_dirty(int(getattr(state, "gid", chat_id)))
+            except Exception:
+                pass
 
         if self.current_group_id == chat_id:
             state.unread = 0
@@ -13769,25 +15766,85 @@ class MainWindow(QtWidgets.QWidget):
         outgoing: bool,
         date_key: str,
     ) -> None:
-        # Keep queue bounded so a stalled UI doesn't blow up memory.
+        # Keep queues bounded so a stalled UI doesn't blow up memory.
         try:
-            max_q = int(os.environ.get("FLAMEBOT_UI_BUBBLE_QUEUE_MAX", "1000") or 1000)
+            max_q = int(UI_BUBBLE_QUEUE_MAX_DEFAULT)
         except Exception:
-            max_q = 1000
+            max_q = 3000
 
         try:
-            if max_q > 0 and len(self._ui_bubble_queue) >= max_q:
-                # Drop oldest to keep UI responsive.
-                for _ in range(max(1, max_q // 10)):
+            queue_len = len(self._ui_live_bubble_queue) + len(self._ui_bubble_queue)
+            if max_q > 0 and queue_len >= max_q:
+                # Emergency drop only when absolutely full (rare with aggressive flushing).
+                # Drop only 1/20th (conservatively small) to minimize message loss.
+                drop_count = max(1, max_q // 20)
+                dropped = 0
+                for _ in range(drop_count):
                     try:
-                        self._ui_bubble_queue.popleft()
+                        if self._ui_bubble_queue:
+                            self._ui_bubble_queue.popleft()
+                        elif self._ui_live_bubble_queue:
+                            self._ui_live_bubble_queue.popleft()
+                        else:
+                            break
+                        dropped += 1
                     except Exception:
                         break
+                # Log emergency message drops for diagnostics
+                if dropped > 0:
+                    try:
+                        self._dev_log(
+                            "ui_queue_emergency_drop",
+                            f"Dropped {dropped} messages (queue full: {queue_len}/{max_q})"
+                        )
+                    except Exception:
+                        pass
         except Exception:
             pass
 
         try:
-            self._ui_bubble_queue.append(
+            is_current_chat = int(getattr(self, "current_group_id", 0) or 0) == int(chat_id)
+        except Exception:
+            is_current_chat = False
+
+        if is_current_chat:
+            try:
+                render_busy = int(getattr(self, "_chat_render_gid", 0) or 0) == int(chat_id)
+            except Exception:
+                render_busy = False
+            try:
+                now_mono = float(time.monotonic())
+                last_live = float(getattr(self, "_last_live_bubble_render_monotonic", 0.0) or 0.0)
+            except Exception:
+                now_mono = 0.0
+                last_live = 0.0
+            direct_window = max(0.0, float(LIVE_BUBBLE_DIRECT_WINDOW_MS_DEFAULT) / 1000.0)
+            if (
+                not render_busy
+                and not bool(getattr(self, "_ui_bubble_flush_in_progress", False))
+                and not self._ui_live_bubble_queue
+                and not self._ui_bubble_queue
+                and (last_live <= 0.0 or (now_mono - last_live) >= direct_window)
+            ):
+                try:
+                    log_widget = getattr(self, "log", None)
+                    if log_widget is not None:
+                        log_widget.appendMessage(
+                            str(bubble_title or ""),
+                            str(text or ""),
+                            str(timestamp or ""),
+                            bool(outgoing),
+                            date_key=str(date_key or ""),
+                            defer_layout=True,
+                        )
+                        self._last_live_bubble_render_monotonic = now_mono
+                        return
+                except Exception:
+                    pass
+
+        try:
+            target_queue = self._ui_live_bubble_queue if is_current_chat else self._ui_bubble_queue
+            target_queue.append(
                 (
                     int(chat_id),
                     str(bubble_title or ""),
@@ -13805,6 +15862,24 @@ class MainWindow(QtWidgets.QWidget):
                 self._ui_bubble_flush_timer.start()
         except Exception:
             pass
+        if is_current_chat:
+            try:
+                if not bool(getattr(self, "_ui_live_flush_pending", False)):
+                    self._ui_live_flush_pending = True
+                    QtCore.QTimer.singleShot(0, self._run_live_ui_flush)
+            except Exception:
+                pass
+
+    def _run_live_ui_flush(self) -> None:
+        try:
+            self._ui_live_flush_pending = False
+        except Exception:
+            pass
+        try:
+            if self._ui_live_bubble_queue or self._ui_bubble_queue:
+                self._flush_ui_bubble_queue()
+        except Exception:
+            pass
 
     def _flush_ui_bubble_queue(self) -> None:
         log_widget = getattr(self, "log", None)
@@ -13816,13 +15891,31 @@ class MainWindow(QtWidgets.QWidget):
                 pass
             return
 
+        try:
+            self._ui_bubble_flush_in_progress = True
+        except Exception:
+            pass
+
         # Time/size budget per tick to keep UI responsive.
         try:
-            max_per_tick = int(os.environ.get("FLAMEBOT_UI_BUBBLES_PER_TICK", "30") or 30)
+            max_per_tick = int(UI_BUBBLES_PER_TICK_DEFAULT)
         except Exception:
-            max_per_tick = 30
-        max_per_tick = max(5, min(200, int(max_per_tick)))
-        deadline = time.perf_counter() + 0.010  # ~10ms budget
+            max_per_tick = 40
+        max_per_tick = max(8, min(300, int(max_per_tick)))
+        # Aggressive adaptive burst mode for high-volume Telegram groups.
+        # Scale processing based on queue depth to drain faster under sustained load.
+        try:
+            pending_now = len(self._ui_live_bubble_queue) + len(self._ui_bubble_queue)
+            if pending_now >= 1500:  # 50% of max 3000
+                max_per_tick = min(240, int(max_per_tick * 3))
+            elif pending_now >= 1000:  # 33% of max 3000
+                max_per_tick = min(200, int(max_per_tick * 2))
+            elif pending_now >= 500:  # 16% of max 3000
+                max_per_tick = min(150, int(max_per_tick * 1.5))
+        except Exception:
+            pass
+        # Increase time budget to allow more aggressive processing during bursts
+        deadline = time.perf_counter() + 0.020  # ~20ms budget for high-volume scenarios
 
         processed = 0
         try:
@@ -13831,7 +15924,7 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
         try:
-            while self._ui_bubble_queue and processed < max_per_tick:
+            while (self._ui_live_bubble_queue or self._ui_bubble_queue) and processed < max_per_tick:
                 try:
                     if time.perf_counter() >= deadline:
                         break
@@ -13839,7 +15932,10 @@ class MainWindow(QtWidgets.QWidget):
                     pass
 
                 try:
-                    cid, title, text, ts, outgoing, dk = self._ui_bubble_queue.popleft()
+                    if self._ui_live_bubble_queue:
+                        cid, title, text, ts, outgoing, dk = self._ui_live_bubble_queue.popleft()
+                    else:
+                        cid, title, text, ts, outgoing, dk = self._ui_bubble_queue.popleft()
                 except Exception:
                     break
 
@@ -13867,9 +15963,13 @@ class MainWindow(QtWidgets.QWidget):
                 log_widget.setUpdatesEnabled(True)
             except Exception:
                 pass
+            try:
+                self._ui_bubble_flush_in_progress = False
+            except Exception:
+                pass
 
         # Stop timer when idle.
-        if not self._ui_bubble_queue:
+        if not self._ui_live_bubble_queue and not self._ui_bubble_queue:
             try:
                 self._ui_bubble_flush_timer.stop()
             except Exception:
@@ -13886,7 +15986,160 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _mark_group_reorder_dirty(self, gid: int) -> None:
+        try:
+            self._ui_dirty_group_reorders.add(int(gid))
+        except Exception:
+            return
+        try:
+            if not self._ui_group_row_flush_timer.isActive():
+                self._ui_group_row_flush_timer.start()
+        except Exception:
+            pass
+
     def _flush_ui_dirty_group_rows(self) -> None:
+        # Apply any pending chat reorders first, while suppressing currentChanged.
+        try:
+            reorder = list(getattr(self, "_ui_dirty_group_reorders", set()) or set())
+        except Exception:
+            reorder = []
+        if reorder:
+            try:
+                self._ui_dirty_group_reorders.clear()
+            except Exception:
+                pass
+            try:
+                # IMPORTANT: when moving multiple chats to the front, process
+                # oldest → newest so the newest ends up at row 0.
+                reorder = sorted(
+                    [int(g) for g in reorder],
+                    key=lambda g: int(
+                        getattr(
+                            (getattr(self, "group_states", {}) or {}).get(int(g)),
+                            "last_message_ts",
+                            0,
+                        )
+                        or 0
+                    ),
+                    reverse=False,
+                )
+            except Exception:
+                pass
+
+            list_groups = getattr(self, "list_groups", None)
+            sb_val = None
+            cur_gid = 0
+            is_model_view = bool(getattr(self, "_group_model", None)) and bool(getattr(self, "_group_proxy", None))
+            try:
+                if list_groups is not None and hasattr(list_groups, "verticalScrollBar"):
+                    sb = list_groups.verticalScrollBar()
+                    sb_val = int(sb.value())
+            except Exception:
+                sb_val = None
+
+            # Preserve the current (highlighted) chat selection to avoid flicker.
+            try:
+                cur_gid = int(getattr(self, "current_group_id", 0) or 0)
+            except Exception:
+                cur_gid = 0
+            if not cur_gid:
+                try:
+                    if list_groups is not None and hasattr(list_groups, "currentIndex"):
+                        idx0 = list_groups.currentIndex()
+                        if idx0 is not None and idx0.isValid():
+                            cur_gid = int(idx0.data(QtCore.Qt.UserRole) or 0)
+                except Exception:
+                    cur_gid = 0
+
+            sel = None
+            blocker = None
+            view_blocker = None
+            if not is_model_view:
+                try:
+                    if list_groups is not None and hasattr(list_groups, "selectionModel"):
+                        sel = list_groups.selectionModel()
+                except Exception:
+                    sel = None
+
+                try:
+                    if sel is not None:
+                        blocker = QtCore.QSignalBlocker(sel)
+                except Exception:
+                    blocker = None
+
+                try:
+                    if list_groups is not None:
+                        view_blocker = QtCore.QSignalBlocker(list_groups)
+                except Exception:
+                    view_blocker = None
+
+            try:
+                try:
+                    self._suspend_group_current_changed = True
+                except Exception:
+                    pass
+                for gid in reorder:
+                    try:
+                        self._bump_group_to_top(int(gid))
+                    except Exception:
+                        continue
+
+                # Under model/view, beginMoveRows preserves row instances.
+                # Re-applying selection/current on every message causes visible
+                # flashes, so only do this for the legacy widget path.
+                if not is_model_view:
+                    try:
+                        if cur_gid and bool(getattr(self, "_group_model", None)) and bool(getattr(self, "_group_proxy", None)):
+                            row = self._group_model.row_for_gid(int(cur_gid))
+                            if row is not None:
+                                src_idx = self._group_model.index(int(row), 0)
+                                proxy_idx = self._group_proxy.mapFromSource(src_idx)
+                                if proxy_idx is not None and proxy_idx.isValid() and sel is not None:
+                                    try:
+                                        sel.select(
+                                            proxy_idx,
+                                            QtCore.QItemSelectionModel.ClearAndSelect | QtCore.QItemSelectionModel.Rows,
+                                        )
+                                    except Exception:
+                                        pass
+                                    try:
+                                        sel.setCurrentIndex(proxy_idx, QtCore.QItemSelectionModel.NoUpdate)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    if list_groups is not None:
+                        try:
+                            # Avoid forcing scrollbar restoration under model/view.
+                            # Forcing sb.setValue() during beginMoveRows can cause a visible flash.
+                            if (not is_model_view) and (sb_val is not None) and hasattr(list_groups, "verticalScrollBar"):
+                                sb = list_groups.verticalScrollBar()
+                                sb.blockSignals(True)
+                                try:
+                                    sb.setValue(int(sb_val))
+                                finally:
+                                    sb.blockSignals(False)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    self._suspend_group_current_changed = False
+                except Exception:
+                    pass
+                try:
+                    if blocker is not None:
+                        del blocker
+                except Exception:
+                    pass
+                try:
+                    if view_blocker is not None:
+                        del view_blocker
+                except Exception:
+                    pass
+
         try:
             dirty = list(getattr(self, "_ui_dirty_group_rows", set()) or set())
         except Exception:
@@ -13898,17 +16151,76 @@ class MainWindow(QtWidgets.QWidget):
                 pass
             return
 
+        # Time-budget updates so listening to many groups doesn't freeze the UI.
         try:
-            self._ui_dirty_group_rows.clear()
+            budget_ms = int(os.environ.get("FLAMEBOT_UI_GROUPROW_BUDGET_MS", "7") or 7)
         except Exception:
-            pass
+            budget_ms = 7
+        budget_ms = max(2, min(25, int(budget_ms)))
+        deadline = time.perf_counter() + (budget_ms / 1000.0)
 
         try:
-            self.list_groups.setUpdatesEnabled(False)
+            is_model_view = bool(getattr(self, "_group_model", None))
+        except Exception:
+            is_model_view = False
+
+        try:
+            dirty_set = getattr(self, "_ui_dirty_group_rows", set())
+            if not isinstance(dirty_set, set):
+                dirty_set = set(dirty_set or [])
+                self._ui_dirty_group_rows = dirty_set
+        except Exception:
+            dirty_set = set()
+            try:
+                self._ui_dirty_group_rows = dirty_set
+            except Exception:
+                pass
+
+        if is_model_view:
+            try:
+                changed = set(int(g) for g in dirty_set)
+            except Exception:
+                changed = set()
+            try:
+                changed.update(int(g) for g in reorder)
+            except Exception:
+                pass
+            try:
+                dirty_set.clear()
+            except Exception:
+                pass
+            try:
+                if changed and bool(getattr(self, "_group_model", None)):
+                    self._group_model.update_gids(list(changed))
+            except Exception:
+                pass
+            try:
+                if not bool(getattr(self, "_ui_dirty_group_rows", set())) and not bool(getattr(self, "_ui_dirty_group_reorders", set())):
+                    self._ui_group_row_flush_timer.stop()
+            except Exception:
+                pass
+            return
+
+        # Under model/view we do not disable updates; update_gid emits minimal dataChanged.
+        # Under legacy widgets, disable updates while touching row widgets.
+        try:
+            if (not is_model_view) and hasattr(self, "list_groups"):
+                self.list_groups.setUpdatesEnabled(False)
         except Exception:
             pass
         try:
-            for gid in dirty:
+            while dirty_set:
+                try:
+                    if time.perf_counter() >= float(deadline):
+                        break
+                except Exception:
+                    pass
+
+                try:
+                    gid = int(dirty_set.pop())
+                except Exception:
+                    break
+
                 try:
                     st = (getattr(self, "group_states", {}) or {}).get(int(gid))
                 except Exception:
@@ -13921,7 +16233,8 @@ class MainWindow(QtWidgets.QWidget):
                     continue
         finally:
             try:
-                self.list_groups.setUpdatesEnabled(True)
+                if (not is_model_view) and hasattr(self, "list_groups"):
+                    self.list_groups.setUpdatesEnabled(True)
             except Exception:
                 pass
 
@@ -13929,6 +16242,72 @@ class MainWindow(QtWidgets.QWidget):
         try:
             if not bool(getattr(self, "_ui_dirty_group_rows", set())):
                 self._ui_group_row_flush_timer.stop()
+        except Exception:
+            pass
+
+    def _monitor_queue_backpressure(self) -> None:
+        """Lightweight queue pressure telemetry for tuning and debugging."""
+        try:
+            ui_q = len(getattr(self, "_ui_live_bubble_queue", ()) or ()) + len(getattr(self, "_ui_bubble_queue", ()) or ())
+        except Exception:
+            ui_q = 0
+        try:
+            ui_max = int(UI_BUBBLE_QUEUE_MAX_DEFAULT)
+        except Exception:
+            ui_max = 3000
+        ui_warn = max(150, int(ui_max * 0.65))
+
+        backend_q = 0
+        try:
+            worker = getattr(self, "worker", None)
+            q = getattr(worker, "_backend_post_queue", None) if worker is not None else None
+            if q is not None:
+                backend_q = int(q.qsize())
+        except Exception:
+            backend_q = 0
+        try:
+            backend_warn = int(os.environ.get("FLAMEBOT_BACKEND_POST_QUEUE_WARN", "2000") or 2000)
+        except Exception:
+            backend_warn = 2000
+
+        # Track maximum queue depths for performance analysis
+        try:
+            max_ui_q = max(int(getattr(self, "_queue_monitor_max_ui", 0) or 0), ui_q)
+            self._queue_monitor_max_ui = max_ui_q
+            max_backend_q = max(int(getattr(self, "_queue_monitor_max_backend", 0) or 0), backend_q)
+            self._queue_monitor_max_backend = max_backend_q
+        except Exception:
+            pass
+
+        overloaded = bool(ui_q >= ui_warn or backend_q >= backend_warn)
+        if not overloaded:
+            return
+
+        try:
+            now = float(time.monotonic())
+        except Exception:
+            now = 0.0
+        try:
+            last = float(getattr(self, "_queue_monitor_last_warn_monotonic", 0.0) or 0.0)
+        except Exception:
+            last = 0.0
+        # Throttle diagnostics to avoid log spam but be aggressive for critical spikes
+        throttle_interval = 4.0 if ui_q >= ui_max * 0.9 else 8.0  # Alert sooner if near capacity
+        if last > 0 and (now - last) < throttle_interval:
+            return
+        try:
+            self._queue_monitor_last_warn_monotonic = now
+        except Exception:
+            pass
+
+        try:
+            flush_ms = int(getattr(self._ui_bubble_flush_timer, 'interval', lambda: 0)() or 0) if hasattr(self, '_ui_bubble_flush_timer') else 0
+            self._dev_log(
+                "queue_backpressure",
+                f"ui_bubble_queue={ui_q}/{ui_max} (max_seen={getattr(self, '_queue_monitor_max_ui', 0)}) "
+                f"backend_post_queue={backend_q}/{backend_warn} (max_seen={getattr(self, '_queue_monitor_max_backend', 0)}) "
+                f"ui_flush_ms={flush_ms}",
+            )
         except Exception:
             pass
 
@@ -13940,11 +16319,26 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+        # Start tailing from EOF so we don't re-ingest historical lines.
+        # (History is restored separately via `_restore_local_message_history`.)
+        try:
+            path = Path(SIGNALS_NDJSON_FILE)
+            try:
+                self._ndjson_follow_offset = int(path.stat().st_size) if path.exists() else 0
+            except Exception:
+                self._ndjson_follow_offset = 0
+            try:
+                self._ndjson_follow_partial = ""
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         try:
             t = QtCore.QTimer(self)
             t.setSingleShot(False)
             t.setInterval(450)
-            t.timeout.connect(self._follow_ndjson_tick)
+            t.timeout.connect(_wrap_ui_slot(self, "ndjson_follow_tick", self._follow_ndjson_tick))
             self._ndjson_follow_timer = t
             t.start()
         except Exception:
@@ -14057,7 +16451,16 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 outgoing = False
 
-            self._ingest_message(chat_id, sender, text, timestamp, outgoing, date_key=date_key, save_settings=False)
+            self._ingest_message(
+                chat_id,
+                sender,
+                text,
+                timestamp,
+                outgoing,
+                date_key=date_key,
+                tg_ts=int(tg_ts or 0),
+                save_settings=False,
+            )
 
     def on_icon_ready(self, chat_id: int, icon_path: str) -> None:
         state = self.group_states.get(chat_id)
@@ -14067,7 +16470,109 @@ class MainWindow(QtWidgets.QWidget):
         self._update_group_icon(chat_id, icon_path)
 
     def _refresh_group_list(self, filter_text: str = "") -> None:
-        # Build row widgets once, then filter by hiding items.
+        # Model/View path: filter via proxy (no widgets per row).
+        if bool(getattr(self, "_group_proxy", None)):
+            # IMPORTANT UX:
+            # - Searching must NOT auto-select/open chats.
+            # - Once the user selected a group, that selection must never be
+            #   replaced automatically by filtering.
+            #
+            # Qt can auto-pick the first matching row when a proxy filter
+            # changes (emitting `currentChanged`). We prevent that by blocking
+            # selection signals while applying the filter and then restoring the
+            # previous selection (or clearing it if none).
+            try:
+                selected_gid = int(getattr(self, "current_group_id", 0) or 0)
+            except Exception:
+                selected_gid = 0
+            if selected_gid <= 0:
+                selected_gid = 0
+
+            try:
+                sel = self.list_groups.selectionModel()
+            except Exception:
+                sel = None
+
+            blocker = None
+            if sel is not None:
+                try:
+                    blocker = QtCore.QSignalBlocker(sel)
+                except Exception:
+                    blocker = None
+
+            try:
+                try:
+                    self._suspend_group_current_changed = True
+                except Exception:
+                    pass
+                try:
+                    self._group_proxy.setFilterText(filter_text)
+                except Exception:
+                    pass
+
+                # If the user has not chosen a group yet, keep empty-state and
+                # ensure no current index is set.
+                if not selected_gid:
+                    if sel is not None:
+                        try:
+                            sel.clearSelection()
+                        except Exception:
+                            pass
+                        try:
+                            sel.setCurrentIndex(QtCore.QModelIndex(), QtCore.QItemSelectionModel.Clear)
+                        except Exception:
+                            pass
+                    return
+
+                # User already selected a group: keep it selected if still
+                # visible under the filter; otherwise keep the selection fixed
+                # logically (current_group_id) but clear the view's current index
+                # so Qt doesn't auto-select a different row.
+                try:
+                    row = self._group_model.row_for_gid(int(selected_gid))
+                except Exception:
+                    row = None
+                if row is None:
+                    if sel is not None:
+                        try:
+                            sel.setCurrentIndex(QtCore.QModelIndex(), QtCore.QItemSelectionModel.Clear)
+                        except Exception:
+                            pass
+                    return
+                try:
+                    src_idx = self._group_model.index(int(row), 0)
+                    proxy_idx = self._group_proxy.mapFromSource(src_idx)
+                except Exception:
+                    proxy_idx = QtCore.QModelIndex()
+
+                if proxy_idx is not None and proxy_idx.isValid():
+                    try:
+                        self.list_groups.setCurrentIndex(proxy_idx)
+                    except Exception:
+                        pass
+                else:
+                    if sel is not None:
+                        try:
+                            sel.setCurrentIndex(QtCore.QModelIndex(), QtCore.QItemSelectionModel.Clear)
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    QtCore.QTimer.singleShot(0, lambda: setattr(self, "_suspend_group_current_changed", False))
+                except Exception:
+                    try:
+                        self._suspend_group_current_changed = False
+                    except Exception:
+                        pass
+                try:
+                    if blocker is not None:
+                        del blocker
+                except Exception:
+                    pass
+
+            return
+
+        # Legacy path: Build row widgets once, then filter by hiding items.
         term = _normalize_search_text(filter_text)
         current_id = getattr(self, "current_group_id", None)
 
@@ -14159,13 +16664,6 @@ class MainWindow(QtWidgets.QWidget):
                     cur_item = None
                 if cur_item is not self._group_items[current_id]:
                     self.list_groups.setCurrentItem(self._group_items[current_id])
-            elif first_visible is not None and first_visible in self._group_items:
-                # Only select a default when nothing is selected.
-                try:
-                    if self.list_groups.currentItem() is None:
-                        self.list_groups.setCurrentItem(self._group_items[first_visible])
-                except Exception:
-                    pass
             else:
                 self.list_groups.clearSelection()
         except Exception:
@@ -14173,6 +16671,45 @@ class MainWindow(QtWidgets.QWidget):
 
     def _begin_group_list_build(self, *, filter_text: str = "", target_gid: Optional[int] = None) -> None:
         """Incrementally build group list widgets to avoid UI freezing."""
+        # Model/View path: no widget build needed.
+        if bool(getattr(self, "_group_model", None)):
+            try:
+                self._group_model.set_gids(list(getattr(self, "group_order", []) or []))
+            except Exception:
+                pass
+            try:
+                self._refresh_group_list(filter_text)
+            except Exception:
+                pass
+            try:
+                if target_gid:
+                    self._select_group_by_id(int(target_gid))
+            except Exception:
+                pass
+            try:
+                self._group_build_inflight = False
+            except Exception:
+                pass
+            return
+
+        # Cancel any in-flight icon hydration from a previous build.
+        try:
+            t = getattr(self, "_group_icon_hydrate_timer", None)
+            if t is not None and t.isActive():
+                t.stop()
+        except Exception:
+            pass
+        try:
+            self._group_icon_hydrate_pending_gids = deque()
+        except Exception:
+            pass
+
+        # Fast-mode skips expensive icon decode/paint during the initial build.
+        # Icons are hydrated incrementally after the list is populated.
+        try:
+            self._group_build_fast_mode = True
+        except Exception:
+            pass
         try:
             self.list_groups.setUpdatesEnabled(False)
             self.list_groups.clear()
@@ -14262,7 +16799,12 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 budget_ms = 8
             budget_ms = max(2, min(40, budget_ms))
-            self._add_group_rows_chunk(30, deadline=(time.perf_counter() + (budget_ms / 1000.0)))
+            try:
+                first_chunk = int(os.environ.get("FLAMEBOT_GROUP_BUILD_FIRST_CHUNK", "12"))
+            except Exception:
+                first_chunk = 12
+            first_chunk = max(0, min(40, first_chunk))
+            self._add_group_rows_chunk(first_chunk, deadline=(time.perf_counter() + (budget_ms / 1000.0)))
         except Exception:
             pass
         finally:
@@ -14283,7 +16825,12 @@ class MainWindow(QtWidgets.QWidget):
                 self._group_build_inflight = False
                 self._refresh_group_list(filter_text)
                 return
-            t.start(0)
+            try:
+                interval_ms = int(os.environ.get("FLAMEBOT_GROUP_BUILD_INTERVAL_MS", "5"))
+            except Exception:
+                interval_ms = 5
+            interval_ms = max(0, min(50, interval_ms))
+            t.start(interval_ms)
         except Exception:
             self._group_build_inflight = False
             self._refresh_group_list(filter_text)
@@ -14313,6 +16860,16 @@ class MainWindow(QtWidgets.QWidget):
             state = self.group_states.get(gid)
             if not state:
                 continue
+
+            # If we already exceeded the budget (e.g., previous row took long), yield.
+            if deadline is not None:
+                try:
+                    if time.perf_counter() >= float(deadline):
+                        # Put back and continue next tick.
+                        self._group_build_pending_gids.appendleft(gid)
+                        break
+                except Exception:
+                    pass
             item = QtWidgets.QListWidgetItem()
             widget = self._build_group_row(state)
             item.setSizeHint(widget.sizeHint())
@@ -14345,12 +16902,24 @@ class MainWindow(QtWidgets.QWidget):
             self.group_widgets[state.gid] = widget
             self._group_items[state.gid] = item
 
+            # Budget check after doing the heavy work.
+            if deadline is not None:
+                try:
+                    if time.perf_counter() >= float(deadline):
+                        break
+                except Exception:
+                    pass
+
     def _continue_group_list_build(self) -> None:
         if not bool(getattr(self, "_group_build_inflight", False)):
             return
 
         # Add rows per tick, but time-budget the work to keep UI responsive.
-        chunk_size = 60
+        try:
+            chunk_size = int(os.environ.get("FLAMEBOT_GROUP_BUILD_CHUNK", "25"))
+        except Exception:
+            chunk_size = 25
+        chunk_size = max(5, min(80, chunk_size))
         try:
             budget_ms = int(os.environ.get("FLAMEBOT_GROUP_BUILD_BUDGET_MS", "8"))
         except Exception:
@@ -14359,7 +16928,17 @@ class MainWindow(QtWidgets.QWidget):
         deadline = time.perf_counter() + (budget_ms / 1000.0)
         try:
             self.list_groups.setUpdatesEnabled(False)
-            self._add_group_rows_chunk(chunk_size, deadline=deadline)
+            try:
+                blocker = QtCore.QSignalBlocker(self.list_groups)
+            except Exception:
+                blocker = None
+            try:
+                self._add_group_rows_chunk(chunk_size, deadline=deadline)
+            finally:
+                try:
+                    del blocker
+                except Exception:
+                    pass
         finally:
             try:
                 self.list_groups.setUpdatesEnabled(True)
@@ -14371,13 +16950,22 @@ class MainWindow(QtWidgets.QWidget):
             try:
                 t = getattr(self, "_group_build_timer", None)
                 if t is not None:
-                    t.start(0)
+                    try:
+                        interval_ms = int(os.environ.get("FLAMEBOT_GROUP_BUILD_INTERVAL_MS", "5"))
+                    except Exception:
+                        interval_ms = 5
+                    interval_ms = max(0, min(50, interval_ms))
+                    t.start(interval_ms)
             except Exception:
                 pass
             return
 
         # Finished.
         self._group_build_inflight = False
+        try:
+            self._group_build_fast_mode = False
+        except Exception:
+            pass
         try:
             self._finalize_group_list_build()
         except Exception:
@@ -14406,6 +16994,12 @@ class MainWindow(QtWidgets.QWidget):
                 self._set_group_row_selected(gid)
             except Exception:
                 pass
+
+            # Hydrate icons after the list stabilizes (non-blocking).
+            try:
+                self._begin_group_icon_hydration()
+            except Exception:
+                pass
             return
 
         # No selected group: keep empty-state and no selection.
@@ -14432,6 +17026,12 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+        # Hydrate icons after the list stabilizes (non-blocking).
+        try:
+            self._begin_group_icon_hydration()
+        except Exception:
+            pass
+
     def _build_group_row(self, state: GroupState) -> QtWidgets.QWidget:
         container = QtWidgets.QFrame()
         container.setObjectName("group_row")
@@ -14446,9 +17046,14 @@ class MainWindow(QtWidgets.QWidget):
         layout.setSpacing(8)
         icon_lbl = QtWidgets.QLabel()
         icon_lbl.setFixedSize(34, 34)
-        icon_pix = self._circle_icon(state.icon_path, 34)
-        if icon_pix:
-            icon_lbl.setPixmap(icon_pix)
+        try:
+            fast_mode = bool(getattr(self, "_group_build_fast_mode", False))
+        except Exception:
+            fast_mode = False
+        if not fast_mode:
+            icon_pix = self._circle_icon(state.icon_path, 34)
+            if icon_pix:
+                icon_lbl.setPixmap(icon_pix)
         text_block = QtWidgets.QVBoxLayout()
         text_block.setSpacing(2)
         name_lbl = QtWidgets.QLabel(state.name)
@@ -14511,6 +17116,126 @@ class MainWindow(QtWidgets.QWidget):
         }
         return container
 
+    def _begin_group_icon_hydration(self) -> None:
+        """Schedule incremental icon updates for built group rows."""
+        try:
+            t = getattr(self, "_group_icon_hydrate_timer", None)
+            if t is None:
+                return
+            if t.isActive():
+                return
+        except Exception:
+            return
+
+        # Only hydrate icons for rows that exist in the UI.
+        try:
+            order = list(getattr(self, "group_order", []) or [])
+        except Exception:
+            order = []
+
+        pending: List[int] = []
+        for gid in order:
+            try:
+                w = (getattr(self, "group_widgets", {}) or {}).get(gid)
+                st = (getattr(self, "group_states", {}) or {}).get(gid)
+            except Exception:
+                w = None
+                st = None
+            if w is None or st is None:
+                continue
+            try:
+                if getattr(st, "icon_path", None):
+                    pending.append(int(gid))
+            except Exception:
+                continue
+
+        try:
+            self._group_icon_hydrate_pending_gids = deque(pending)
+        except Exception:
+            self._group_icon_hydrate_pending_gids = deque()
+
+        # Kick off hydration after allowing the UI to breathe.
+        try:
+            interval_ms = int(os.environ.get("FLAMEBOT_GROUP_ICON_HYDRATE_INTERVAL_MS", "12"))
+        except Exception:
+            interval_ms = 12
+        interval_ms = max(0, min(100, interval_ms))
+        try:
+            t.start(interval_ms)
+        except Exception:
+            pass
+
+    def _continue_group_icon_hydration(self) -> None:
+        try:
+            t = getattr(self, "_group_icon_hydrate_timer", None)
+            if t is None:
+                return
+        except Exception:
+            return
+
+        if not (getattr(self, "_group_icon_hydrate_pending_gids", None) or deque()):
+            try:
+                self._group_icon_hydrate_pending_gids = deque()
+            except Exception:
+                pass
+            return
+
+        try:
+            chunk = int(os.environ.get("FLAMEBOT_GROUP_ICON_HYDRATE_CHUNK", "18"))
+        except Exception:
+            chunk = 18
+        chunk = max(5, min(60, chunk))
+
+        try:
+            budget_ms = int(os.environ.get("FLAMEBOT_GROUP_ICON_HYDRATE_BUDGET_MS", "6"))
+        except Exception:
+            budget_ms = 6
+        budget_ms = max(2, min(30, budget_ms))
+        deadline = time.perf_counter() + (budget_ms / 1000.0)
+
+        for _ in range(chunk):
+            try:
+                if time.perf_counter() >= float(deadline):
+                    break
+            except Exception:
+                pass
+
+            try:
+                gid = self._group_icon_hydrate_pending_gids.popleft()
+            except Exception:
+                break
+
+            try:
+                st = (getattr(self, "group_states", {}) or {}).get(gid)
+            except Exception:
+                st = None
+            if st is None:
+                continue
+            try:
+                icon_path = getattr(st, "icon_path", None)
+            except Exception:
+                icon_path = None
+            if not icon_path:
+                continue
+
+            # Best-effort: update only if widget exists.
+            try:
+                self._update_group_icon(int(gid), str(icon_path))
+            except Exception:
+                continue
+
+        # Continue later until done.
+        try:
+            if self._group_icon_hydrate_pending_gids:
+                try:
+                    interval_ms = int(os.environ.get("FLAMEBOT_GROUP_ICON_HYDRATE_INTERVAL_MS", "12"))
+                except Exception:
+                    interval_ms = 12
+                interval_ms = max(0, min(100, interval_ms))
+                t.start(interval_ms)
+        except Exception:
+            pass
+
     def _color_headset_button(self, button: QtWidgets.QToolButton, active: bool) -> None:
         color = "#ff7a2f" if active else "#888888"
         button.setStyleSheet(f"color: {color}; font-size: 20px; background: transparent;")
@@ -14528,6 +17253,12 @@ class MainWindow(QtWidgets.QWidget):
             self.dashboard_splitter.setSizes([max(min_left, total - min_right), min_right])
 
     def _update_group_icon(self, gid: int, icon_path: str) -> None:
+        if bool(getattr(self, "_group_model", None)):
+            try:
+                self._group_model.update_gid(int(gid))
+            except Exception:
+                pass
+            return
         widget = self.group_widgets.get(gid)
         if not widget:
             return
@@ -14540,6 +17271,12 @@ class MainWindow(QtWidgets.QWidget):
                 icon_lbl.update()
 
     def _update_group_widget(self, state: GroupState) -> None:
+        if bool(getattr(self, "_group_model", None)):
+            try:
+                self._group_model.update_gid(int(state.gid))
+            except Exception:
+                pass
+            return
         widget = self.group_widgets.get(state.gid)
         if not widget:
             return
@@ -17093,13 +19830,12 @@ class MainWindow(QtWidgets.QWidget):
         platform = (auth_params.get("platform") or getattr(self, "platform", None) or "mt5").lower()
         user_id = str(auth_params.get("user_id") or getattr(self, "flamebot_id", "") or "").strip()
         acct = (auth_params.get("account_type") or getattr(self, "current_account_type", None) or "prop")
-        try:
-            payload = {"platform": platform, "flamebot_id": user_id}
-            resp = self._post_backend_json("/ea/status/list", payload) or {}
-        except Exception:
-            resp = {}
+        payload = {"platform": platform, "flamebot_id": user_id}
 
-        if isinstance(resp, dict) and resp.get("status") == "OK" and isinstance(resp.get("items"), list):
+        def _on_done(resp: Optional[dict]) -> None:
+            if not (isinstance(resp, dict) and resp.get("status") == "OK" and isinstance(resp.get("items"), list)):
+                return
+
             for it in resp.get("items", []):
                 try:
                     if (it.get("platform") or "").lower() != platform:
@@ -17121,29 +19857,24 @@ class MainWindow(QtWidgets.QWidget):
                 except Exception:
                     continue
 
-            try:
-                if platform == (getattr(self, "platform", None) or "mt5").lower():
+            if platform == (getattr(self, "platform", None) or "mt5").lower():
+                try:
                     self.ea_active = self._get_platform_ea_active(platform)
                     self._ea_active_account = self._get_platform_active_account(platform)
+                except Exception:
+                    pass
+            try:
+                self._update_active_profile_label()
             except Exception:
                 pass
-            return
+            try:
+                self._update_logout_ea_button_state()
+            except Exception:
+                pass
 
-        # Fallback to legacy single-row endpoint if list is unavailable
+        # Non-blocking: always background.
         try:
-            response = self._get_backend_json("ea_status", auth_params)
-        except Exception:
-            response = None
-        if not response:
-            return
-        try:
-            self._apply_platform_ea_state_from_response(auth_params, response)
-        except Exception:
-            pass
-        try:
-            if platform == (getattr(self, "platform", None) or "mt5").lower():
-                self.ea_active = self._get_platform_ea_active(platform)
-                self._ea_active_account = self._get_platform_active_account(platform)
+            self._backend_post_async("/ea/status/list", payload, on_done=_on_done)
         except Exception:
             pass
 
@@ -18806,45 +21537,106 @@ class MainWindow(QtWidgets.QWidget):
                 pass
 
     def _fetch_ea_status(self, auth_params: dict, response: Optional[dict] = None) -> None:
-        # Prefer list endpoint to capture both accounts concurrently
+        # Never block the UI thread from here.
         platform = (auth_params.get("platform") or getattr(self, "platform", None) or "mt5").lower()
         user_id = str(auth_params.get("user_id") or getattr(self, "flamebot_id", "") or "").strip()
-        used_list = False
-        try:
-            payload = {"platform": platform, "flamebot_id": user_id}
-            resp = self._post_backend_json("/ea/status/list", payload) or {}
-            if isinstance(resp, dict) and resp.get("status") == "OK" and isinstance(resp.get("items"), list):
-                used_list = True
-                for it in resp.get("items", []):
-                    try:
-                        if (it.get("platform") or "").lower() != platform:
-                            continue
-                        at = str(it.get("account_type") or "").lower()
-                        if at not in {"prop", "normal"}:
-                            continue
-                        st = self._get_ea_context_state(platform, at)
-                        st["ea_active"] = bool(it.get("online", False))
-                        st["known"] = True
-                    except Exception:
-                        continue
-                if platform == (getattr(self, "platform", None) or "mt5").lower():
-                    self.ea_active = self._get_platform_ea_active(platform)
-                    self._ea_active_account = self._get_platform_active_account(platform)
-        except Exception:
-            used_list = False
 
-        if not used_list:
-            if response is None:
-                response = self._get_backend_json("ea_status", auth_params)
-            if not response:
-                return
+        # Apply already-fetched EA status from poll responses.
+        if isinstance(response, dict):
             try:
                 self._apply_platform_ea_state_from_response(auth_params, response)
             except Exception:
                 pass
 
-        # Refresh label to reflect authoritative EA state
-        self._update_active_profile_label()
+        # Refresh label to reflect best-known EA state now.
+        try:
+            self._update_active_profile_label()
+        except Exception:
+            pass
+
+        # Optionally refresh both accounts via list endpoint, asynchronously and throttled.
+        if platform not in {"mt4", "mt5"}:
+            return
+        if not user_id:
+            return
+
+        try:
+            inflight = getattr(self, "_ea_status_list_inflight_by_platform", None)
+            if not isinstance(inflight, dict):
+                self._ea_status_list_inflight_by_platform = {"mt4": False, "mt5": False}
+                inflight = self._ea_status_list_inflight_by_platform
+        except Exception:
+            inflight = {"mt4": False, "mt5": False}
+
+        try:
+            last_ms = getattr(self, "_ea_status_list_last_ms_by_platform", None)
+            if not isinstance(last_ms, dict):
+                self._ea_status_list_last_ms_by_platform = {"mt4": 0, "mt5": 0}
+                last_ms = self._ea_status_list_last_ms_by_platform
+        except Exception:
+            last_ms = {"mt4": 0, "mt5": 0}
+
+        try:
+            now_ms = int(time.time() * 1000)
+        except Exception:
+            now_ms = 0
+
+        try:
+            if bool(inflight.get(platform)):
+                return
+            prev = int(last_ms.get(platform, 0) or 0)
+            if prev and now_ms and (now_ms - prev) < 1200:
+                return
+            inflight[platform] = True
+            last_ms[platform] = now_ms
+        except Exception:
+            pass
+
+        payload = {"platform": platform, "flamebot_id": user_id}
+
+        def _on_list(resp: Optional[dict]) -> None:
+            try:
+                inflight[platform] = False
+            except Exception:
+                pass
+
+            if not (isinstance(resp, dict) and resp.get("status") == "OK" and isinstance(resp.get("items"), list)):
+                return
+            for it in resp.get("items", []):
+                try:
+                    if (it.get("platform") or "").lower() != platform:
+                        continue
+                    at = str(it.get("account_type") or "").lower()
+                    if at not in {"prop", "normal"}:
+                        continue
+                    st = self._get_ea_context_state(platform, at)
+                    st["ea_active"] = bool(it.get("online", False))
+                    st["known"] = True
+                except Exception:
+                    continue
+
+            if platform == (getattr(self, "platform", None) or "mt5").lower():
+                try:
+                    self.ea_active = self._get_platform_ea_active(platform)
+                    self._ea_active_account = self._get_platform_active_account(platform)
+                except Exception:
+                    pass
+            try:
+                self._update_active_profile_label()
+            except Exception:
+                pass
+            try:
+                self._update_logout_ea_button_state()
+            except Exception:
+                pass
+
+        try:
+            self._backend_post_async("/ea/status/list", payload, on_done=_on_list)
+        except Exception:
+            try:
+                inflight[platform] = False
+            except Exception:
+                pass
 
     def _fetch_lot_settings(self, auth_params: dict, response: Optional[dict] = None) -> None:
         if not self._backend_ui_hydration_allowed():
@@ -20373,6 +23165,7 @@ class MainWindow(QtWidgets.QWidget):
                             str(ts or ""),
                             bool(outgoing),
                             date_key=date_key,
+                            tg_ts=int(epoch or 0),
                             save_settings=False,
                         )
                     except Exception:
@@ -20476,6 +23269,1388 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _show_trade_bunker_wizard(self) -> None:
+        """Open the Trade Bunker wizard (Platform → Account → Dashboard)."""
+        self._toggle_drawer(False)
+        try:
+            self._trade_bunker_stop_refresh()
+        except Exception:
+            pass
+        try:
+            self.tb_selected_platform = None
+            self.tb_selected_account = None
+        except Exception:
+            pass
+        try:
+            self.content_stack.setCurrentWidget(self.trade_bunker_wizard)
+        except Exception:
+            return
+        try:
+            self.trade_bunker_stack.setCurrentIndex(0)
+        except Exception:
+            pass
+        try:
+            self.trade_bunker_table.setRowCount(0)
+        except Exception:
+            pass
+        try:
+            self._tb_selected_pos = None
+        except Exception:
+            pass
+        try:
+            self.tb_selected_ticket_label.setText("No trade selected")
+            self.tb_sl_input.clear()
+            self.tb_tp_input.clear()
+        except Exception:
+            pass
+        try:
+            getattr(self, "_update_trade_bunker_context_indicator", lambda: None)()
+        except Exception:
+            pass
+
+    def _trade_bunker_context_key(self) -> str:
+        platform = (getattr(self, "tb_selected_platform", None) or getattr(self, "platform", None) or "mt5").lower()
+        if platform not in {"mt4", "mt5"}:
+            platform = "mt5"
+        acct = (getattr(self, "tb_selected_account", None) or "prop").lower()
+        if acct not in {"prop", "normal"}:
+            acct = "prop"
+        lic = ""
+        try:
+            lic = str((getattr(self, "licenses", {}) or {}).get(acct, "") or "").strip()
+        except Exception:
+            lic = ""
+        return f"{platform}:{acct}:{lic}" if lic else f"{platform}:{acct}:"
+
+    def _trade_bunker_auth_params(self) -> Optional[dict]:
+        """Build backend auth for Trade Bunker without mutating global account selection."""
+        try:
+            user_id = str(getattr(self, "flamebot_id", "") or "").strip()
+        except Exception:
+            user_id = ""
+        if (not user_id) or user_id == "FB-XXXXXXX":
+            return None
+        platform = (getattr(self, "tb_selected_platform", None) or getattr(self, "platform", None) or "mt5").lower()
+        if platform not in {"mt4", "mt5"}:
+            platform = "mt5"
+        acct = (getattr(self, "tb_selected_account", None) or "prop").lower()
+        if acct not in {"prop", "normal"}:
+            acct = "prop"
+        try:
+            license_key = str((getattr(self, "licenses", {}) or {}).get(acct, "") or "").strip()
+        except Exception:
+            license_key = ""
+        if not license_key:
+            return None
+        params = {
+            "user_id": user_id,
+            "flamebot_id": user_id,
+            "license_key": license_key,
+            "platform": platform,
+            "account_type": acct,
+        }
+        try:
+            tid = (getattr(self, "_terminal_id_by_platform", {}) or {}).get(platform)
+            tid = str(tid or "").strip()
+            if tid:
+                params["terminal_id"] = tid
+        except Exception:
+            pass
+        return params
+
+    def _trade_bunker_start_refresh(self) -> None:
+        """Start periodic refresh for live P/L and trade status."""
+        try:
+            if getattr(self, "trade_bunker_stack", None) is None:
+                return
+            if int(self.trade_bunker_stack.currentIndex()) != 2:
+                return
+        except Exception:
+            return
+        auth = self._trade_bunker_auth_params()
+        if not auth:
+            return
+
+        if getattr(self, "_tb_refresh_timer", None) is None:
+            t = QtCore.QTimer(self)
+            t.setSingleShot(False)
+            t.timeout.connect(self._trade_bunker_refresh_tick)
+            self._tb_refresh_timer = t
+        try:
+            self._tb_refresh_context = self._trade_bunker_context_key()
+        except Exception:
+            self._tb_refresh_context = None
+        try:
+            if not self._tb_refresh_timer.isActive():
+                self._tb_refresh_timer.start(2000)
+        except Exception:
+            pass
+
+    def _trade_bunker_stop_refresh(self) -> None:
+        try:
+            t = getattr(self, "_tb_refresh_timer", None)
+            if t is not None and t.isActive():
+                t.stop()
+        except Exception:
+            pass
+        try:
+            self._tb_refresh_context = None
+        except Exception:
+            pass
+
+    def _trade_bunker_reset_editor_state(self) -> None:
+        """Clear any selected trade + SL/TP draft values.
+
+        This is used when switching contexts (Prop/Normal, MT4/MT5, etc.) to
+        prevent editor/selection state from leaking across accounts.
+        """
+        try:
+            self._tb_selected_pos = None
+        except Exception:
+            pass
+        try:
+            self._trade_bunker_exit_modify_mode()
+        except Exception:
+            pass
+        try:
+            self.tb_selected_ticket_label.setText("No trade selected")
+        except Exception:
+            pass
+        try:
+            self.tb_sl_input.clearFocus()
+            self.tb_tp_input.clearFocus()
+        except Exception:
+            pass
+        try:
+            self.tb_sl_input.clear()
+            self.tb_tp_input.clear()
+        except Exception:
+            pass
+        try:
+            self.trade_bunker_table.clearSelection()
+        except Exception:
+            pass
+        try:
+            self.tb_modify_btn.setEnabled(False)
+        except Exception:
+            pass
+        # When switching contexts, also clear the visible rows immediately
+        # so previous-account trades never remain on screen.
+        try:
+            self.trade_bunker_table.setRowCount(0)
+        except Exception:
+            pass
+
+    def _trade_bunker_refresh_tick(self) -> None:
+        try:
+            if getattr(self, "content_stack", None) is None:
+                return
+            if getattr(self, "trade_bunker_wizard", None) is None:
+                return
+            if self.content_stack.currentWidget() is not self.trade_bunker_wizard:
+                self._trade_bunker_stop_refresh()
+                return
+            if int(getattr(self.trade_bunker_stack, "currentIndex", lambda: 0)()) != 2:
+                self._trade_bunker_stop_refresh()
+                return
+        except Exception:
+            return
+
+        try:
+            ctx = self._trade_bunker_context_key()
+            if getattr(self, "_tb_refresh_context", None) and ctx != getattr(self, "_tb_refresh_context", None):
+                return
+        except Exception:
+            pass
+
+        # Avoid overlapping refresh with action calls (Apply/Close/B.E.), which can
+        # otherwise block the UI thread and make clicks feel unreliable.
+        try:
+            if bool(getattr(self, "_tb_action_inflight", False)):
+                return
+        except Exception:
+            pass
+
+        # Debounce: if something just triggered a load (e.g., action completion),
+        # don't immediately fire another refresh.
+        try:
+            now_ms = int(time.time() * 1000)
+            last_ms = int(getattr(self, "_tb_last_load_ms", 0) or 0)
+            if last_ms and (now_ms - last_ms) < 750:
+                return
+        except Exception:
+            pass
+
+        self._trade_bunker_load_positions(preserve_editor=True)
+
+    def _trade_bunker_post_async(self, path: str, payload: dict, *, on_done) -> bool:
+        """Post to backend without blocking the UI.
+
+        Uses the app's shared backend threadpool. Returns True if scheduled.
+        """
+        try:
+            backend_url = str(getattr(self, "backend_url", "") or "").strip()
+        except Exception:
+            backend_url = ""
+        if not backend_url:
+            return False
+
+        try:
+            pool = getattr(self, "_backend_pool", None) or QtCore.QThreadPool.globalInstance()
+        except Exception:
+            pool = QtCore.QThreadPool.globalInstance()
+
+        try:
+            seq = int(getattr(self, "_tb_action_seq", 0) or 0) + 1
+        except Exception:
+            seq = 1
+        try:
+            self._tb_action_seq = seq
+        except Exception:
+            pass
+
+        clean_path = str(path or "").lstrip("/")
+        task = _BackendMultiPostTask(seq, backend_url, posts=[(clean_path, dict(payload or {}))], timeout=DEFAULT_HTTP_TIMEOUT)
+
+        def _finished(_seq: int, results: dict) -> None:
+            try:
+                resp = results.get(clean_path)
+            except Exception:
+                resp = None
+            try:
+                on_done(resp)
+            except Exception:
+                pass
+
+        def _error(_seq: int, msg: str) -> None:
+            try:
+                on_done({"status": "NET_ERROR", "message": str(msg or "Network error")})
+            except Exception:
+                pass
+
+        try:
+            task.signals.finished.connect(_finished)
+            task.signals.error.connect(_error)
+            pool.start(task)
+            return True
+        except Exception:
+            return False
+
+    def _backend_post_async(self, path: str, payload: dict, *, on_done, timeout: Optional[float] = None) -> bool:
+        """Post to backend without blocking the UI.
+
+        This is the generic version of `_trade_bunker_post_async`.
+        """
+        try:
+            backend_url = str(getattr(self, "backend_url", "") or "").strip()
+        except Exception:
+            backend_url = ""
+        if not backend_url:
+            return False
+
+        try:
+            pool = getattr(self, "_backend_pool", None) or QtCore.QThreadPool.globalInstance()
+        except Exception:
+            pool = QtCore.QThreadPool.globalInstance()
+
+        try:
+            seq = int(getattr(self, "_backend_post_seq", 0) or 0) + 1
+        except Exception:
+            seq = 1
+        try:
+            self._backend_post_seq = seq
+        except Exception:
+            pass
+
+        clean_path = str(path or "").lstrip("/")
+        to = float(timeout) if timeout is not None else DEFAULT_HTTP_TIMEOUT
+        task = _BackendMultiPostTask(seq, backend_url, posts=[(clean_path, dict(payload or {}))], timeout=to)
+
+        def _finished(_seq: int, results: dict) -> None:
+            try:
+                resp = (results or {}).get(clean_path)
+            except Exception:
+                resp = None
+            try:
+                # Ensure callback is delivered on the GUI thread.
+                QtCore.QTimer.singleShot(0, self, lambda r=resp: on_done(r))
+            except Exception:
+                try:
+                    on_done(resp)
+                except Exception:
+                    pass
+
+        def _error(_seq: int, msg: str) -> None:
+            try:
+                err = {"status": "NET_ERROR", "message": str(msg or "Network error")}
+            except Exception:
+                err = {"status": "NET_ERROR", "message": "Network error"}
+            try:
+                QtCore.QTimer.singleShot(0, self, lambda r=err: on_done(r))
+            except Exception:
+                try:
+                    on_done(err)
+                except Exception:
+                    pass
+
+        try:
+            task.signals.finished.connect(_finished)
+            task.signals.error.connect(_error)
+            pool.start(task)
+            return True
+        except Exception:
+            return False
+
+    def _on_trade_bunker_platform_selected(self, platform: str) -> None:
+        """Handle platform selection from Trade Bunker wizard."""
+        self._switch_platform(platform)
+        self.tb_selected_platform = platform
+        # Hard separation: switching platform should never carry draft SL/TP.
+        try:
+            self._trade_bunker_reset_editor_state()
+        except Exception:
+            pass
+        try:
+            platform_key = str(platform or "mt5").lower()
+            account_key = str(getattr(self, "current_account_type", None) or "prop").lower()
+        except Exception:
+            platform_key = str(platform or "mt5").lower()
+            account_key = "prop"
+        try:
+            if hasattr(self, 'telegram_id') and self.telegram_id and (not self._has_backend_identity(platform=platform_key)):
+                self._schedule_backend_register(self.telegram_id, platform=platform_key, account_type=account_key)
+        except Exception:
+            self._dev_log("trade_bunker_platform_switch_register_failed")
+        try:
+            self.trade_bunker_stack.setCurrentIndex(1)
+        except Exception:
+            pass
+        try:
+            getattr(self, "_update_trade_bunker_context_indicator", lambda: None)()
+        except Exception:
+            pass
+
+    def _on_trade_bunker_account_selected(self, acct: str) -> None:
+        """Handle account selection from Trade Bunker wizard and open dashboard."""
+        # Hard separation: always clear selection/editor when switching Prop/Normal.
+        try:
+            self._trade_bunker_reset_editor_state()
+        except Exception:
+            pass
+        try:
+            self.tb_selected_account = acct
+        except Exception:
+            pass
+        try:
+            self.content_stack.setCurrentWidget(self.trade_bunker_wizard)
+            self.trade_bunker_stack.setCurrentIndex(2)
+        except Exception:
+            pass
+        try:
+            getattr(self, "_update_trade_bunker_context_indicator", lambda: None)()
+        except Exception:
+            pass
+
+        self._trade_bunker_load_positions(preserve_editor=False)
+        try:
+            self._trade_bunker_start_refresh()
+        except Exception:
+            pass
+
+    def _trade_bunker_load_positions(
+        self,
+        *,
+        preserve_editor: bool = False,
+        _resp: Optional[dict] = None,
+        _snap: Optional[dict] = None,
+    ) -> None:
+        auth = self._trade_bunker_auth_params()
+        if not auth:
+            return
+
+        # If this is an async response apply, ignore it if the user has switched
+        # Trade Bunker context since the request was made.
+        if _resp is not None and isinstance(_snap, dict) and _snap.get("ctx"):
+            try:
+                if str(_snap.get("ctx") or "") != str(self._trade_bunker_context_key() or ""):
+                    return
+            except Exception:
+                pass
+        payload = {
+            "flamebot_id": auth.get("user_id"),
+            "user_id": auth.get("user_id"),
+            "license_key": auth.get("license_key"),
+            "platform": auth.get("platform"),
+            "account_type": auth.get("account_type"),
+        }
+        if auth.get("terminal_id"):
+            payload["terminal_id"] = auth.get("terminal_id")
+
+        prev_ticket = None
+        prev_sl = None
+        prev_tp = None
+        prev_sl_cursor = None
+        prev_tp_cursor = None
+        prev_sl_sel = None
+        prev_tp_sel = None
+        editing = False
+        if preserve_editor and isinstance(_snap, dict):
+            try:
+                prev_ticket = _snap.get("prev_ticket")
+                prev_sl = _snap.get("prev_sl")
+                prev_tp = _snap.get("prev_tp")
+                prev_sl_cursor = _snap.get("prev_sl_cursor")
+                prev_tp_cursor = _snap.get("prev_tp_cursor")
+                prev_sl_sel = _snap.get("prev_sl_sel")
+                prev_tp_sel = _snap.get("prev_tp_sel")
+                editing = bool(_snap.get("editing", False))
+            except Exception:
+                pass
+        elif preserve_editor:
+            try:
+                psel = getattr(self, "_tb_selected_pos", None)
+                if isinstance(psel, dict):
+                    prev_ticket = psel.get("ticket")
+            except Exception:
+                prev_ticket = None
+            try:
+                prev_sl = self.tb_sl_input.text()
+                prev_tp = self.tb_tp_input.text()
+                editing = bool(self.tb_sl_input.hasFocus() or self.tb_tp_input.hasFocus())
+            except Exception:
+                pass
+            # Preserve cursor/selection so typing inserts at caret even while the
+            # periodic refresh runs (prevents "always append at end").
+            try:
+                if self.tb_sl_input.hasFocus():
+                    prev_sl_cursor = int(self.tb_sl_input.cursorPosition())
+                    s = int(self.tb_sl_input.selectionStart())
+                    if s >= 0:
+                        prev_sl_sel = (s, len(self.tb_sl_input.selectedText() or ""))
+                if self.tb_tp_input.hasFocus():
+                    prev_tp_cursor = int(self.tb_tp_input.cursorPosition())
+                    s = int(self.tb_tp_input.selectionStart())
+                    if s >= 0:
+                        prev_tp_sel = (s, len(self.tb_tp_input.selectedText() or ""))
+            except Exception:
+                pass
+
+        try:
+            self._tb_last_load_ms = int(time.time() * 1000)
+        except Exception:
+            pass
+
+        # Network fetch must not block the GUI thread.
+        if _resp is None:
+            try:
+                req_ctx = str(self._trade_bunker_context_key() or "")
+            except Exception:
+                req_ctx = ""
+
+            # If a poll is already in flight for the SAME context, don't overlap.
+            # If the context has changed, allow a new request (and ignore stale results).
+            try:
+                if bool(getattr(self, "_tb_poll_inflight", False)) and (str(getattr(self, "_tb_poll_inflight_ctx", "") or "") == req_ctx):
+                    return
+            except Exception:
+                pass
+
+            try:
+                seq = int(getattr(self, "_tb_positions_req_seq", 0) or 0) + 1
+            except Exception:
+                seq = 1
+            try:
+                self._tb_positions_req_seq = seq
+                self._tb_positions_expected_seq = seq
+            except Exception:
+                pass
+
+            snap = {
+                "ctx": req_ctx,
+                "seq": seq,
+                "prev_ticket": prev_ticket,
+                "prev_sl": prev_sl,
+                "prev_tp": prev_tp,
+                "prev_sl_cursor": prev_sl_cursor,
+                "prev_tp_cursor": prev_tp_cursor,
+                "prev_sl_sel": prev_sl_sel,
+                "prev_tp_sel": prev_tp_sel,
+                "editing": bool(editing),
+            }
+
+            try:
+                self._tb_poll_inflight = True
+                self._tb_poll_inflight_ctx = req_ctx
+            except Exception:
+                pass
+
+            def _done(r: Optional[dict]) -> None:
+                # Ignore stale responses (older than the latest scheduled request).
+                try:
+                    expected = int(getattr(self, "_tb_positions_expected_seq", 0) or 0)
+                except Exception:
+                    expected = 0
+                try:
+                    got = int((snap or {}).get("seq", 0) or 0)
+                except Exception:
+                    got = 0
+                if expected and got and got != expected:
+                    return
+
+                try:
+                    self._tb_poll_inflight = False
+                except Exception:
+                    pass
+                try:
+                    QtCore.QTimer.singleShot(
+                        0,
+                        lambda rr=r, ss=snap: self._trade_bunker_load_positions(
+                            preserve_editor=preserve_editor,
+                            _resp=rr,
+                            _snap=ss,
+                        ),
+                    )
+                except Exception:
+                    try:
+                        self._trade_bunker_load_positions(preserve_editor=preserve_editor, _resp=r, _snap=snap)
+                    except Exception:
+                        pass
+
+            try:
+                self._backend_post_async("/ea/get_open_positions", payload, on_done=_done)
+            except Exception:
+                try:
+                    self._tb_poll_inflight = False
+                except Exception:
+                    pass
+            return
+
+        resp = _resp or {}
+        # If the backend is temporarily unreachable or returns a non-OK status,
+        # do NOT clear/redraw the table. This prevents visible flicker.
+        try:
+            if not (isinstance(resp, dict) and str(resp.get("status") or "").upper() == "OK"):
+                return
+        except Exception:
+            return
+
+        try:
+            raw_ops = resp.get("open_positions")
+            if not isinstance(raw_ops, list):
+                return
+            ops: list[dict] = [x for x in raw_ops if isinstance(x, dict)]
+        except Exception:
+            return
+
+        # If there are no active trades, force-clear selection/editor state.
+        if not ops:
+            # Strategy-level profit: no open positions => 0.00.
+            try:
+                if hasattr(self, "tb_stat_profit"):
+                    self.tb_stat_profit.setText("0.00")
+            except Exception:
+                pass
+            try:
+                self._trade_bunker_reset_editor_state()
+            except Exception:
+                pass
+            return
+
+        # Update bottom-anchored Total Profit as STRATEGY-level profit.
+        # Do NOT use any account-wide profit fields, which can include other strategies.
+        try:
+            def _fmt_money(v: Any) -> str:
+                try:
+                    fv = float(v)
+                    return f"{fv:,.2f}"
+                except Exception:
+                    return "0.00"
+
+            try:
+                total_profit = 0.0
+                for p in ops:
+                    if not isinstance(p, dict):
+                        continue
+                    try:
+                        total_profit += float(p.get("profit") or 0.0)
+                    except Exception:
+                        continue
+            except Exception:
+                total_profit = 0.0
+
+            if hasattr(self, "tb_stat_profit"):
+                self.tb_stat_profit.setText(_fmt_money(total_profit))
+        except Exception:
+            pass
+
+        def _fmt_num(v: Any) -> str:
+            if v is None:
+                return ""
+            try:
+                if isinstance(v, (int, float)):
+                    return str(v)
+                s = str(v)
+                if s == "null":
+                    return ""
+                return s
+            except Exception:
+                return ""
+
+        def _fmt_pl(v: Any) -> str:
+            if v is None:
+                return ""
+            try:
+                fv = float(v)
+            except Exception:
+                return _fmt_num(v)
+            try:
+                return f"{fv:.2f}"
+            except Exception:
+                return str(fv)
+
+        # Fast-path: if the trade list structure did not change, do not rebuild
+        # the full table. Only update the volatile P/L column in-place.
+        try:
+            ctx = self._trade_bunker_context_key()
+        except Exception:
+            ctx = ""
+
+        def _ensure_dict_attr(name: str) -> dict:
+            try:
+                d = getattr(self, name, None)
+            except Exception:
+                d = None
+            if not isinstance(d, dict):
+                d = {}
+                try:
+                    setattr(self, name, d)
+                except Exception:
+                    pass
+            return d
+
+        layout: list[tuple] = []
+        for p in ops:
+            if not isinstance(p, dict):
+                continue
+            try:
+                t = int(p.get("ticket") or 0)
+            except Exception:
+                t = 0
+            if t <= 0:
+                continue
+            layout.append(
+                (
+                    t,
+                    str(p.get("symbol") or ""),
+                    str(p.get("kind") or ""),
+                    str(p.get("side") or ""),
+                    _fmt_num(p.get("volume")),
+                    _fmt_num(p.get("price_open")),
+                    _fmt_num(p.get("sl")),
+                    _fmt_num(p.get("tp")),
+                )
+            )
+
+        try:
+            layout_sig = hashlib.sha1(repr(layout).encode("utf-8", errors="ignore")).hexdigest()
+        except Exception:
+            layout_sig = repr(layout)
+
+        last_sig_by_ctx = _ensure_dict_attr("_tb_last_layout_sig_by_ctx")
+        last_tickets_by_ctx = _ensure_dict_attr("_tb_last_tickets_by_ctx")
+        tickets = [x[0] for x in layout]
+
+        try:
+            same_layout = (last_sig_by_ctx.get(ctx) == layout_sig) and (last_tickets_by_ctx.get(ctx) == tickets)
+        except Exception:
+            same_layout = False
+
+        if same_layout:
+            try:
+                if int(self.trade_bunker_table.rowCount()) == int(len(ops)):
+                    for r, p in enumerate(ops):
+                        pl = p.get("profit") if isinstance(p, dict) else None
+                        text = _fmt_pl(pl)
+                        pl_item = self.trade_bunker_table.item(r, 8)
+                        if pl_item is None:
+                            pl_item = QtWidgets.QTableWidgetItem(text)
+                            self.trade_bunker_table.setItem(r, 8, pl_item)
+                        else:
+                            if pl_item.text() != text:
+                                pl_item.setText(text)
+                        try:
+                            fv = float(pl) if pl is not None and str(pl).strip() != "" else None
+                        except Exception:
+                            fv = None
+                        if fv is not None:
+                            try:
+                                pl_item.setForeground(QtGui.QBrush(QtGui.QColor("blue" if fv >= 0 else "red")))
+                            except Exception:
+                                pass
+                    # Keep Total Profit in sync even when we only update P/L cells.
+                    try:
+                        if hasattr(self, "tb_stat_profit"):
+                            tot = 0.0
+                            for p2 in ops:
+                                if not isinstance(p2, dict):
+                                    continue
+                                try:
+                                    tot += float(p2.get("profit") or 0.0)
+                                except Exception:
+                                    continue
+                            self.tb_stat_profit.setText(f"{tot:,.2f}")
+                    except Exception:
+                        pass
+                    try:
+                        self._tb_open_positions = ops
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                # Any unexpected table mismatch falls back to full rebuild.
+                pass
+
+        try:
+            self._tb_open_positions = ops
+        except Exception:
+            pass
+
+        try:
+            # Reduce flicker during full rebuild.
+            self.trade_bunker_table.setUpdatesEnabled(False)
+        except Exception:
+            pass
+
+        try:
+            self.trade_bunker_table.setRowCount(len(ops))
+        except Exception:
+            try:
+                self.trade_bunker_table.setUpdatesEnabled(True)
+            except Exception:
+                pass
+            return
+
+        try:
+            self._tb_suppress_selection_changed = True
+        except Exception:
+            pass
+
+        for r, p in enumerate(ops):
+            ticket = p.get("ticket")
+            sym = p.get("symbol")
+            kind = p.get("kind")
+            side = p.get("side")
+            vol = p.get("volume")
+            price = p.get("price_open")
+            sl = p.get("sl")
+            tp = p.get("tp")
+            pl = p.get("profit")
+
+            first = QtWidgets.QTableWidgetItem(str(ticket or ""))
+            first.setData(QtCore.Qt.UserRole, p)
+            self.trade_bunker_table.setItem(r, 0, first)
+            self.trade_bunker_table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(sym or "")))
+            self.trade_bunker_table.setItem(r, 2, QtWidgets.QTableWidgetItem(str(kind or "")))
+            self.trade_bunker_table.setItem(r, 3, QtWidgets.QTableWidgetItem(str(side or "")))
+            self.trade_bunker_table.setItem(r, 4, QtWidgets.QTableWidgetItem(_fmt_num(vol)))
+            self.trade_bunker_table.setItem(r, 5, QtWidgets.QTableWidgetItem(_fmt_num(price)))
+            self.trade_bunker_table.setItem(r, 6, QtWidgets.QTableWidgetItem(_fmt_num(sl)))
+            self.trade_bunker_table.setItem(r, 7, QtWidgets.QTableWidgetItem(_fmt_num(tp)))
+            pl_item = QtWidgets.QTableWidgetItem(_fmt_pl(pl))
+            try:
+                fv = float(pl) if pl is not None and str(pl).strip() != "" else None
+            except Exception:
+                fv = None
+            if fv is not None:
+                try:
+                    # Profit -> blue, Loss -> red
+                    pl_item.setForeground(QtGui.QBrush(QtGui.QColor("blue" if fv >= 0 else "red")))
+                except Exception:
+                    pass
+            self.trade_bunker_table.setItem(r, 8, pl_item)
+
+            close_btn = QtWidgets.QPushButton("Close Trade")
+            close_btn.setCursor(QtCore.Qt.PointingHandCursor)
+            close_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+            try:
+                close_btn.clicked.connect(lambda _checked=False, t=ticket, b=close_btn: self._trade_bunker_close_trade(t, b))
+            except Exception:
+                pass
+            try:
+                self.trade_bunker_table.setCellWidget(r, 9, close_btn)
+            except Exception:
+                pass
+
+            be_btn = QtWidgets.QPushButton("B.E.")
+            be_btn.setCursor(QtCore.Qt.PointingHandCursor)
+            be_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+            try:
+                be_btn.clicked.connect(lambda _checked=False, t=ticket, b=be_btn: self._trade_bunker_set_break_even(t, b))
+            except Exception:
+                pass
+            try:
+                self.trade_bunker_table.setCellWidget(r, 10, be_btn)
+            except Exception:
+                pass
+
+        try:
+            self._tb_suppress_selection_changed = False
+        except Exception:
+            pass
+
+        # Preserve selection & editor text across refresh ticks (don't clobber active edits).
+        if preserve_editor and prev_ticket is not None:
+            try:
+                wanted = int(prev_ticket)
+            except Exception:
+                wanted = None
+            if wanted is not None and wanted > 0:
+                try:
+                    for r in range(self.trade_bunker_table.rowCount()):
+                        it = self.trade_bunker_table.item(r, 0)
+                        if not it:
+                            continue
+                        try:
+                            if int(str(it.text() or "0").strip() or "0") == wanted:
+                                self.trade_bunker_table.setCurrentCell(r, 0)
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            if editing:
+                try:
+                    if prev_sl is not None:
+                        # Only write back if needed; setText can reset cursor.
+                        if self.tb_sl_input.text() != prev_sl:
+                            self.tb_sl_input.setText(prev_sl)
+                    if prev_tp is not None:
+                        if self.tb_tp_input.text() != prev_tp:
+                            self.tb_tp_input.setText(prev_tp)
+
+                    # Restore cursor/selection (after any setText above).
+                    if self.tb_sl_input.hasFocus() and prev_sl_cursor is not None:
+                        try:
+                            sl_len = len(self.tb_sl_input.text() or "")
+                            if prev_sl_sel is not None:
+                                a, b = prev_sl_sel
+                                a = max(0, min(int(a), sl_len))
+                                b = max(0, min(int(b), max(0, sl_len - a)))
+                                self.tb_sl_input.setSelection(a, b)
+                            else:
+                                self.tb_sl_input.setCursorPosition(max(0, min(int(prev_sl_cursor), sl_len)))
+                        except Exception:
+                            pass
+
+                    if self.tb_tp_input.hasFocus() and prev_tp_cursor is not None:
+                        try:
+                            tp_len = len(self.tb_tp_input.text() or "")
+                            if prev_tp_sel is not None:
+                                a, b = prev_tp_sel
+                                a = max(0, min(int(a), tp_len))
+                                b = max(0, min(int(b), max(0, tp_len - a)))
+                                self.tb_tp_input.setSelection(a, b)
+                            else:
+                                self.tb_tp_input.setCursorPosition(max(0, min(int(prev_tp_cursor), tp_len)))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        # Ensure important columns (Ticket + action buttons) fully display.
+        try:
+            self.trade_bunker_table.resizeColumnToContents(0)   # Ticket
+            self.trade_bunker_table.resizeColumnToContents(9)   # Close
+            self.trade_bunker_table.resizeColumnToContents(10)  # B.E.
+        except Exception:
+            pass
+
+        # Record structural signature for this context so future refreshes can
+        # update P/L only without rebuilding the full table.
+        try:
+            last_sig_by_ctx[ctx] = layout_sig
+            last_tickets_by_ctx[ctx] = tickets
+        except Exception:
+            pass
+
+        try:
+            self.trade_bunker_table.setUpdatesEnabled(True)
+        except Exception:
+            pass
+
+    def _trade_bunker_exit_modify_mode(self) -> None:
+        try:
+            self._tb_modify_ticket = None
+        except Exception:
+            pass
+        try:
+            self.tb_sl_input.setEnabled(False)
+            self.tb_tp_input.setEnabled(False)
+            self.tb_apply_btn.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.tb_modify_btn.setText("Modify")
+        except Exception:
+            pass
+
+    def _trade_bunker_modify_or_cancel(self) -> None:
+        """Toggle between Modify and Cancel.
+
+        - When not in modify mode: starts modify for the selected ticket.
+        - When in modify mode: cancels (exits modify mode) WITHOUT clearing inputs.
+        """
+        try:
+            mt = getattr(self, "_tb_modify_ticket", None)
+            if mt is not None and int(mt) > 0:
+                self._trade_bunker_exit_modify_mode()
+                return
+        except Exception:
+            pass
+        self._trade_bunker_begin_modify()
+
+    def _trade_bunker_begin_modify(self) -> None:
+        p = getattr(self, "_tb_selected_pos", None)
+        if not isinstance(p, dict):
+            return
+        try:
+            ticket = int(p.get("ticket") or 0)
+        except Exception:
+            ticket = 0
+        if ticket <= 0:
+            return
+        try:
+            self._tb_modify_ticket = ticket
+        except Exception:
+            pass
+        try:
+            self.tb_sl_input.setEnabled(True)
+            self.tb_tp_input.setEnabled(True)
+            self.tb_apply_btn.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            self.tb_modify_btn.setText("Cancel")
+        except Exception:
+            pass
+        try:
+            self.tb_sl_input.setFocus()
+        except Exception:
+            pass
+
+    def _on_trade_bunker_selection_changed(self) -> None:
+        try:
+            if bool(getattr(self, "_tb_suppress_selection_changed", False)):
+                return
+        except Exception:
+            pass
+        try:
+            row = self.trade_bunker_table.currentRow()
+        except Exception:
+            row = -1
+        if row < 0:
+            try:
+                self._trade_bunker_reset_editor_state()
+            except Exception:
+                pass
+            return
+        item = self.trade_bunker_table.item(row, 0)
+        if not item:
+            # IMPORTANT: When the table is empty, Qt can still report row=0.
+            # Treat this as "no valid selection" and clear stale state.
+            try:
+                self._trade_bunker_reset_editor_state()
+            except Exception:
+                pass
+            return
+        p = item.data(QtCore.Qt.UserRole)
+        if not isinstance(p, dict):
+            try:
+                self._trade_bunker_reset_editor_state()
+            except Exception:
+                pass
+            return
+        self._tb_selected_pos = p
+
+        # Enable Modify only when an actual trade is selected.
+        try:
+            self.tb_modify_btn.setEnabled(True)
+        except Exception:
+            pass
+
+        # Safeguard: if user changes selection, lock editor unless still on the same ticket.
+        try:
+            cur_ticket = int(p.get("ticket") or 0)
+        except Exception:
+            cur_ticket = 0
+        try:
+            mt = getattr(self, "_tb_modify_ticket", None)
+            if mt is not None:
+                try:
+                    mt_int = int(mt)
+                except Exception:
+                    mt_int = 0
+                if mt_int <= 0 or (cur_ticket > 0 and mt_int != cur_ticket):
+                    self._trade_bunker_exit_modify_mode()
+        except Exception:
+            pass
+
+        try:
+            ticket = p.get("ticket")
+            sym = p.get("symbol")
+            kind = p.get("kind")
+            self.tb_selected_ticket_label.setText(f"Selected: {ticket} | {sym} | {kind}")
+        except Exception:
+            pass
+
+        try:
+            sl = p.get("sl")
+            tp = p.get("tp")
+            self.tb_sl_input.setText("" if sl is None else str(sl))
+            self.tb_tp_input.setText("" if tp is None else str(tp))
+        except Exception:
+            pass
+
+    def _trade_bunker_apply_changes(self) -> None:
+        try:
+            if bool(getattr(self, "_tb_action_inflight", False)):
+                return
+        except Exception:
+            pass
+        p = getattr(self, "_tb_selected_pos", None)
+        if not isinstance(p, dict):
+            return
+        try:
+            ticket = int(p.get("ticket") or 0)
+        except Exception:
+            ticket = 0
+        if ticket <= 0:
+            return
+
+        # Safeguard: user must explicitly click Modify for this ticket first.
+        try:
+            mt = getattr(self, "_tb_modify_ticket", None)
+            if mt is None or int(mt) != int(ticket):
+                return
+        except Exception:
+            return
+
+        def _norm(v: Any) -> Optional[float]:
+            if v is None:
+                return None
+            try:
+                fv = float(v)
+                if abs(fv) < 1e-12:
+                    return None
+                return fv
+            except Exception:
+                return None
+
+        orig_sl = _norm(p.get("sl"))
+        orig_tp = _norm(p.get("tp"))
+
+        changes: dict = {}
+
+        def _parse_field(text: str) -> Tuple[bool, Any]:
+            t = str(text or "").strip()
+            if not t:
+                return False, None
+            if t.lower() == "null":
+                return True, None
+            return True, float(t)
+
+        try:
+            has, val = _parse_field(self.tb_sl_input.text())
+            if has:
+                if val is None:
+                    if orig_sl is not None:
+                        changes["sl"] = None
+                else:
+                    if orig_sl is None or abs(float(val) - float(orig_sl)) > 1e-9:
+                        changes["sl"] = float(val)
+        except Exception:
+            pass
+
+        try:
+            has, val = _parse_field(self.tb_tp_input.text())
+            if has:
+                if val is None:
+                    if orig_tp is not None:
+                        changes["tp"] = None
+                else:
+                    if orig_tp is None or abs(float(val) - float(orig_tp)) > 1e-9:
+                        changes["tp"] = float(val)
+        except Exception:
+            pass
+
+        if not changes:
+            return
+
+        auth = self._trade_bunker_auth_params()
+        if not auth:
+            return
+
+        payload = {
+            "flamebot_id": auth.get("user_id"),
+            "user_id": auth.get("user_id"),
+            "license_key": auth.get("license_key"),
+            "platform": auth.get("platform"),
+            "account_type": auth.get("account_type"),
+            "command_uid": uuid.uuid4().hex,
+            "ticket": ticket,
+            "changes": changes,
+        }
+        if auth.get("terminal_id"):
+            payload["terminal_id"] = auth.get("terminal_id")
+
+        # Non-blocking request: disable Apply immediately so first click always "takes".
+        try:
+            self._tb_action_inflight = True
+        except Exception:
+            pass
+        try:
+            self.tb_apply_btn.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.tb_modify_btn.setEnabled(False)
+        except Exception:
+            pass
+
+        def _done(resp: Any) -> None:
+            try:
+                self._tb_action_inflight = False
+            except Exception:
+                pass
+            ok = bool(isinstance(resp, dict) and resp.get("status") == "OK")
+            if ok:
+                try:
+                    self._trade_bunker_exit_modify_mode()
+                except Exception:
+                    pass
+                try:
+                    self._trade_bunker_load_positions(preserve_editor=True)
+                except Exception:
+                    pass
+            else:
+                # Stay in modify mode so user can retry; don't force extra clicks.
+                try:
+                    self.tb_apply_btn.setEnabled(True)
+                except Exception:
+                    pass
+                try:
+                    self.tb_modify_btn.setEnabled(True)
+                except Exception:
+                    pass
+                try:
+                    msg = resp.get("message") if isinstance(resp, dict) else None
+                    if msg:
+                        self._show_toast(str(msg))
+                except Exception:
+                    pass
+            try:
+                # Re-enable Modify button in both success/fail states.
+                self.tb_modify_btn.setEnabled(True)
+            except Exception:
+                pass
+
+        scheduled = False
+        try:
+            scheduled = bool(self._trade_bunker_post_async("trade_bunker/modify_trade", payload, on_done=_done))
+        except Exception:
+            scheduled = False
+        if not scheduled:
+            # Fallback to sync call if threadpool unavailable.
+            resp = self._post_backend_json("/trade_bunker/modify_trade", payload) or {}
+            _done(resp)
+
+    def _trade_bunker_close_trade(self, ticket_raw: Any, btn: Optional[QtWidgets.QPushButton] = None) -> None:
+        try:
+            if bool(getattr(self, "_tb_action_inflight", False)):
+                return
+        except Exception:
+            pass
+        try:
+            self._trade_bunker_exit_modify_mode()
+        except Exception:
+            pass
+        try:
+            ticket = int(ticket_raw or 0)
+        except Exception:
+            ticket = 0
+        if ticket <= 0:
+            return
+
+        auth = self._trade_bunker_auth_params()
+        if not auth:
+            return
+
+        payload = {
+            "flamebot_id": auth.get("user_id"),
+            "user_id": auth.get("user_id"),
+            "license_key": auth.get("license_key"),
+            "platform": auth.get("platform"),
+            "account_type": auth.get("account_type"),
+            "command_uid": uuid.uuid4().hex,
+            "ticket": ticket,
+        }
+        if auth.get("terminal_id"):
+            payload["terminal_id"] = auth.get("terminal_id")
+
+        try:
+            self._tb_action_inflight = True
+        except Exception:
+            pass
+        try:
+            if btn is not None:
+                btn.setEnabled(False)
+        except Exception:
+            pass
+
+        def _done(resp: Any) -> None:
+            try:
+                self._tb_action_inflight = False
+            except Exception:
+                pass
+            ok = bool(isinstance(resp, dict) and resp.get("status") == "OK")
+            if ok:
+                try:
+                    self._trade_bunker_load_positions(preserve_editor=True)
+                except Exception:
+                    pass
+            else:
+                try:
+                    if btn is not None:
+                        btn.setEnabled(True)
+                except Exception:
+                    pass
+                try:
+                    msg = resp.get("message") if isinstance(resp, dict) else None
+                    if msg:
+                        self._show_toast(str(msg))
+                except Exception:
+                    pass
+
+        scheduled = False
+        try:
+            scheduled = bool(self._trade_bunker_post_async("trade_bunker/close_trade", payload, on_done=_done))
+        except Exception:
+            scheduled = False
+        if not scheduled:
+            resp = self._post_backend_json("/trade_bunker/close_trade", payload) or {}
+            _done(resp)
+
+    def _trade_bunker_set_break_even(self, ticket_raw: Any, btn: Optional[QtWidgets.QPushButton] = None) -> None:
+        """Apply break-even by setting SL to the trade's entry price via modify_trade."""
+        try:
+            if bool(getattr(self, "_tb_action_inflight", False)):
+                return
+        except Exception:
+            pass
+        try:
+            self._trade_bunker_exit_modify_mode()
+        except Exception:
+            pass
+        try:
+            ticket = int(ticket_raw or 0)
+        except Exception:
+            ticket = 0
+        if ticket <= 0:
+            return
+
+        # Try to locate cached row payload for this ticket.
+        pos: Optional[dict] = None
+        try:
+            ops = getattr(self, "_tb_open_positions", None)
+            if isinstance(ops, list):
+                for p in ops:
+                    if not isinstance(p, dict):
+                        continue
+                    try:
+                        if int(p.get("ticket") or 0) == ticket:
+                            pos = p
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pos = None
+        if not isinstance(pos, dict):
+            return
+
+        # Only apply BE for active trades (pending orders don't have a meaningful BE SL).
+        try:
+            if str(pos.get("kind") or "").strip().lower() != "active":
+                return
+        except Exception:
+            pass
+
+        try:
+            entry = float(pos.get("price_open"))
+        except Exception:
+            return
+        if abs(float(entry)) < 1e-12:
+            return
+
+        auth = self._trade_bunker_auth_params()
+        if not auth:
+            return
+
+        payload = {
+            "flamebot_id": auth.get("user_id"),
+            "user_id": auth.get("user_id"),
+            "license_key": auth.get("license_key"),
+            "platform": auth.get("platform"),
+            "account_type": auth.get("account_type"),
+            "command_uid": uuid.uuid4().hex,
+            "ticket": ticket,
+            "changes": {"sl": float(entry)},
+        }
+        if auth.get("terminal_id"):
+            payload["terminal_id"] = auth.get("terminal_id")
+
+        try:
+            self._tb_action_inflight = True
+        except Exception:
+            pass
+        try:
+            if btn is not None:
+                btn.setEnabled(False)
+        except Exception:
+            pass
+
+        def _done(resp: Any) -> None:
+            try:
+                self._tb_action_inflight = False
+            except Exception:
+                pass
+            ok = bool(isinstance(resp, dict) and resp.get("status") == "OK")
+            if ok:
+                try:
+                    self._trade_bunker_load_positions(preserve_editor=True)
+                except Exception:
+                    pass
+            else:
+                try:
+                    if btn is not None:
+                        btn.setEnabled(True)
+                except Exception:
+                    pass
+                try:
+                    msg = resp.get("message") if isinstance(resp, dict) else None
+                    if msg:
+                        self._show_toast(str(msg))
+                except Exception:
+                    pass
+
+        scheduled = False
+        try:
+            scheduled = bool(self._trade_bunker_post_async("trade_bunker/modify_trade", payload, on_done=_done))
+        except Exception:
+            scheduled = False
+        if not scheduled:
+            resp = self._post_backend_json("/trade_bunker/modify_trade", payload) or {}
+            _done(resp)
+
     def _show_expert(self) -> None:
         self._toggle_drawer(False)
         self.content_stack.setCurrentWidget(self.expert_page)
@@ -20514,6 +24689,11 @@ class MainWindow(QtWidgets.QWidget):
             
             self.wizard_selected_account = acct
             self.current_account_type = acct
+            # Ensure Trade Bunker editor state can't leak across global account switches.
+            try:
+                self._trade_bunker_reset_editor_state()
+            except Exception:
+                pass
             try:
                 self._reset_settings_state_for_context_switch()
             except Exception:
@@ -20549,6 +24729,11 @@ class MainWindow(QtWidgets.QWidget):
         # Persist the UI-selected account for credential display/copy.
         # EA-active account is shown separately in the EA Status panel.
         self.current_account_type = account_key
+        # Ensure Trade Bunker editor state can't leak across global account switches.
+        try:
+            self._trade_bunker_reset_editor_state()
+        except Exception:
+            pass
         try:
             self._reset_settings_state_for_context_switch()
         except Exception:
@@ -20657,46 +24842,155 @@ class MainWindow(QtWidgets.QWidget):
                 self._show_toast("Missing credentials for selected context")
                 return
 
-            # Backend requires terminal_id for state-changing calls (logout/settings saves).
+            def _set_logout_btn_enabled(enabled: bool) -> None:
+                try:
+                    if hasattr(self, "clear_cached_btn"):
+                        self.clear_cached_btn.setEnabled(bool(enabled))
+                except Exception:
+                    pass
+
+            def _do_logout(tid: str) -> None:
+                payload = {
+                    "action": "logout_ea",
+                    "flamebot_id": flamebot_id,
+                    "license_key": license_key,
+                    "platform": platform,
+                    "account_type": account_type,
+                    "terminal_id": tid,
+                }
+
+                def _on_done(response: Optional[dict]) -> None:
+                    try:
+                        if not (isinstance(response, dict) and response.get("status") == "OK"):
+                            msg = "Logout failed"
+                            try:
+                                if isinstance(response, dict) and response.get("message"):
+                                    msg = str(response.get("message") or msg)
+                            except Exception:
+                                pass
+                            self._show_toast(msg)
+                            _set_logout_btn_enabled(True)
+                            try:
+                                self._update_logout_ea_button_state()
+                            except Exception:
+                                pass
+                            return
+
+                        # Mark EA as disconnected for this platform
+                        try:
+                            ctx_state = self._get_ea_context_state(platform, account_type)
+                            ctx_state["ea_active"] = False
+                            ctx_state["known"] = True
+                            if platform == (getattr(self, "platform", None) or "mt5").lower():
+                                self.ea_active = self._get_platform_ea_active(platform)
+                                self._ea_active_account = self._get_platform_active_account(platform)
+                        except Exception:
+                            pass
+
+                        # Mark hydration pending for this specific context (display-only)
+                        try:
+                            ctx = self._context_key(platform=platform, account_type=account_type)
+                            if ctx:
+                                self._settings_hydration_pending[ctx] = True
+                                try:
+                                    self._settings_hydration_started_at[ctx] = float(time.time())
+                                except Exception:
+                                    pass
+                                try:
+                                    self._context_hydrated_at.pop(ctx, None)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # If current UI matches, refresh status and lock state
+                        if platform == (getattr(self, "platform", None) or "mt5").lower():
+                            try:
+                                self.ea_active = self._get_platform_ea_active(platform)
+                                self._ea_active_account = self._get_platform_active_account(platform)
+                                self._update_ea_status_panel()
+                                self._update_settings_lock_state()
+                                self._update_edit_button_state()
+                                self._render_config_status_labels()
+                            except Exception:
+                                pass
+
+                        try:
+                            self._save_settings()
+                        except Exception:
+                            pass
+                        self._show_toast("EA logged out")
+                        try:
+                            self._update_logout_ea_button_state()
+                        except Exception:
+                            pass
+                    except Exception:
+                        self._show_toast("EA logout failed")
+                        _set_logout_btn_enabled(True)
+
+                try:
+                    self._backend_post_async("app/logout_ea", payload, on_done=_on_done)
+                except Exception:
+                    self._show_toast("EA logout failed")
+                    _set_logout_btn_enabled(True)
+
+            # Backend requires terminal_id for state-changing calls.
             terminal_id = None
             try:
                 terminal_id = (getattr(self, "_terminal_id_by_platform", {}) or {}).get(platform)
                 terminal_id = str(terminal_id or "").strip() or None
             except Exception:
                 terminal_id = None
-            if not terminal_id:
-                # Best-effort refresh to capture terminal_id from ea_status.
-                try:
-                    auth = {
-                        "user_id": flamebot_id,
-                        "license_key": license_key,
-                        "platform": platform,
-                        "account_type": account_type,
-                    }
-                    self._refresh_ea_status_for_context(auth)
-                except Exception:
-                    pass
-                try:
-                    terminal_id = (getattr(self, "_terminal_id_by_platform", {}) or {}).get(platform)
-                    terminal_id = str(terminal_id or "").strip() or None
-                except Exception:
-                    terminal_id = None
-            if not terminal_id:
-                self._show_toast("Terminal not bound yet — please wait for EA status to update")
+
+            if terminal_id:
+                _do_logout(terminal_id)
                 return
 
-            payload = {
-                "action": "logout_ea",
-                "flamebot_id": flamebot_id,
-                "license_key": license_key,
-                "platform": platform,
-                "account_type": account_type,
-                "terminal_id": terminal_id,
-            }
-            response = self._post_backend_json("app/logout_ea", payload) or {}
-            if response.get("status") != "OK":
-                self._show_toast(response.get("message", "Logout failed"))
-                return
+            # No terminal id yet: refresh asynchronously then retry.
+            def _after_status(resp: Optional[dict]) -> None:
+                tid = None
+                try:
+                    if isinstance(resp, dict) and resp.get("status") == "OK" and isinstance(resp.get("items"), list):
+                        for it in resp.get("items", []):
+                            try:
+                                if (it.get("platform") or "").lower() != platform:
+                                    continue
+                                at = str(it.get("account_type") or "").lower()
+                                if at != str(account_type or "").lower():
+                                    continue
+                                tid = str(it.get("terminal_id") or "").strip() or None
+                                if tid:
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    tid = None
+
+                if tid:
+                    try:
+                        store = getattr(self, "_terminal_id_by_platform", None)
+                        if not isinstance(store, dict):
+                            self._terminal_id_by_platform = {"mt4": None, "mt5": None}
+                            store = self._terminal_id_by_platform
+                        store[platform] = tid
+                    except Exception:
+                        pass
+                    _do_logout(tid)
+                    return
+
+                self._show_toast("Terminal not bound yet — please wait for EA status to update")
+                _set_logout_btn_enabled(True)
+                try:
+                    self._update_logout_ea_button_state()
+                except Exception:
+                    pass
+
+            try:
+                self._backend_post_async("/ea/status/list", {"platform": platform, "flamebot_id": flamebot_id}, on_done=_after_status)
+            except Exception:
+                self._show_toast("Terminal not bound yet — please wait for EA status to update")
+                _set_logout_btn_enabled(True)
+            return
 
             # Mark EA as disconnected for this platform
             try:
@@ -21100,14 +25394,25 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+        try:
+            wd = getattr(self, "_ui_freeze_watchdog", None)
+            if wd is not None:
+                wd.stop()
+        except Exception:
+            pass
+
         # Stop any timers that might rebuild UI or make network calls.
         for timer_name in (
             "backend_timer",
+            "_tg_worker_restart_timer",
             "_symbol_resize_timer",
             "_symbol_filter_timer",
             "_groups_retry_timer",
             "_startup_deferred_auth_timeout_timer",
             "_group_build_timer",
+            "_ui_bubble_flush_timer",
+            "_ui_group_row_flush_timer",
+            "_ndjson_follow_timer",
             "_boot_timeout_timer",
             "_settings_save_timer",
             "_group_filter_timer",
@@ -21179,11 +25484,24 @@ class FlameApp(QtWidgets.QApplication):
             # splash before boot finishes, keep the main window maximized).
             want_maximized = False
             try:
-                want_maximized = bool(splash.isMaximized())
+                want_maximized = bool(splash.isMaximized()) or bool(getattr(splash, "_pseudo_maximized", False))
             except Exception:
                 want_maximized = False
             try:
                 splash.close()
+            except Exception:
+                pass
+            # Extra safety: ensure splash cannot remain on top and steal clicks.
+            try:
+                splash.hide()
+            except Exception:
+                pass
+            try:
+                splash.setWindowFlags(QtCore.Qt.FramelessWindowHint)
+            except Exception:
+                pass
+            try:
+                splash.deleteLater()
             except Exception:
                 pass
             try:
@@ -21349,5 +25667,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main() 
-     
+    main()

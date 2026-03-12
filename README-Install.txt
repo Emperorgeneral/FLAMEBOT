@@ -25,8 +25,8 @@ FlameBot Desktop + MT4/MT5 EA Bundle (Windows)
       - Click "Install MT4/MT5 EA" and follow the prompts
 
    C) Manual:
-      - Copy eas\mt4\FLAMEBOTMT4 EA.ex4 -> your MT4 Data Folder\MQL4\Experts\Advisors\
-      - Copy eas\mt5\FLAMEBOT MT5 EA.ex5 -> your MT5 Data Folder\MQL5\Experts\Advisors\
+      - Copy eas\FLAMEBOT MT4 EA.ex4 -> your MT4 Data Folder\MQL4\Experts\Advisors\
+      - Copy eas\FLAMEBOT MT5 EA.ex5 -> your MT5 Data Folder\MQL5\Experts\Advisors\
 
 MetaTrader Data Folder:
 - In MT4/MT5: File -> Open Data Folder

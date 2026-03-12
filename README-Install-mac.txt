@@ -27,8 +27,8 @@ FlameBot Desktop + MT4/MT5 EA Bundle (macOS)
    B) Manual:
       - In MetaTrader: File -> Open Data Folder
       - Copy:
-        eas/mt4/FLAMEBOTMT4 EA.ex4 -> MQL4/Experts/(Advisors)
-        eas/mt5/FLAMEBOT MT5 EA.ex5 -> MQL5/Experts/(Advisors)
+            eas/FLAMEBOT MT4 EA.ex4 -> MQL4/Experts/(Advisors)
+            eas/FLAMEBOT MT5 EA.ex5 -> MQL5/Experts/(Advisors)
 
 After copying:
 - Restart MetaTrader, then attach the EA to a chart.

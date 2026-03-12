@@ -54,9 +54,7 @@ New-Item -ItemType Directory -Force -Path .\dist\FlameBot\eas | Out-Null
 # Copy top-level EAs
 Copy-Item -Force (Join-Path $root 'eas\*.ex4') .\dist\FlameBot\eas -ErrorAction SilentlyContinue
 Copy-Item -Force (Join-Path $root 'eas\*.ex5') .\dist\FlameBot\eas -ErrorAction SilentlyContinue
-# Also copy from mt4/mt5 subfolders if present, but flatten them
-Copy-Item -Force (Join-Path $root 'eas\mt4\*.ex4') .\dist\FlameBot\eas -ErrorAction SilentlyContinue
-Copy-Item -Force (Join-Path $root 'eas\mt5\*.ex5') .\dist\FlameBot\eas -ErrorAction SilentlyContinue
+
 
 Write-Host "[4/4] Building Inno Setup installer" -ForegroundColor Cyan
 try {
@@ -112,8 +110,6 @@ $stageEas = Join-Path $stageDir 'eas'
 New-Item -ItemType Directory -Force -Path $stageEas | Out-Null
 Copy-Item -Force (Join-Path $root 'eas\*.ex4') $stageEas -ErrorAction SilentlyContinue
 Copy-Item -Force (Join-Path $root 'eas\*.ex5') $stageEas -ErrorAction SilentlyContinue
-Copy-Item -Force (Join-Path $root 'eas\mt4\*.ex4') $stageEas -ErrorAction SilentlyContinue
-Copy-Item -Force (Join-Path $root 'eas\mt5\*.ex5') $stageEas -ErrorAction SilentlyContinue
 Copy-Item -Force .\Install_EAs.ps1 $stageDir
 Copy-Item -Force .\README-Install.txt $stageDir
 

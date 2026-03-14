@@ -128,9 +128,9 @@
 
     .heroGrid {
       display: grid;
-      grid-template-columns: 1.15fr 0.85fr;
-      gap: 18px;
-      align-items: center;
+      grid-template-columns: 1fr;
+      gap: 22px;
+      align-items: start;
     }
 
     .kicker {
@@ -247,8 +247,9 @@
 
     .hero .storySlider {
       margin-top: 0;
-      min-height: 280px;
-      height: 280px;
+      min-height: 360px;
+      height: 360px;
+      width: 100%;
     }
 
     .storyTrack {
@@ -257,8 +258,8 @@
     }
 
     .hero .storyTrack {
-      min-height: 280px;
-      height: 280px;
+      min-height: 360px;
+      height: 360px;
     }
 
     .storySlide {
@@ -444,7 +445,6 @@
     }
 
     @media (max-width: 980px) {
-      .heroGrid { grid-template-columns: 1fr; }
       .cards { grid-template-columns: 1fr; }
       .downloadGrid { grid-template-columns: 1fr; }
       .graphic { height: 240px; }
@@ -456,6 +456,8 @@
         bottom: 20px;
       }
       .storyDots { left: 18px; }
+      .hero .storySlider,
+      .hero .storyTrack { min-height: 320px; height: 320px; }
     }
 
     @media (max-width: 520px) {
@@ -468,6 +470,8 @@
         font-size: clamp(19px, 6vw, 28px);
         line-height: 1.26;
       }
+      .hero .storySlider,
+      .hero .storyTrack { min-height: 280px; height: 280px; }
     }
   </style>
 </head>

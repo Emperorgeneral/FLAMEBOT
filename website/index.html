@@ -220,16 +220,117 @@
       pointer-events: none;
     }
 
-    .graphic svg {
+    .graphic img {
       position: absolute;
       inset: 0;
       width: 100%;
       height: 100%;
-      opacity: 0.95;
+      object-fit: cover;
+      padding: 0;
+      opacity: 0.98;
     }
 
     .section {
       margin-top: 18px;
+    }
+
+    .storySlider {
+      margin-top: 18px;
+      position: relative;
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 8px);
+      overflow: hidden;
+      background: rgba(255, 255, 255, 0.03);
+      box-shadow: var(--shadow-soft);
+      min-height: 360px;
+    }
+
+    .hero .storySlider {
+      margin-top: 0;
+      min-height: 280px;
+      height: 280px;
+    }
+
+    .storyTrack {
+      position: relative;
+      min-height: 360px;
+    }
+
+    .hero .storyTrack {
+      min-height: 280px;
+      height: 280px;
+    }
+
+    .storySlide {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      transform: scale(1.02);
+      transition: opacity 900ms ease, transform 900ms ease;
+      pointer-events: none;
+    }
+
+    .storySlide.is-active {
+      opacity: 1;
+      transform: scale(1);
+      pointer-events: auto;
+      z-index: 1;
+    }
+
+    .storySlide::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(106deg, rgba(4, 8, 22, 0.78) 0%, rgba(4, 8, 22, 0.52) 44%, rgba(4, 8, 22, 0.20) 100%),
+        linear-gradient(180deg, rgba(0, 0, 0, 0.08) 0%, rgba(0, 0, 0, 0.46) 100%);
+      z-index: 1;
+    }
+
+    .storySlide img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .storyCaption {
+      position: absolute;
+      z-index: 2;
+      left: 26px;
+      right: 26px;
+      bottom: 24px;
+      max-width: 760px;
+      font-size: clamp(22px, 3.2vw, 38px);
+      line-height: 1.2;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      text-shadow: 0 6px 28px rgba(0, 0, 0, 0.6);
+      margin: 0;
+    }
+
+    .storyDots {
+      position: absolute;
+      z-index: 3;
+      left: 26px;
+      bottom: 16px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .storyDot {
+      width: 30px;
+      height: 4px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.30);
+      transition: background 260ms ease, transform 260ms ease;
+    }
+
+    .storyDot.is-active {
+      background: rgba(255, 255, 255, 0.95);
+      transform: scaleX(1.08);
     }
 
     .sectionHead {
@@ -347,12 +448,26 @@
       .cards { grid-template-columns: 1fr; }
       .downloadGrid { grid-template-columns: 1fr; }
       .graphic { height: 240px; }
+      .storySlider,
+      .storyTrack { min-height: 320px; }
+      .storyCaption {
+        left: 18px;
+        right: 18px;
+        bottom: 20px;
+      }
+      .storyDots { left: 18px; }
     }
 
     @media (max-width: 520px) {
       .wrap { padding: 38px 14px 30px; }
       .hero { padding: 18px 14px; }
       h1 { font-size: 36px; }
+      .storySlider,
+      .storyTrack { min-height: 280px; }
+      .storyCaption {
+        font-size: clamp(19px, 6vw, 28px);
+        line-height: 1.26;
+      }
     }
   </style>
 </head>
@@ -382,51 +497,27 @@
           <div class="scrollHint">Scroll down for the download button or <a href="#download">jump to download</a>.</div>
         </div>
 
-        <div class="graphic" aria-hidden="true">
-          <svg viewBox="0 0 760 420" preserveAspectRatio="none">
-            <defs>
-              <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0%" stop-color="rgba(124,58,237,0.60)" />
-                <stop offset="45%" stop-color="rgba(34,211,238,0.40)" />
-                <stop offset="100%" stop-color="rgba(255,122,24,0.25)" />
-              </linearGradient>
-              <radialGradient id="g2" cx="50%" cy="38%" r="60%">
-                <stop offset="0%" stop-color="rgba(255,255,255,0.18)" />
-                <stop offset="55%" stop-color="rgba(255,255,255,0.06)" />
-                <stop offset="100%" stop-color="rgba(255,255,255,0.00)" />
-              </radialGradient>
-            </defs>
-            <rect x="0" y="0" width="760" height="420" fill="rgba(255,255,255,0.02)" />
-            <circle cx="420" cy="210" r="148" fill="url(#g2)" />
-            <circle cx="420" cy="210" r="170" fill="none" stroke="url(#g1)" stroke-width="2" opacity="0.75" />
-            <circle cx="420" cy="210" r="220" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="1" opacity="0.6" />
-            <path d="M110 285 C 190 170, 260 165, 345 220 C 430 275, 510 285, 650 170" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="2" />
-            <path d="M110 285 C 190 170, 260 165, 345 220 C 430 275, 510 285, 650 170" fill="none" stroke="rgba(255,122,24,0.20)" stroke-width="6" opacity="0.35" />
-            <circle cx="110" cy="285" r="6" fill="rgba(255,122,24,0.65)" />
-            <circle cx="345" cy="220" r="6" fill="rgba(34,211,238,0.60)" />
-            <circle cx="650" cy="170" r="6" fill="rgba(124,58,237,0.65)" />
-          </svg>
-        </div>
-      </div>
-    </div>
-
-    <div class="section" aria-label="What FlameBot does">
-      <div class="sectionHead">
-        <h2>What FlameBot Does</h2>
-      </div>
-      <div class="cards">
-        <div class="card">
-          <h3>Ingest signals</h3>
-          <p class="muted">Connect Telegram and select the groups/channels you want to follow. FlameBot reads new messages and prepares them for automation.</p>
-        </div>
-        <div class="card">
-          <h3>Normalize to trade intent</h3>
-          <p class="muted">Messages are parsed into structured trade intent (symbol, direction, entry, SL, TP targets) so the automation layer can behave consistently.</p>
-        </div>
-        <div class="card">
-          <h3>Execute with rules</h3>
-          <p class="muted">The included MT4/MT5 EAs execute trades and apply your configured risk, symbol filters, and trade controls (close / breakeven / secure-half).</p>
-        </div>
+        <section class="storySlider" id="ai-slider" aria-label="FlameBot AI highlights">
+          <div class="storyTrack">
+            <article class="storySlide is-active" aria-hidden="false">
+              <img src="/assets/screenshots/slide-analysis.png" alt="Robot analyzing market charts and signals" loading="lazy" />
+              <h2 class="storyCaption">Stay Calm, Stay in Control&mdash;While AI Handles the Trades, You Relax and Watch Your Future Grow.</h2>
+            </article>
+            <article class="storySlide" aria-hidden="true">
+              <img src="/assets/screenshots/slide-copied-trades.png" alt="AI mirrored trading signals on desktop monitors" loading="lazy" />
+              <h2 class="storyCaption">Access Elite Trade Signals&mdash;Each Winning Move Instantly Copied, So You Stay Ahead of the Market.</h2>
+            </article>
+            <article class="storySlide" aria-hidden="true">
+              <img src="/assets/screenshots/slide-relax.png" alt="User relaxed while AI trading assistant works in the background" loading="lazy" />
+              <h2 class="storyCaption">Stop Wasting Time&mdash;Let AI Unleash Your Full Trading Potential, Analyzing Every Move So You Don&rsquo;t Have To.</h2>
+            </article>
+          </div>
+          <div class="storyDots" aria-hidden="true">
+            <span class="storyDot is-active"></span>
+            <span class="storyDot"></span>
+            <span class="storyDot"></span>
+          </div>
+        </section>
       </div>
     </div>
 
@@ -441,7 +532,7 @@
         </div>
         <div class="card">
           <h3>Automation pipeline</h3>
-          <p class="muted">Telegram message → desktop ingestion → backend queue/state → MetaTrader EA poll → order placement + trade-state reporting.</p>
+          <p class="muted">Telegram message → desktop ingestion → server queue/state → MetaTrader EA poll → order placement + trade-state reporting.</p>
         </div>
         <div class="card">
           <h3>Failure behavior</h3>
@@ -499,6 +590,70 @@
     (function () {
       const el = document.getElementById('year');
       if (el) el.textContent = String(new Date().getFullYear());
+
+      const slider = document.getElementById('ai-slider');
+      if (!slider) return;
+
+      const slides = Array.from(slider.querySelectorAll('.storySlide'));
+      const dots = Array.from(slider.querySelectorAll('.storyDot'));
+      if (slides.length < 2) return;
+
+      const intervalMs = 5000;
+      let activeIndex = 0;
+      let timerId = null;
+
+      const showSlide = function (index) {
+        slides.forEach(function (slide, i) {
+          const isActive = i === index;
+          slide.classList.toggle('is-active', isActive);
+          slide.setAttribute('aria-hidden', isActive ? 'false' : 'true');
+          if (dots[i]) dots[i].classList.toggle('is-active', isActive);
+        });
+      };
+
+      const advance = function () {
+        activeIndex = (activeIndex + 1) % slides.length;
+        showSlide(activeIndex);
+      };
+
+      const stopAutoplay = function () {
+        if (timerId) {
+          window.clearInterval(timerId);
+          timerId = null;
+        }
+      };
+
+      const startAutoplay = function () {
+        if (timerId) return;
+        timerId = window.setInterval(advance, intervalMs);
+      };
+
+      showSlide(activeIndex);
+
+      if ('IntersectionObserver' in window) {
+        const observer = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (entry.target !== slider) return;
+            if (entry.isIntersecting) {
+              startAutoplay();
+            } else {
+              stopAutoplay();
+            }
+          });
+        }, { threshold: [0, 0.01, 1] });
+
+        observer.observe(slider);
+      } else {
+        startAutoplay();
+      }
+
+      document.addEventListener('visibilitychange', function () {
+        if (document.hidden) {
+          stopAutoplay();
+        } else if (slider.getBoundingClientRect().top < window.innerHeight && slider.getBoundingClientRect().bottom > 0) {
+          startAutoplay();
+        }
+      });
     })();
   </script>
 </body>

@@ -10,6 +10,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
+const zlib = require('zlib');
 
 const ROOT = __dirname;
 const PORT = Number(process.env.PORT || 3000);
@@ -18,6 +19,14 @@ const WEBSITE_ANALYTICS_SECRET = String(process.env.FLAMEBOT_WEBSITE_ANALYTICS_S
 const COOKIE_PREFERENCES_NAME = 'flamebot_cookie_preferences';
 
 const CANONICAL_HOST = 'www.flamebotapp.com';
+
+const COMPRESSIBLE_CONTENT_TYPES = [
+  'text/',
+  'application/javascript',
+  'application/json',
+  'application/xml',
+  'image/svg+xml',
+];
 
 const CSP = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self' mailto:; upgrade-insecure-requests";
 
@@ -239,6 +248,49 @@ function contentTypeFor(filePath) {
   }
 }
 
+function isCompressibleContentType(contentType) {
+  const normalized = String(contentType || '').toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return COMPRESSIBLE_CONTENT_TYPES.some((prefix) => normalized.startsWith(prefix));
+}
+
+function negotiateCompression(req, contentType, fileSize) {
+  const method = String(req.method || '').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') {
+    return null;
+  }
+  if (Number(fileSize || 0) < 1024) {
+    return null;
+  }
+  if (!isCompressibleContentType(contentType)) {
+    return null;
+  }
+  if (req.headers.range) {
+    return null;
+  }
+
+  const acceptEncoding = String(req.headers['accept-encoding'] || '').toLowerCase();
+  if (acceptEncoding.includes('br')) {
+    return {
+      encoding: 'br',
+      stream: zlib.createBrotliCompress({
+        params: {
+          [zlib.constants.BROTLI_PARAM_QUALITY]: 5,
+        },
+      }),
+    };
+  }
+  if (acceptEncoding.includes('gzip')) {
+    return {
+      encoding: 'gzip',
+      stream: zlib.createGzip({ level: 6 }),
+    };
+  }
+  return null;
+}
+
 function serveFile(req, res, filePath, requestPath = '') {
   fs.stat(filePath, (err, stat) => {
     if (err || !stat.isFile()) {
@@ -250,6 +302,17 @@ function serveFile(req, res, filePath, requestPath = '') {
 
     res.statusCode = 200;
     res.setHeader('Content-Type', contentTypeFor(filePath));
+    res.setHeader('Last-Modified', stat.mtime.toUTCString());
+
+    const ifModifiedSinceRaw = String(req.headers['if-modified-since'] || '').trim();
+    if (ifModifiedSinceRaw) {
+      const ifModifiedSince = Date.parse(ifModifiedSinceRaw);
+      if (Number.isFinite(ifModifiedSince) && stat.mtimeMs <= ifModifiedSince) {
+        res.statusCode = 304;
+        res.end();
+        return;
+      }
+    }
 
     // Cache static assets lightly; keep HTML uncached to allow fast updates.
     if (filePath.includes(`${path.sep}admin${path.sep}`)) {
@@ -257,8 +320,21 @@ function serveFile(req, res, filePath, requestPath = '') {
     } else if (filePath.endsWith('.html')) {
       res.setHeader('Cache-Control', 'no-cache');
       emitWebsiteAnalytics(req, requestPath || '/');
+    } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+      res.setHeader('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
     } else {
-      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=3600');
+    }
+
+    if (String(req.method || '').toUpperCase() === 'HEAD') {
+      res.end();
+      return;
+    }
+
+    const compression = negotiateCompression(req, res.getHeader('Content-Type'), stat.size);
+    if (compression) {
+      res.setHeader('Content-Encoding', compression.encoding);
+      res.setHeader('Vary', 'Accept-Encoding');
     }
 
     const stream = fs.createReadStream(filePath);
@@ -267,6 +343,10 @@ function serveFile(req, res, filePath, requestPath = '') {
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.end('Server error');
     });
+    if (compression) {
+      stream.pipe(compression.stream).pipe(res);
+      return;
+    }
     stream.pipe(res);
   });
 }

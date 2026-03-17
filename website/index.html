@@ -14,6 +14,7 @@
   <meta property="og:url" content="https://www.flamebotapp.com/" />
   <meta property="og:image" content="/assets/logo.png" />
   <meta name="twitter:card" content="summary_large_image" />
+  <link rel="preload" as="image" href="/assets/screenshots/slide-analysis.png" fetchpriority="high" />
   <link rel="icon" href="/assets/icon.ico" sizes="any" />
   <link rel="icon" type="image/png" href="/assets/icon.png" />
   <link rel="apple-touch-icon" href="/assets/icon.png" />
@@ -689,15 +690,15 @@
         <section class="storySlider" id="ai-slider" aria-label="FlameBot AI highlights">
           <div class="storyTrack">
             <article class="storySlide is-active" aria-hidden="false">
-              <img src="/assets/screenshots/slide-analysis.png" alt="Robot analyzing market charts and signals" loading="lazy" />
+              <img src="/assets/screenshots/slide-analysis.png" alt="Robot analyzing market charts and signals" loading="eager" fetchpriority="high" decoding="async" width="1600" height="900" />
               <h2 class="storyCaption">Stay Calm, Stay in Control&mdash;While AI Handles the Trades, You Relax and Watch Your Future Grow.</h2>
             </article>
             <article class="storySlide" aria-hidden="true">
-              <img src="/assets/screenshots/slide-copied-trades.png" alt="AI mirrored trading signals on desktop monitors" loading="lazy" />
+              <img src="/assets/screenshots/slide-copied-trades.png" alt="AI mirrored trading signals on desktop monitors" loading="lazy" fetchpriority="low" decoding="async" width="1600" height="900" />
               <h2 class="storyCaption">Access Elite Trade Signals&mdash;Each Winning Move Instantly Copied, So You Stay Ahead of the Market.</h2>
             </article>
             <article class="storySlide" aria-hidden="true">
-              <img src="/assets/screenshots/slide-relax.png" alt="User relaxed while AI trading assistant works in the background" loading="lazy" />
+              <img src="/assets/screenshots/slide-relax.png" alt="User relaxed while AI trading assistant works in the background" loading="lazy" fetchpriority="low" decoding="async" width="1600" height="900" />
               <h2 class="storyCaption">Stop Wasting Time&mdash;Let AI Unleash Your Full Trading Potential, Analyzing Every Move So You Don&rsquo;t Have To.</h2>
             </article>
           </div>
@@ -763,7 +764,7 @@
         <div class="stepCard">
           <div class="stepNumber">02</div>
           <h3>Finish account verification</h3>
-          <p class="muted">After Telegram login succeeds, FlameBot verifies your account with the backend, assigns your FlameBot profile, and pulls the settings needed for your active platform.</p>
+          <p class="muted">After Telegram login succeeds, FlameBot verifies your account with the server, assigns your FlameBot profile, and pulls the settings needed for your active platform.</p>
         </div>
         <div class="stepCard">
           <div class="stepNumber">03</div>
@@ -785,11 +786,11 @@
       <div class="faqList">
         <div class="faqItem">
           <h3>Do I need a referral link on the website?</h3>
-          <p class="muted">No. Referral handling lives inside the Telegram bot flow. The website stays focused on product information, downloads, and setup guidance.</p>
+          <p class="muted">No. The website stays focused on product information, downloads, and setup guidance.</p>
         </div>
         <div class="faqItem">
           <h3>What happens if Telegram asks for extra security?</h3>
-          <p class="muted">If your account has two-step verification enabled, FlameBot will ask for the Telegram password after the login code step. That is part of the normal login flow.</p>
+          <p class="muted">If Telegram asks for extra verification, that is a normal Telegram security step. FlameBot does not collect or store Telegram passwords, and we have no access to your Telegram credentials.</p>
         </div>
         <div class="faqItem">
           <h3>Why is my EA not placing trades yet?</h3>

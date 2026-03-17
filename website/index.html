@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'self' mailto:; upgrade-insecure-requests" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self' mailto:; upgrade-insecure-requests" />
   <meta name="referrer" content="no-referrer" />
   <title>FlameBot</title>
   <meta name="description" content="FlameBot: Premium desktop companion that connects Telegram signal channels to MetaTrader automation (MT4/MT5 EAs included)." />
@@ -50,6 +50,10 @@
         radial-gradient(980px 540px at 90% 2%, rgba(34, 211, 238, 0.20) 0%, rgba(34, 211, 238, 0) 60%),
         radial-gradient(880px 520px at 70% 110%, rgba(124, 58, 237, 0.18) 0%, rgba(124, 58, 237, 0) 55%),
         linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+    }
+
+    body.consent-open {
+      overflow: hidden;
     }
 
     .wrap {
@@ -405,6 +409,185 @@
       outline-offset: 2px;
     }
 
+    .btnGhost {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .guideGrid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-top: 16px;
+    }
+
+    .stepCard {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      background: var(--panel);
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(8px);
+      min-height: 130px;
+    }
+
+    .stepCard::before {
+      content: "";
+      position: absolute;
+      inset: -1px;
+      background:
+        radial-gradient(420px 180px at 16% 0%, rgba(255, 122, 24, 0.16) 0%, rgba(255, 122, 24, 0) 62%),
+        radial-gradient(400px 180px at 88% 0%, rgba(34, 211, 238, 0.12) 0%, rgba(34, 211, 238, 0) 70%);
+      opacity: 0.7;
+      pointer-events: none;
+    }
+
+    .stepCard > * { position: relative; }
+
+    .stepNumber {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      font-size: 13px;
+      font-weight: 800;
+      margin-bottom: 10px;
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .faqList {
+      display: grid;
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .faqItem {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      background: var(--panel);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .faqItem h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+
+    .cookieOverlay {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: rgba(2, 4, 12, 0.84);
+      backdrop-filter: blur(12px);
+    }
+
+    .cookieOverlay.is-visible {
+      display: flex;
+    }
+
+    .cookiePanel {
+      width: min(100%, 680px);
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 10px);
+      padding: 24px;
+      background: linear-gradient(180deg, rgba(14, 18, 35, 0.96) 0%, rgba(8, 11, 24, 0.98) 100%);
+      box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+    }
+
+    .cookiePanel h2 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      letter-spacing: -0.02em;
+    }
+
+    .cookiePanel p {
+      color: rgba(243, 244, 246, 0.76);
+    }
+
+    .cookieOptions {
+      display: grid;
+      gap: 12px;
+      margin: 18px 0 20px;
+    }
+
+    .cookieOption {
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+      justify-content: space-between;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .cookieOption h3 {
+      margin: 0 0 6px;
+      font-size: 15px;
+    }
+
+    .cookieOption p {
+      margin: 0;
+      font-size: 13px;
+    }
+
+    .cookieToggle {
+      width: 52px;
+      height: 30px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: rgba(255, 255, 255, 0.08);
+      position: relative;
+      flex: 0 0 auto;
+      transition: background 180ms ease;
+    }
+
+    .cookieToggle::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      background: #ffffff;
+      transition: transform 180ms ease;
+    }
+
+    .cookieToggle.is-on {
+      background: rgba(34, 211, 238, 0.45);
+    }
+
+    .cookieToggle.is-on::after {
+      transform: translateX(22px);
+    }
+
+    .cookieActions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .cookieSettingsButton {
+      appearance: none;
+      border: 0;
+      background: none;
+      color: inherit;
+      font: inherit;
+      padding: 0;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+    }
+
     .downloadCard {
       position: relative;
       overflow: hidden;
@@ -446,6 +629,7 @@
 
     @media (max-width: 980px) {
       .cards { grid-template-columns: 1fr; }
+      .guideGrid { grid-template-columns: 1fr; }
       .downloadGrid { grid-template-columns: 1fr; }
       .graphic { height: 240px; }
       .storySlider,
@@ -464,6 +648,7 @@
       .wrap { padding: 38px 14px 30px; }
       .hero { padding: 18px 14px; }
       h1 { font-size: 36px; }
+      .cookiePanel { padding: 20px 16px; }
       .storySlider,
       .storyTrack { min-height: 280px; }
       .storyCaption {
@@ -565,6 +750,54 @@
       </div>
     </div>
 
+    <div class="section" aria-label="Quick start guide">
+      <div class="sectionHead">
+        <h2>Quick Start Guide</h2>
+      </div>
+      <div class="guideGrid">
+        <div class="stepCard">
+          <div class="stepNumber">01</div>
+          <h3>Open FlameBot and sign into Telegram</h3>
+          <p class="muted">Start with your phone number, wait for the Telegram login code, and enter it inside the desktop app. If your Telegram account uses two-step verification, the app will prompt for your 2FA password next.</p>
+        </div>
+        <div class="stepCard">
+          <div class="stepNumber">02</div>
+          <h3>Finish account verification</h3>
+          <p class="muted">After Telegram login succeeds, FlameBot verifies your account with the backend, assigns your FlameBot profile, and pulls the settings needed for your active platform.</p>
+        </div>
+        <div class="stepCard">
+          <div class="stepNumber">03</div>
+          <h3>Connect your MetaTrader terminal</h3>
+          <p class="muted">Install the included EA in MT4 or MT5, allow automated trading, and make sure any required WebRequest URL is whitelisted in the terminal settings before expecting live execution.</p>
+        </div>
+        <div class="stepCard">
+          <div class="stepNumber">04</div>
+          <h3>Select the groups you want to follow</h3>
+          <p class="muted">Once the Telegram session is active, FlameBot loads your available groups and channels so you can choose the sources you want the app to listen to for incoming signal messages.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" aria-label="Frequently asked questions">
+      <div class="sectionHead">
+        <h2>FAQ</h2>
+      </div>
+      <div class="faqList">
+        <div class="faqItem">
+          <h3>Do I need a referral link on the website?</h3>
+          <p class="muted">No. Referral handling lives inside the Telegram bot flow. The website stays focused on product information, downloads, and setup guidance.</p>
+        </div>
+        <div class="faqItem">
+          <h3>What happens if Telegram asks for extra security?</h3>
+          <p class="muted">If your account has two-step verification enabled, FlameBot will ask for the Telegram password after the login code step. That is part of the normal login flow.</p>
+        </div>
+        <div class="faqItem">
+          <h3>Why is my EA not placing trades yet?</h3>
+          <p class="muted">Check automated trading permissions, terminal WebRequest settings, broker rules, and whether the desktop app has fully finished its first-time verification and configuration sync.</p>
+        </div>
+      </div>
+    </div>
+
     <div class="section" id="download" aria-label="Download">
       <div class="downloadCard">
         <div class="downloadGrid">
@@ -586,14 +819,154 @@
         <a href="/contact.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Contact</a>
         <a href="/terms.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Terms</a>
         <a href="/privacy.html" style="color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255,255,255,0.16); padding-bottom: 1px;">Privacy</a>
+        <button type="button" class="cookieSettingsButton" id="cookie-settings-button">Cookie settings</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="cookieOverlay" id="cookie-overlay" role="dialog" aria-modal="true" aria-labelledby="cookie-title">
+    <div class="cookiePanel">
+      <h2 id="cookie-title">Cookie consent</h2>
+      <p>Choose whether FlameBot can use analytics cookies on this site. Essential cookies stay on because they store your consent preferences and keep basic site behavior working.</p>
+      <div class="cookieOptions">
+        <div class="cookieOption">
+          <div>
+            <h3>Essential cookies</h3>
+            <p>Required for security, consent storage, and core website behavior.</p>
+          </div>
+          <div class="cookieToggle is-on" aria-hidden="true"></div>
+        </div>
+        <div class="cookieOption">
+          <div>
+            <h3>Analytics cookies</h3>
+            <p>Allow anonymous page-view measurement so we can understand which public pages are being used.</p>
+          </div>
+          <button type="button" class="cookieToggle" id="analytics-toggle" role="switch" aria-checked="false" aria-label="Enable analytics cookies"></button>
+        </div>
+      </div>
+      <div class="cookieActions">
+        <button type="button" class="btn" id="accept-cookies">Accept analytics</button>
+        <button type="button" class="btn btnGhost" id="save-cookie-preferences">Save preferences</button>
       </div>
     </div>
   </div>
 
   <script>
     (function () {
+      const COOKIE_NAME = 'flamebot_cookie_preferences';
+      const COOKIE_MAX_AGE = 60 * 60 * 24 * 180;
+
+      const readCookiePreferences = function () {
+        const cookies = String(document.cookie || '').split(';');
+        for (let i = 0; i < cookies.length; i += 1) {
+          const entry = String(cookies[i] || '').trim();
+          if (!entry || !entry.startsWith(COOKIE_NAME + '=')) {
+            continue;
+          }
+          const rawValue = entry.slice(COOKIE_NAME.length + 1);
+          try {
+            const params = new URLSearchParams(decodeURIComponent(rawValue));
+            return {
+              analytics: ['1', 'true', 'yes'].includes(String(params.get('analytics') || '').toLowerCase())
+            };
+          } catch (_error) {
+            return null;
+          }
+        }
+        return null;
+      };
+
+      const writeCookiePreferences = function (preferences) {
+        const params = new URLSearchParams();
+        params.set('essential', '1');
+        params.set('analytics', preferences.analytics ? '1' : '0');
+        let cookieValue = COOKIE_NAME + '=' + encodeURIComponent(params.toString()) + '; Path=/; Max-Age=' + String(COOKIE_MAX_AGE) + '; SameSite=Lax';
+        if (window.location.protocol === 'https:') {
+          cookieValue += '; Secure';
+        }
+        document.cookie = cookieValue;
+      };
+
+      const overlay = document.getElementById('cookie-overlay');
+      const analyticsToggle = document.getElementById('analytics-toggle');
+      const acceptCookiesButton = document.getElementById('accept-cookies');
+      const savePreferencesButton = document.getElementById('save-cookie-preferences');
+      const openSettingsButton = document.getElementById('cookie-settings-button');
+      let analyticsEnabled = false;
+
+      const syncAnalyticsToggle = function () {
+        if (!analyticsToggle) {
+          return;
+        }
+        analyticsToggle.classList.toggle('is-on', analyticsEnabled);
+        analyticsToggle.setAttribute('aria-checked', analyticsEnabled ? 'true' : 'false');
+      };
+
+      const openConsent = function () {
+        if (!overlay) {
+          return;
+        }
+        overlay.classList.add('is-visible');
+        document.body.classList.add('consent-open');
+        syncAnalyticsToggle();
+      };
+
+      const closeConsent = function () {
+        if (!overlay) {
+          return;
+        }
+        overlay.classList.remove('is-visible');
+        document.body.classList.remove('consent-open');
+      };
+
+      const persistConsent = function () {
+        writeCookiePreferences({ analytics: analyticsEnabled });
+        closeConsent();
+        window.location.reload();
+      };
+
       const el = document.getElementById('year');
       if (el) el.textContent = String(new Date().getFullYear());
+
+      const savedPreferences = readCookiePreferences();
+      if (savedPreferences) {
+        analyticsEnabled = !!savedPreferences.analytics;
+        syncAnalyticsToggle();
+      } else {
+        openConsent();
+      }
+
+      if (analyticsToggle) {
+        analyticsToggle.addEventListener('click', function () {
+          analyticsEnabled = !analyticsEnabled;
+          syncAnalyticsToggle();
+        });
+      }
+
+      if (acceptCookiesButton) {
+        acceptCookiesButton.addEventListener('click', function () {
+          analyticsEnabled = true;
+          syncAnalyticsToggle();
+          persistConsent();
+        });
+      }
+
+      if (savePreferencesButton) {
+        savePreferencesButton.addEventListener('click', function () {
+          persistConsent();
+        });
+      }
+
+      if (openSettingsButton) {
+        openSettingsButton.addEventListener('click', function () {
+          const currentPreferences = readCookiePreferences();
+          if (currentPreferences) {
+            analyticsEnabled = !!currentPreferences.analytics;
+            syncAnalyticsToggle();
+          }
+          openConsent();
+        });
+      }
 
       const slider = document.getElementById('ai-slider');
       if (!slider) return;

@@ -1,0 +1,628 @@
+const API_ROOT = '/api/backend';
+const TOKEN_KEY = 'flamebot_admin_token';
+
+const state = {
+  token: sessionStorage.getItem(TOKEN_KEY) || '',
+  admin: null,
+  currentView: 'dashboard',
+  overview: null,
+  analytics: null,
+  ambassadors: [],
+  users: [],
+  userCounts: null,
+  selectedUserId: '',
+  loaded: {
+    overview: false,
+    ambassadors: false,
+    users: false,
+    analytics: false,
+  },
+  filters: {
+    search: '',
+    status: '',
+  },
+};
+
+const elements = {
+  authShell: document.getElementById('auth-shell'),
+  appShell: document.getElementById('app-shell'),
+  loginForm: document.getElementById('login-form'),
+  adminHeading: document.getElementById('admin-heading'),
+  adminSubheading: document.getElementById('admin-subheading'),
+  refreshButton: document.getElementById('refresh-button'),
+  logoutButton: document.getElementById('logout-button'),
+  navButtons: Array.from(document.querySelectorAll('[data-view]')),
+  viewPanels: Array.from(document.querySelectorAll('[data-view-panel]')),
+  statsGrid: document.getElementById('stats-grid'),
+  growthTrend: document.getElementById('growth-trend'),
+  recentUsersBody: document.getElementById('recent-users-body'),
+  miniAdminForm: document.getElementById('mini-admin-form'),
+  ambassadorsTableBody: document.getElementById('ambassadors-table-body'),
+  filtersForm: document.getElementById('filters-form'),
+  filterSearch: document.getElementById('filter-search'),
+  filterStatus: document.getElementById('filter-status'),
+  usersSubstats: document.getElementById('users-substats'),
+  usersTableBody: document.getElementById('users-table-body'),
+  tableCaption: document.getElementById('table-caption'),
+  selectedUserMeta: document.getElementById('selected-user-meta'),
+  userEditorForm: document.getElementById('user-editor-form'),
+  editorStatus: document.getElementById('editor-status'),
+  editorReferrer: document.getElementById('editor-referrer'),
+  editorEmail: document.getElementById('editor-email'),
+  editorPassword: document.getElementById('editor-password'),
+  editorAmbassador: document.getElementById('editor-ambassador'),
+  editorOwner: document.getElementById('editor-owner'),
+  clearReferrerButton: document.getElementById('clear-referrer-button'),
+  referralPerformanceBody: document.getElementById('referral-performance-body'),
+  recentReferralsBody: document.getElementById('recent-referrals-body'),
+  analyticsCards: document.getElementById('analytics-cards'),
+  dailyTraffic: document.getElementById('daily-traffic'),
+  analyticsUsersBody: document.getElementById('analytics-users-body'),
+  toast: document.getElementById('toast'),
+};
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function setToken(token) {
+  state.token = token || '';
+  if (state.token) {
+    sessionStorage.setItem(TOKEN_KEY, state.token);
+  } else {
+    sessionStorage.removeItem(TOKEN_KEY);
+  }
+}
+
+function showToast(message, tone = 'success') {
+  elements.toast.hidden = false;
+  elements.toast.dataset.tone = tone;
+  elements.toast.textContent = message;
+  window.clearTimeout(showToast.timer);
+  showToast.timer = window.setTimeout(() => {
+    elements.toast.hidden = true;
+  }, 3600);
+}
+
+async function api(path, options = {}) {
+  const headers = {
+    Accept: 'application/json',
+    ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+    ...(options.headers || {}),
+  };
+  if (state.token) {
+    headers.Authorization = `Bearer ${state.token}`;
+  }
+
+  const response = await fetch(`${API_ROOT}${path}`, {
+    method: options.method || 'GET',
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+
+  const data = await response.json().catch(() => ({ status: 'ERROR', message: 'Invalid server response' }));
+  if (!response.ok) {
+    const error = new Error(data?.message || 'Request failed');
+    error.status = response.status;
+    error.payload = data;
+    throw error;
+  }
+  return data;
+}
+
+function formatDate(value) {
+  if (!value) {
+    return 'Not yet';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+  return date.toLocaleString();
+}
+
+function renderStats(container, cards) {
+  container.innerHTML = cards
+    .map(([label, value]) => `<article class="statCard"><span class="sectionTag">${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`)
+    .join('');
+}
+
+function renderTrendList(container, points, valueLabel) {
+  if (!Array.isArray(points) || !points.length) {
+    container.innerHTML = '<p class="emptyState">No trend data yet.</p>';
+    return;
+  }
+  const maxValue = Math.max(...points.map((point) => Number(point.users ?? point.visits ?? 0)), 1);
+  container.innerHTML = points
+    .map((point) => {
+      const value = Number(point.users ?? point.visits ?? 0);
+      const width = Math.max(8, Math.round((value / maxValue) * 100));
+      return `
+        <div class="trendRow">
+          <div class="trendMeta">
+            <span>${escapeHtml(point.label || '')}</span>
+            <span>${escapeHtml(`${value} ${valueLabel}`)}</span>
+          </div>
+          <div class="trendBar"><span style="width:${width}%"></span></div>
+        </div>
+      `;
+    })
+    .join('');
+}
+
+function userLabel(user) {
+  const flamebotId = user.flamebot_id || 'Pending app login';
+  const telegram = user.telegram_username ? `${user.telegram_id} • @${user.telegram_username}` : user.telegram_id;
+  return `<strong>${escapeHtml(flamebotId)}</strong><div class="subtle">${escapeHtml(telegram || 'Unknown Telegram')}</div>`;
+}
+
+function renderSession() {
+  const isAuthed = Boolean(state.admin);
+  elements.authShell.hidden = isAuthed;
+  elements.appShell.hidden = !isAuthed;
+  if (!isAuthed) {
+    return;
+  }
+  elements.adminHeading.textContent = state.admin.role === 'main_admin' ? 'Admin dashboard' : 'Restricted dashboard';
+  elements.adminSubheading.textContent = state.admin.email || '';
+}
+
+function renderDashboard() {
+  const summary = state.overview?.summary || {};
+  renderStats(elements.statsGrid, [
+    ['Total Users', summary.total_users || 0],
+    ['Active Users', summary.active_users || 0],
+    ['Pre-Registered', summary.pre_registered_users || 0],
+    ['Registered', summary.registered_users || 0],
+    ['Paid Users', summary.paid_users || 0],
+  ]);
+  renderTrendList(elements.growthTrend, state.overview?.growth_trend?.daily || [], 'users');
+
+  const recentUsers = Array.isArray(state.overview?.recent_users) ? state.overview.recent_users : [];
+  elements.recentUsersBody.innerHTML = recentUsers.length
+    ? recentUsers
+        .map(
+          (user) => `
+            <tr>
+              <td>${userLabel(user)}</td>
+              <td>${escapeHtml(user.telegram_username ? `@${user.telegram_username}` : user.telegram_id || 'Unknown')}</td>
+              <td><span class="statusPill" data-status="${escapeHtml(user.status || '')}">${escapeHtml(String(user.status || '').replace('_', ' '))}</span></td>
+              <td>${escapeHtml(user.referred_by_email || 'Owner / direct')}</td>
+              <td class="subtle">${escapeHtml(formatDate(user.last_activity_at || user.last_login_at || user.created_at))}</td>
+            </tr>
+          `,
+        )
+        .join('')
+    : '<tr><td colspan="5" class="subtle">No users yet.</td></tr>';
+}
+
+function renderAmbassadorOptions() {
+  const selectedUser = state.users.find((user) => (user.record_id || user.flamebot_id) === state.selectedUserId);
+  const currentReferrer = selectedUser?.referred_by_telegram_id || '';
+  elements.editorReferrer.innerHTML = ['<option value="">Unassigned</option>']
+    .concat(
+      state.ambassadors.map(
+        (ambassador) => `<option value="${escapeHtml(ambassador.telegram_id || '')}" ${ambassador.telegram_id === currentReferrer ? 'selected' : ''}>${escapeHtml(ambassador.display_label || ambassador.email || ambassador.telegram_id || 'Unknown')}</option>`,
+      ),
+    )
+    .join('');
+}
+
+function renderAmbassadors() {
+  elements.ambassadorsTableBody.innerHTML = state.ambassadors.length
+    ? state.ambassadors
+        .map(
+          (ambassador) => `
+            <tr>
+              <td>
+                <strong>${escapeHtml(ambassador.display_label || ambassador.email || ambassador.telegram_id || 'Unknown')}</strong>
+                <div class="subtle">${escapeHtml(ambassador.dashboard_url || 'No dashboard URL')}</div>
+              </td>
+              <td>${escapeHtml(ambassador.telegram_id || 'Unknown')}</td>
+              <td>${escapeHtml(ambassador.total_referred_users || 0)}</td>
+              <td>${escapeHtml(ambassador.pre_registered_users || 0)}</td>
+              <td>${escapeHtml(ambassador.registered_users || 0)}</td>
+              <td>${escapeHtml(ambassador.paid_users || 0)}</td>
+              <td>${escapeHtml(ambassador.active_users || 0)}</td>
+              <td>${escapeHtml(`${ambassador.conversion_rate || 0}%`)}</td>
+            </tr>
+          `,
+        )
+        .join('')
+    : '<tr><td colspan="8" class="subtle">No ambassadors yet.</td></tr>';
+
+  elements.referralPerformanceBody.innerHTML = state.ambassadors.length
+    ? state.ambassadors
+        .map(
+          (ambassador) => `
+            <tr>
+              <td>${escapeHtml(ambassador.display_label || ambassador.email || ambassador.telegram_id || 'Unknown')}</td>
+              <td>${escapeHtml(ambassador.total_referred_users || 0)}</td>
+              <td>${escapeHtml(ambassador.pre_registered_users || 0)}</td>
+              <td>${escapeHtml(ambassador.registered_users || 0)}</td>
+              <td>${escapeHtml(ambassador.paid_users || 0)}</td>
+              <td>${escapeHtml(`${ambassador.conversion_rate || 0}%`)}</td>
+            </tr>
+          `,
+        )
+        .join('')
+    : '<tr><td colspan="6" class="subtle">No referral performance data yet.</td></tr>';
+
+  renderAmbassadorOptions();
+}
+
+function renderUserSubstats() {
+  const counts = state.userCounts || { total: 0, active: 0, pre_registered: 0, registered: 0, paid: 0 };
+  elements.usersSubstats.innerHTML = [
+    ['Visible users', counts.total || 0],
+    ['Active', counts.active || 0],
+    ['Pre-registered', counts.pre_registered || 0],
+    ['Registered', counts.registered || 0],
+    ['Paid', counts.paid || 0],
+  ]
+    .map(([label, value]) => `<span class="subStatChip"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></span>`)
+    .join('');
+}
+
+function selectUser(recordId) {
+  state.selectedUserId = recordId;
+  const user = state.users.find((entry) => (entry.record_id || entry.flamebot_id) === recordId);
+  if (!user) {
+    elements.selectedUserMeta.textContent = 'Select a user from the table.';
+    return;
+  }
+  elements.selectedUserMeta.textContent = `${user.telegram_id || 'Unknown'} • ${user.platform || 'pending'} • ${formatDate(user.last_activity_at || user.last_login_at || user.created_at)}`;
+  elements.editorStatus.value = user.status || 'pre_registered';
+  elements.editorEmail.value = user.email || '';
+  elements.editorPassword.value = '';
+  elements.editorAmbassador.value = user.is_ambassador ? 'true' : 'false';
+  elements.editorOwner.value = user.is_owner ? 'true' : 'false';
+  renderAmbassadorOptions();
+}
+
+function renderUsers() {
+  renderUserSubstats();
+  if (!state.users.length) {
+    elements.usersTableBody.innerHTML = '<tr><td colspan="8" class="subtle">No users matched the current filter.</td></tr>';
+    elements.tableCaption.textContent = 'No records returned for the current filter.';
+    elements.recentReferralsBody.innerHTML = '<tr><td colspan="4" class="subtle">No referral users yet.</td></tr>';
+    return;
+  }
+
+  elements.tableCaption.textContent = `${state.users.length} user record${state.users.length === 1 ? '' : 's'} loaded from the backend.`;
+  elements.usersTableBody.innerHTML = state.users
+    .map(
+      (user) => `
+        <tr>
+          <td>${userLabel(user)}</td>
+          <td>${escapeHtml(user.telegram_username ? `@${user.telegram_username}` : user.telegram_id || 'Unknown')}</td>
+          <td><span class="statusPill" data-status="${escapeHtml(user.status || '')}">${escapeHtml(String(user.status || '').replace('_', ' '))}</span></td>
+          <td>
+            <strong>${escapeHtml(user.platform || 'pending')}</strong>
+            <div class="subtle">${escapeHtml(user.last_seen_device || 'No device recorded')}</div>
+          </td>
+          <td>${escapeHtml(user.referred_by_email || 'Owner / direct')}</td>
+          <td class="subtle">${escapeHtml(formatDate(user.last_login_at || user.first_app_login_at))}</td>
+          <td class="subtle">${escapeHtml(formatDate(user.last_activity_at || user.backend_last_signal_at || user.created_at))}</td>
+          <td><button class="rowButton" data-user-id="${escapeHtml(user.record_id || user.flamebot_id || '')}" type="button">Manage</button></td>
+        </tr>
+      `,
+    )
+    .join('');
+
+  elements.usersTableBody.querySelectorAll('[data-user-id]').forEach((button) => {
+    button.addEventListener('click', () => selectUser(button.dataset.userId));
+  });
+
+  const referredUsers = state.users.filter((user) => user.referred_by_telegram_id);
+  elements.recentReferralsBody.innerHTML = referredUsers.length
+    ? referredUsers
+        .slice(0, 12)
+        .map(
+          (user) => `
+            <tr>
+              <td>${userLabel(user)}</td>
+              <td>${escapeHtml(user.referred_by_email || user.referred_by_telegram_id || 'Unknown')}</td>
+              <td><span class="statusPill" data-status="${escapeHtml(user.status || '')}">${escapeHtml(String(user.status || '').replace('_', ' '))}</span></td>
+              <td class="subtle">${escapeHtml(formatDate(user.last_activity_at || user.created_at))}</td>
+            </tr>
+          `,
+        )
+        .join('')
+    : '<tr><td colspan="4" class="subtle">No referral users yet.</td></tr>';
+
+  renderAmbassadorOptions();
+}
+
+function renderAnalytics() {
+  const website = state.analytics?.website || {};
+  const backend = state.analytics?.backend || {};
+  const users = state.analytics?.users || {};
+  renderStats(elements.analyticsCards, [
+    ['Total Site Visits', website.total_site_visits || 0],
+    ['Website Hits', website.website_hits || 0],
+    ['Unique Visitors', website.unique_visitors || 0],
+    ['Active Users', users.active_users || 0],
+    ['Online Sessions', backend.online_sessions || 0],
+  ]);
+  renderTrendList(elements.dailyTraffic, website.daily_traffic || [], 'visits');
+  const recentActivity = Array.isArray(users.recent_activity) ? users.recent_activity : [];
+  elements.analyticsUsersBody.innerHTML = recentActivity.length
+    ? recentActivity
+        .map(
+          (user) => `
+            <tr>
+              <td>${userLabel(user)}</td>
+              <td><span class="statusPill" data-status="${escapeHtml(user.status || '')}">${escapeHtml(String(user.status || '').replace('_', ' '))}</span></td>
+              <td>${escapeHtml(user.last_seen_platform || user.platform || 'pending')}</td>
+              <td class="subtle">${escapeHtml(formatDate(user.last_activity_at || user.last_login_at || user.created_at))}</td>
+            </tr>
+          `,
+        )
+        .join('')
+    : '<tr><td colspan="4" class="subtle">No activity data yet.</td></tr>';
+}
+
+function setView(view) {
+  state.currentView = view;
+  elements.navButtons.forEach((button) => {
+    button.classList.toggle('is-active', button.dataset.view === view);
+  });
+  elements.viewPanels.forEach((panel) => {
+    panel.hidden = panel.dataset.viewPanel !== view;
+  });
+}
+
+async function loadOverview() {
+  const data = await api('/admin/overview');
+  state.overview = data;
+  state.loaded.overview = true;
+  renderDashboard();
+}
+
+async function loadAmbassadors() {
+  const data = await api('/admin/ambassadors');
+  state.ambassadors = data.ambassadors || [];
+  state.loaded.ambassadors = true;
+  renderAmbassadors();
+}
+
+async function loadUsers() {
+  const params = new URLSearchParams();
+  if (state.filters.search) {
+    params.set('search', state.filters.search);
+  }
+  if (state.filters.status) {
+    params.set('status', state.filters.status);
+  }
+  const data = await api(`/admin/users${params.toString() ? `?${params.toString()}` : ''}`);
+  state.users = data.users || [];
+  state.userCounts = data.counts || null;
+  state.loaded.users = true;
+  if (state.selectedUserId && !state.users.some((user) => (user.record_id || user.flamebot_id) === state.selectedUserId)) {
+    state.selectedUserId = '';
+    elements.selectedUserMeta.textContent = 'Select a user from the table.';
+  }
+  renderUsers();
+}
+
+async function loadAnalytics() {
+  const data = await api('/admin/analytics');
+  state.analytics = data;
+  state.loaded.analytics = true;
+  renderAnalytics();
+}
+
+async function ensureViewData(view) {
+  if (view === 'dashboard' && !state.loaded.overview) {
+    await loadOverview();
+  }
+  if (view === 'ambassadors' && !state.loaded.ambassadors) {
+    await loadAmbassadors();
+  }
+  if ((view === 'users' || view === 'referrals') && !state.loaded.users) {
+    await loadUsers();
+  }
+  if (view === 'referrals' && !state.loaded.ambassadors) {
+    await loadAmbassadors();
+  }
+  if (view === 'analytics' && !state.loaded.analytics) {
+    await loadAnalytics();
+  }
+}
+
+function resetLoaded() {
+  state.loaded = { overview: false, ambassadors: false, users: false, analytics: false };
+}
+
+async function restoreSession() {
+  if (!state.token) {
+    renderSession();
+    return;
+  }
+  try {
+    const data = await api('/admin/auth/me');
+    state.admin = data.admin || null;
+    renderSession();
+    setView('dashboard');
+    await ensureViewData('dashboard');
+  } catch (error) {
+    setToken('');
+    state.admin = null;
+    renderSession();
+    if (error.status && error.status !== 401) {
+      showToast(error.message, 'error');
+    }
+  }
+}
+
+async function handleLogin(event) {
+  event.preventDefault();
+  const formData = new FormData(elements.loginForm);
+  try {
+    const data = await api('/admin/auth/login', {
+      method: 'POST',
+      body: {
+        email: formData.get('email'),
+        password: formData.get('password'),
+      },
+    });
+    setToken(data.token || '');
+    state.admin = data.admin || null;
+    resetLoaded();
+    elements.loginForm.reset();
+    renderSession();
+    setView('dashboard');
+    await ensureViewData('dashboard');
+    showToast('Dashboard unlocked.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function handleLogout() {
+  try {
+    if (state.token) {
+      await api('/admin/auth/logout', { method: 'POST' });
+    }
+  } catch (_error) {
+  } finally {
+    setToken('');
+    state.admin = null;
+    state.overview = null;
+    state.analytics = null;
+    state.ambassadors = [];
+    state.users = [];
+    state.userCounts = null;
+    state.selectedUserId = '';
+    resetLoaded();
+    renderSession();
+    showToast('Signed out.');
+  }
+}
+
+async function handleRefresh() {
+  try {
+    resetLoaded();
+    await ensureViewData(state.currentView);
+    if (state.currentView !== 'dashboard') {
+      await ensureViewData('dashboard');
+    }
+    showToast('Dashboard refreshed.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function handleMiniAdminCreate(event) {
+  event.preventDefault();
+  const formData = new FormData(elements.miniAdminForm);
+  try {
+    const data = await api('/admin/ambassadors', {
+      method: 'POST',
+      body: {
+        name: formData.get('name'),
+        email: formData.get('email'),
+        telegram_id: String(formData.get('telegram_id') || '').trim() || null,
+        phone_number: String(formData.get('phone_number') || '').trim() || null,
+        password: formData.get('password'),
+      },
+    });
+    elements.miniAdminForm.reset();
+    state.loaded.ambassadors = false;
+    state.loaded.overview = false;
+    await Promise.all([ensureViewData('ambassadors'), ensureViewData('dashboard')]);
+    showToast(data?.ambassador?.dashboard_url ? `Ambassador created. Login URL: ${data.ambassador.dashboard_url}` : 'Ambassador created.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function handleUserUpdate(event) {
+  event.preventDefault();
+  if (!state.selectedUserId) {
+    showToast('Select a user first.', 'error');
+    return;
+  }
+  try {
+    await api(`/admin/users/${encodeURIComponent(state.selectedUserId)}`, {
+      method: 'PATCH',
+      body: {
+        registration_status: elements.editorStatus.value,
+        referred_by_telegram_id: elements.editorReferrer.value || null,
+        email: elements.editorEmail.value.trim() || null,
+        password: elements.editorPassword.value,
+        is_ambassador: elements.editorAmbassador.value === 'true',
+        is_owner: elements.editorOwner.value === 'true',
+      },
+    });
+    state.loaded.users = false;
+    state.loaded.ambassadors = false;
+    state.loaded.overview = false;
+    state.loaded.analytics = false;
+    await Promise.all([ensureViewData('users'), ensureViewData('ambassadors'), ensureViewData('dashboard')]);
+    if (state.selectedUserId) {
+      selectUser(state.selectedUserId);
+    }
+    showToast('User updated.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function clearReferrer() {
+  if (!state.selectedUserId) {
+    showToast('Select a user first.', 'error');
+    return;
+  }
+  try {
+    await api(`/admin/users/${encodeURIComponent(state.selectedUserId)}`, {
+      method: 'PATCH',
+      body: { clear_referrer: true },
+    });
+    state.loaded.users = false;
+    state.loaded.ambassadors = false;
+    state.loaded.overview = false;
+    await Promise.all([ensureViewData('users'), ensureViewData('ambassadors'), ensureViewData('dashboard')]);
+    showToast('Referrer cleared.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function applyFilters(event) {
+  event.preventDefault();
+  state.filters.search = elements.filterSearch.value.trim();
+  state.filters.status = elements.filterStatus.value;
+  state.loaded.users = false;
+  await ensureViewData('users').catch((error) => showToast(error.message, 'error'));
+}
+
+function bindEvents() {
+  elements.loginForm.addEventListener('submit', handleLogin);
+  elements.logoutButton.addEventListener('click', handleLogout);
+  elements.refreshButton.addEventListener('click', handleRefresh);
+  elements.miniAdminForm.addEventListener('submit', handleMiniAdminCreate);
+  elements.filtersForm.addEventListener('submit', applyFilters);
+  elements.userEditorForm.addEventListener('submit', handleUserUpdate);
+  elements.clearReferrerButton.addEventListener('click', clearReferrer);
+  elements.navButtons.forEach((button) => {
+    button.addEventListener('click', async () => {
+      const nextView = button.dataset.view;
+      setView(nextView);
+      try {
+        await ensureViewData(nextView);
+      } catch (error) {
+        showToast(error.message, 'error');
+      }
+    });
+  });
+}
+
+bindEvents();
+restoreSession();

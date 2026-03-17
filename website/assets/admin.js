@@ -21,6 +21,9 @@ const state = {
     search: '',
     status: '',
   },
+  ambassadorOnboarding: {
+    verificationToken: '',
+  },
 };
 
 const elements = {
@@ -37,6 +40,12 @@ const elements = {
   growthTrend: document.getElementById('growth-trend'),
   recentUsersBody: document.getElementById('recent-users-body'),
   miniAdminForm: document.getElementById('mini-admin-form'),
+  miniAdminTelegramId: document.getElementById('mini-admin-telegram-id'),
+  miniAdminVerificationCode: document.getElementById('mini-admin-verification-code'),
+  miniAdminVerificationToken: document.getElementById('mini-admin-verification-token'),
+  miniAdminPhone: document.getElementById('mini-admin-phone'),
+  miniAdminSendCodeButton: document.getElementById('mini-admin-send-code'),
+  miniAdminVerifyCodeButton: document.getElementById('mini-admin-verify-code'),
   ambassadorsTableBody: document.getElementById('ambassadors-table-body'),
   filtersForm: document.getElementById('filters-form'),
   filterSearch: document.getElementById('filter-search'),
@@ -522,6 +531,11 @@ async function handleRefresh() {
 async function handleMiniAdminCreate(event) {
   event.preventDefault();
   const formData = new FormData(elements.miniAdminForm);
+  const verificationToken = state.ambassadorOnboarding.verificationToken || String(formData.get('verification_token') || '').trim();
+  if (!verificationToken) {
+    showToast('Send and verify the Telegram code first.', 'error');
+    return;
+  }
   try {
     const data = await api('/admin/ambassadors', {
       method: 'POST',
@@ -529,15 +543,82 @@ async function handleMiniAdminCreate(event) {
         name: formData.get('name'),
         email: formData.get('email'),
         telegram_id: String(formData.get('telegram_id') || '').trim() || null,
-        phone_number: String(formData.get('phone_number') || '').trim() || null,
-        password: formData.get('password'),
+        verification_token: verificationToken,
       },
     });
     elements.miniAdminForm.reset();
+    state.ambassadorOnboarding.verificationToken = '';
+    if (elements.miniAdminVerificationToken) {
+      elements.miniAdminVerificationToken.value = '';
+    }
+    if (elements.miniAdminPhone) {
+      elements.miniAdminPhone.value = '';
+    }
     state.loaded.ambassadors = false;
     state.loaded.overview = false;
     await Promise.all([ensureViewData('ambassadors'), ensureViewData('dashboard')]);
     showToast(data?.ambassador?.dashboard_url ? `Ambassador created. Login URL: ${data.ambassador.dashboard_url}` : 'Ambassador created.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function handleAmbassadorSendCode() {
+  const telegramId = String(elements.miniAdminTelegramId?.value || '').trim();
+  if (!telegramId) {
+    showToast('Enter Telegram ID first.', 'error');
+    return;
+  }
+  try {
+    const data = await api('/admin/ambassadors/send-code', {
+      method: 'POST',
+      body: {
+        telegram_id: telegramId,
+      },
+    });
+    state.ambassadorOnboarding.verificationToken = '';
+    if (elements.miniAdminVerificationToken) {
+      elements.miniAdminVerificationToken.value = '';
+    }
+    if (elements.miniAdminVerificationCode) {
+      elements.miniAdminVerificationCode.value = '';
+      elements.miniAdminVerificationCode.focus();
+    }
+    const masked = data?.verification?.phone_number_masked || data?.verification?.phone_number || 'Unavailable';
+    showToast(`Code sent via prereg bot. Profile phone: ${masked}`);
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function handleAmbassadorVerifyCode() {
+  const telegramId = String(elements.miniAdminTelegramId?.value || '').trim();
+  const code = String(elements.miniAdminVerificationCode?.value || '').trim();
+  if (!telegramId) {
+    showToast('Enter Telegram ID first.', 'error');
+    return;
+  }
+  if (!code) {
+    showToast('Enter the verification code from Telegram.', 'error');
+    return;
+  }
+  try {
+    const data = await api('/admin/ambassadors/verify-code', {
+      method: 'POST',
+      body: {
+        telegram_id: telegramId,
+        verification_code: code,
+      },
+    });
+    const token = String(data?.verification?.verification_token || '').trim();
+    state.ambassadorOnboarding.verificationToken = token;
+    if (elements.miniAdminVerificationToken) {
+      elements.miniAdminVerificationToken.value = token;
+    }
+    if (elements.miniAdminPhone) {
+      elements.miniAdminPhone.value = String(data?.verification?.phone_number || '');
+    }
+    showToast('Telegram ID verified. You can now create ambassador access.');
   } catch (error) {
     showToast(error.message, 'error');
   }
@@ -608,6 +689,8 @@ function bindEvents() {
   elements.logoutButton.addEventListener('click', handleLogout);
   elements.refreshButton.addEventListener('click', handleRefresh);
   elements.miniAdminForm.addEventListener('submit', handleMiniAdminCreate);
+  elements.miniAdminSendCodeButton?.addEventListener('click', handleAmbassadorSendCode);
+  elements.miniAdminVerifyCodeButton?.addEventListener('click', handleAmbassadorVerifyCode);
   elements.filtersForm.addEventListener('submit', applyFilters);
   elements.userEditorForm.addEventListener('submit', handleUserUpdate);
   elements.clearReferrerButton.addEventListener('click', clearReferrer);

@@ -140,16 +140,21 @@
                 </label>
                 <label>
                   <span>Telegram ID</span>
-                  <input id="mini-admin-telegram-id" name="telegram_id" type="text" placeholder="Numeric Telegram ID" />
+                  <input id="mini-admin-telegram-id" name="telegram_id" type="text" placeholder="Numeric Telegram ID" required />
                 </label>
                 <label>
-                  <span>Telegram phone number</span>
-                  <input id="mini-admin-phone" name="phone_number" type="text" placeholder="Optional Telegram phone number" />
+                  <span>Verification code</span>
+                  <input id="mini-admin-verification-code" name="verification_code" type="text" placeholder="Code sent by prereg bot" />
                 </label>
+                <input id="mini-admin-verification-token" name="verification_token" type="hidden" />
                 <label>
-                  <span>Password</span>
-                  <input id="mini-admin-password" name="password" type="password" placeholder="At least 10 characters" required />
+                  <span>Phone (auto-filled after verification)</span>
+                  <input id="mini-admin-phone" name="phone_number" type="text" placeholder="Auto-filled from verified Telegram profile" readonly />
                 </label>
+                <div class="actionsRow">
+                  <button class="ghostButton" id="mini-admin-send-code" type="button">Send code</button>
+                  <button class="ghostButton" id="mini-admin-verify-code" type="button">Verify code</button>
+                </div>
                 <button class="primaryButton" type="submit">Create ambassador</button>
               </form>
             </section>

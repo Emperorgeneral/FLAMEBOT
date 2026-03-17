@@ -14,7 +14,13 @@ const zlib = require('zlib');
 
 const ROOT = __dirname;
 const PORT = Number(process.env.PORT || 3000);
-const BACKEND_BASE_URL = String(process.env.FLAMEBOT_BACKEND_BASE_URL || '').trim().replace(/\/+$/, '');
+const BACKEND_BASE_URL = String(
+  process.env.FLAMEBOT_BACKEND_BASE_URL
+  || process.env.FLAMEBOT_BACKEND_URL
+  || process.env.BACKEND_BASE_URL
+  || process.env.BACKEND_URL
+  || ''
+).trim().replace(/\/+$/, '');
 const WEBSITE_ANALYTICS_SECRET = String(process.env.FLAMEBOT_WEBSITE_ANALYTICS_SECRET || '').trim();
 const COOKIE_PREFERENCES_NAME = 'flamebot_cookie_preferences';
 

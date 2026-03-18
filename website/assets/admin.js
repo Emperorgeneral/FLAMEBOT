@@ -663,7 +663,9 @@ async function handleAmbassadorSendCode() {
       elements.miniAdminVerificationCode.focus();
     }
     const masked = data?.verification?.phone_number_masked || data?.verification?.phone_number || 'Unavailable';
-    showToast(`Code sent via prereg bot. Matched phone: ${masked}`);
+    const tgMasked = String(data?.verification?.telegram_id_masked || '').trim() || 'Unavailable';
+    const tgUsername = String(data?.verification?.telegram_username || '').trim();
+    showToast(`Code sent via prereg bot to ${tgUsername ? `@${tgUsername}` : tgMasked}. Matched phone: ${masked}`);
   } catch (error) {
     showToast(error.message, 'error');
   }

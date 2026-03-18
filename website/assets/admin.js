@@ -22,7 +22,10 @@ const state = {
     status: '',
   },
   ambassadorOnboarding: {
+    onboardingKey: '',
     verificationToken: '',
+    expiresAtMs: 0,
+    timerId: 0,
   },
 };
 
@@ -40,10 +43,15 @@ const elements = {
   growthTrend: document.getElementById('growth-trend'),
   recentUsersBody: document.getElementById('recent-users-body'),
   miniAdminForm: document.getElementById('mini-admin-form'),
+  miniAdminName: document.getElementById('mini-admin-name'),
+  miniAdminEmail: document.getElementById('mini-admin-email'),
+  miniAdminPhoneInput: document.getElementById('mini-admin-phone-input'),
   miniAdminTelegramId: document.getElementById('mini-admin-telegram-id'),
   miniAdminVerificationCode: document.getElementById('mini-admin-verification-code'),
+  miniAdminOnboardingKey: document.getElementById('mini-admin-onboarding-key'),
   miniAdminVerificationToken: document.getElementById('mini-admin-verification-token'),
   miniAdminPhone: document.getElementById('mini-admin-phone'),
+  miniAdminCodeCountdown: document.getElementById('mini-admin-code-countdown'),
   miniAdminSendCodeButton: document.getElementById('mini-admin-send-code'),
   miniAdminVerifyCodeButton: document.getElementById('mini-admin-verify-code'),
   ambassadorsTableBody: document.getElementById('ambassadors-table-body'),
@@ -133,6 +141,75 @@ function formatDate(value) {
     return String(value);
   }
   return date.toLocaleString();
+}
+
+function updateCodeCountdown() {
+  const expiresAtMs = Number(state.ambassadorOnboarding.expiresAtMs || 0);
+  if (!elements.miniAdminCodeCountdown) {
+    return;
+  }
+  if (!expiresAtMs) {
+    elements.miniAdminCodeCountdown.dataset.state = 'idle';
+    elements.miniAdminCodeCountdown.textContent = 'Verification code not active.';
+    return;
+  }
+  const remainingMs = Math.max(0, expiresAtMs - Date.now());
+  const remainingSec = Math.ceil(remainingMs / 1000);
+  if (remainingSec <= 0) {
+    window.clearInterval(state.ambassadorOnboarding.timerId || 0);
+    state.ambassadorOnboarding.timerId = 0;
+    state.ambassadorOnboarding.verificationToken = '';
+    state.ambassadorOnboarding.onboardingKey = '';
+    state.ambassadorOnboarding.expiresAtMs = 0;
+    if (elements.miniAdminVerificationToken) {
+      elements.miniAdminVerificationToken.value = '';
+    }
+    if (elements.miniAdminOnboardingKey) {
+      elements.miniAdminOnboardingKey.value = '';
+    }
+    elements.miniAdminCodeCountdown.dataset.state = 'expired';
+    elements.miniAdminCodeCountdown.textContent = 'Code expired. Click Send code to request a new one.';
+    return;
+  }
+  const minutes = String(Math.floor(remainingSec / 60)).padStart(2, '0');
+  const seconds = String(remainingSec % 60).padStart(2, '0');
+  elements.miniAdminCodeCountdown.dataset.state = 'active';
+  elements.miniAdminCodeCountdown.textContent = `Code expires in ${minutes}:${seconds}`;
+}
+
+function startCodeCountdown(expiresInSec) {
+  const ttl = Number(expiresInSec || 0);
+  if (!Number.isFinite(ttl) || ttl <= 0) {
+    return;
+  }
+  window.clearInterval(state.ambassadorOnboarding.timerId || 0);
+  state.ambassadorOnboarding.timerId = window.setInterval(updateCodeCountdown, 1000);
+  state.ambassadorOnboarding.expiresAtMs = Date.now() + ttl * 1000;
+  updateCodeCountdown();
+}
+
+function resetAmbassadorOnboarding({ keepInputs = true } = {}) {
+  window.clearInterval(state.ambassadorOnboarding.timerId || 0);
+  state.ambassadorOnboarding.timerId = 0;
+  state.ambassadorOnboarding.onboardingKey = '';
+  state.ambassadorOnboarding.verificationToken = '';
+  state.ambassadorOnboarding.expiresAtMs = 0;
+  if (elements.miniAdminOnboardingKey) {
+    elements.miniAdminOnboardingKey.value = '';
+  }
+  if (elements.miniAdminVerificationToken) {
+    elements.miniAdminVerificationToken.value = '';
+  }
+  if (elements.miniAdminTelegramId) {
+    elements.miniAdminTelegramId.value = '';
+  }
+  if (elements.miniAdminPhone) {
+    elements.miniAdminPhone.value = '';
+  }
+  if (!keepInputs && elements.miniAdminVerificationCode) {
+    elements.miniAdminVerificationCode.value = '';
+  }
+  updateCodeCountdown();
 }
 
 function renderStats(container, cards) {
@@ -542,18 +619,12 @@ async function handleMiniAdminCreate(event) {
       body: {
         name: formData.get('name'),
         email: formData.get('email'),
-        telegram_id: String(formData.get('telegram_id') || '').trim() || null,
+        phone_number: String(formData.get('phone_number') || '').trim() || null,
         verification_token: verificationToken,
       },
     });
     elements.miniAdminForm.reset();
-    state.ambassadorOnboarding.verificationToken = '';
-    if (elements.miniAdminVerificationToken) {
-      elements.miniAdminVerificationToken.value = '';
-    }
-    if (elements.miniAdminPhone) {
-      elements.miniAdminPhone.value = '';
-    }
+    resetAmbassadorOnboarding({ keepInputs: false });
     state.loaded.ambassadors = false;
     state.loaded.overview = false;
     await Promise.all([ensureViewData('ambassadors'), ensureViewData('dashboard')]);
@@ -564,38 +635,45 @@ async function handleMiniAdminCreate(event) {
 }
 
 async function handleAmbassadorSendCode() {
-  const telegramId = String(elements.miniAdminTelegramId?.value || '').trim();
-  if (!telegramId) {
-    showToast('Enter Telegram ID first.', 'error');
+  const name = String(elements.miniAdminName?.value || '').trim();
+  const email = String(elements.miniAdminEmail?.value || '').trim();
+  const phoneNumber = String(elements.miniAdminPhoneInput?.value || '').trim();
+  if (!name || !email || !phoneNumber) {
+    showToast('Enter name, Gmail, and phone first.', 'error');
     return;
   }
   try {
     const data = await api('/admin/ambassadors/send-code', {
       method: 'POST',
       body: {
-        telegram_id: telegramId,
+        name,
+        email,
+        phone_number: phoneNumber,
       },
     });
-    state.ambassadorOnboarding.verificationToken = '';
-    if (elements.miniAdminVerificationToken) {
-      elements.miniAdminVerificationToken.value = '';
+    resetAmbassadorOnboarding({ keepInputs: true });
+    const onboardingKey = String(data?.verification?.onboarding_key || '').trim();
+    state.ambassadorOnboarding.onboardingKey = onboardingKey;
+    if (elements.miniAdminOnboardingKey) {
+      elements.miniAdminOnboardingKey.value = onboardingKey;
     }
+    startCodeCountdown(Number(data?.verification?.expires_in_sec || 0));
     if (elements.miniAdminVerificationCode) {
       elements.miniAdminVerificationCode.value = '';
       elements.miniAdminVerificationCode.focus();
     }
     const masked = data?.verification?.phone_number_masked || data?.verification?.phone_number || 'Unavailable';
-    showToast(`Code sent via prereg bot. Profile phone: ${masked}`);
+    showToast(`Code sent via prereg bot. Matched phone: ${masked}`);
   } catch (error) {
     showToast(error.message, 'error');
   }
 }
 
 async function handleAmbassadorVerifyCode() {
-  const telegramId = String(elements.miniAdminTelegramId?.value || '').trim();
+  const onboardingKey = String(state.ambassadorOnboarding.onboardingKey || elements.miniAdminOnboardingKey?.value || '').trim();
   const code = String(elements.miniAdminVerificationCode?.value || '').trim();
-  if (!telegramId) {
-    showToast('Enter Telegram ID first.', 'error');
+  if (!onboardingKey) {
+    showToast('Click Send code first.', 'error');
     return;
   }
   if (!code) {
@@ -606,18 +684,27 @@ async function handleAmbassadorVerifyCode() {
     const data = await api('/admin/ambassadors/verify-code', {
       method: 'POST',
       body: {
-        telegram_id: telegramId,
+        onboarding_key: onboardingKey,
         verification_code: code,
       },
     });
+    const refreshedOnboardingKey = String(data?.verification?.onboarding_key || onboardingKey).trim();
+    state.ambassadorOnboarding.onboardingKey = refreshedOnboardingKey;
+    if (elements.miniAdminOnboardingKey) {
+      elements.miniAdminOnboardingKey.value = refreshedOnboardingKey;
+    }
     const token = String(data?.verification?.verification_token || '').trim();
     state.ambassadorOnboarding.verificationToken = token;
     if (elements.miniAdminVerificationToken) {
       elements.miniAdminVerificationToken.value = token;
     }
+    if (elements.miniAdminTelegramId) {
+      elements.miniAdminTelegramId.value = String(data?.verification?.telegram_id || '');
+    }
     if (elements.miniAdminPhone) {
       elements.miniAdminPhone.value = String(data?.verification?.phone_number || '');
     }
+    startCodeCountdown(Number(data?.verification?.expires_in_sec || 0));
     showToast('Telegram ID verified. You can now create ambassador access.');
   } catch (error) {
     showToast(error.message, 'error');
@@ -691,6 +778,11 @@ function bindEvents() {
   elements.miniAdminForm.addEventListener('submit', handleMiniAdminCreate);
   elements.miniAdminSendCodeButton?.addEventListener('click', handleAmbassadorSendCode);
   elements.miniAdminVerifyCodeButton?.addEventListener('click', handleAmbassadorVerifyCode);
+  [elements.miniAdminName, elements.miniAdminEmail, elements.miniAdminPhoneInput].forEach((input) => {
+    input?.addEventListener('input', () => {
+      resetAmbassadorOnboarding({ keepInputs: true });
+    });
+  });
   elements.filtersForm.addEventListener('submit', applyFilters);
   elements.userEditorForm.addEventListener('submit', handleUserUpdate);
   elements.clearReferrerButton.addEventListener('click', clearReferrer);
@@ -708,4 +800,5 @@ function bindEvents() {
 }
 
 bindEvents();
+updateCodeCountdown();
 restoreSession();

@@ -139,18 +139,24 @@
                   <input id="mini-admin-email" name="email" type="email" placeholder="ambassador@gmail.com" required />
                 </label>
                 <label>
-                  <span>Telegram ID</span>
-                  <input id="mini-admin-telegram-id" name="telegram_id" type="text" placeholder="Numeric Telegram ID" required />
+                  <span>Phone</span>
+                  <input id="mini-admin-phone-input" name="phone_number" type="text" placeholder="Ambassador phone number" required />
                 </label>
                 <label>
                   <span>Verification code</span>
                   <input id="mini-admin-verification-code" name="verification_code" type="text" placeholder="Code sent by prereg bot" />
                 </label>
-                <input id="mini-admin-verification-token" name="verification_token" type="hidden" />
                 <label>
-                  <span>Phone (auto-filled after verification)</span>
-                  <input id="mini-admin-phone" name="phone_number" type="text" placeholder="Auto-filled from verified Telegram profile" readonly />
+                  <span>Telegram ID (auto-filled after verification)</span>
+                  <input id="mini-admin-telegram-id" name="telegram_id" type="text" placeholder="Auto-filled after code verification" readonly />
                 </label>
+                <input id="mini-admin-verification-token" name="verification_token" type="hidden" />
+                <input id="mini-admin-onboarding-key" name="onboarding_key" type="hidden" />
+                <label>
+                  <span>Matched Telegram phone (from bot profile)</span>
+                  <input id="mini-admin-phone" type="text" placeholder="Resolved after Send code" readonly />
+                </label>
+                <p class="hint" id="mini-admin-code-countdown">Verification code not active.</p>
                 <div class="actionsRow">
                   <button class="ghostButton" id="mini-admin-send-code" type="button">Send code</button>
                   <button class="ghostButton" id="mini-admin-verify-code" type="button">Verify code</button>

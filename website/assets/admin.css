@@ -184,6 +184,14 @@ h2 {
   font-size: 0.95rem;
 }
 
+#mini-admin-code-countdown[data-state="active"] {
+  color: var(--accent-2);
+}
+
+#mini-admin-code-countdown[data-state="expired"] {
+  color: var(--danger);
+}
+
 .brandLockup {
   display: inline-flex;
   align-items: center;

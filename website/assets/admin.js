@@ -663,9 +663,12 @@ async function handleAmbassadorSendCode() {
       elements.miniAdminVerificationCode.focus();
     }
     const masked = data?.verification?.phone_number_masked || data?.verification?.phone_number || 'Unavailable';
+    const tgExact = String(data?.verification?.telegram_id || '').trim();
     const tgMasked = String(data?.verification?.telegram_id_masked || '').trim() || 'Unavailable';
     const tgUsername = String(data?.verification?.telegram_username || '').trim();
-    showToast(`Code sent via prereg bot to ${tgUsername ? `@${tgUsername}` : tgMasked}. Matched phone: ${masked}`);
+    const botUsername = String(data?.verification?.bot_username || '').trim();
+    const botSource = String(data?.verification?.bot_token_source || '').trim();
+    showToast(`Code sent to ${tgUsername ? `@${tgUsername}` : tgMasked} (tg: ${tgExact || tgMasked}) via ${botUsername ? `@${botUsername}` : 'configured bot'} [${botSource || 'unknown source'}]. Matched phone: ${masked}`);
   } catch (error) {
     showToast(error.message, 'error');
   }

@@ -106,6 +106,24 @@ function showToast(message, tone = 'success') {
   }, 3600);
 }
 
+function setButtonBusy(button, busy, idleLabel, busyLabel) {
+  if (!button) {
+    return;
+  }
+  button.disabled = Boolean(busy);
+  button.textContent = busy ? busyLabel : idleLabel;
+}
+
+function updateAmbassadorActionButtons() {
+  const hasOnboardingKey = Boolean(String(state.ambassadorOnboarding.onboardingKey || '').trim());
+  if (elements.miniAdminVerifyCodeButton) {
+    elements.miniAdminVerifyCodeButton.disabled = !hasOnboardingKey;
+    if (!hasOnboardingKey) {
+      elements.miniAdminVerifyCodeButton.textContent = 'Verify code';
+    }
+  }
+}
+
 async function api(path, options = {}) {
   const headers = {
     Accept: 'application/json',
@@ -210,6 +228,7 @@ function resetAmbassadorOnboarding({ keepInputs = true } = {}) {
     elements.miniAdminVerificationCode.value = '';
   }
   updateCodeCountdown();
+  updateAmbassadorActionButtons();
 }
 
 function renderStats(container, cards) {
@@ -643,6 +662,7 @@ async function handleAmbassadorSendCode() {
     return;
   }
   try {
+    setButtonBusy(elements.miniAdminSendCodeButton, true, 'Send code', 'Sending...');
     const data = await api('/admin/ambassadors/send-code', {
       method: 'POST',
       body: {
@@ -671,6 +691,9 @@ async function handleAmbassadorSendCode() {
     showToast(`Code sent to ${tgUsername ? `@${tgUsername}` : tgMasked} (tg: ${tgExact || tgMasked}) via ${botUsername ? `@${botUsername}` : 'configured bot'} [${botSource || 'unknown source'}]. Matched phone: ${masked}`);
   } catch (error) {
     showToast(error.message, 'error');
+  } finally {
+    setButtonBusy(elements.miniAdminSendCodeButton, false, 'Send code', 'Sending...');
+    updateAmbassadorActionButtons();
   }
 }
 
@@ -686,6 +709,7 @@ async function handleAmbassadorVerifyCode() {
     return;
   }
   try {
+    setButtonBusy(elements.miniAdminVerifyCodeButton, true, 'Verify code', 'Verifying...');
     const data = await api('/admin/ambassadors/verify-code', {
       method: 'POST',
       body: {
@@ -713,6 +737,9 @@ async function handleAmbassadorVerifyCode() {
     showToast('Telegram ID verified. You can now create ambassador access.');
   } catch (error) {
     showToast(error.message, 'error');
+  } finally {
+    setButtonBusy(elements.miniAdminVerifyCodeButton, false, 'Verify code', 'Verifying...');
+    updateAmbassadorActionButtons();
   }
 }
 
@@ -806,4 +833,5 @@ function bindEvents() {
 
 bindEvents();
 updateCodeCountdown();
+updateAmbassadorActionButtons();
 restoreSession();

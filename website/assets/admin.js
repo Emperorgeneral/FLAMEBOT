@@ -113,12 +113,9 @@ function setButtonBusy(button, busy, idleLabel, busyLabel) {
 }
 
 function updateAmbassadorActionButtons() {
-  const hasOnboardingKey = Boolean(String(state.ambassadorOnboarding.onboardingKey || '').trim());
   if (elements.miniAdminVerifyCodeButton) {
-    elements.miniAdminVerifyCodeButton.disabled = !hasOnboardingKey;
-    if (!hasOnboardingKey) {
-      elements.miniAdminVerifyCodeButton.textContent = 'Verify code';
-    }
+    elements.miniAdminVerifyCodeButton.disabled = false;
+    elements.miniAdminVerifyCodeButton.textContent = 'Verify code';
   }
 }
 
@@ -696,9 +693,10 @@ async function handleAmbassadorSendCode() {
 
 async function handleAmbassadorVerifyCode() {
   const onboardingKey = String(state.ambassadorOnboarding.onboardingKey || elements.miniAdminOnboardingKey?.value || '').trim();
+  const telegramId = String(elements.miniAdminTelegramId?.value || '').trim();
   const code = String(elements.miniAdminVerificationCode?.value || '').trim();
-  if (!onboardingKey) {
-    showToast('Click Send code first.', 'error');
+  if (!onboardingKey && !telegramId) {
+    showToast('Enter Telegram ID first or click Send code.', 'error');
     return;
   }
   if (!code) {
@@ -710,7 +708,8 @@ async function handleAmbassadorVerifyCode() {
     const data = await api('/admin/ambassadors/verify-code', {
       method: 'POST',
       body: {
-        onboarding_key: onboardingKey,
+        onboarding_key: onboardingKey || null,
+        telegram_id: telegramId || null,
         verification_code: code,
       },
     });

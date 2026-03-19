@@ -213,11 +213,13 @@ function resetAmbassadorOnboarding({ keepInputs = true } = {}) {
   if (elements.miniAdminVerificationToken) {
     elements.miniAdminVerificationToken.value = '';
   }
-  if (elements.miniAdminTelegramId) {
-    elements.miniAdminTelegramId.value = '';
-  }
-  if (!keepInputs && elements.miniAdminVerificationCode) {
-    elements.miniAdminVerificationCode.value = '';
+  if (!keepInputs) {
+    if (elements.miniAdminTelegramId) {
+      elements.miniAdminTelegramId.value = '';
+    }
+    if (elements.miniAdminVerificationCode) {
+      elements.miniAdminVerificationCode.value = '';
+    }
   }
   updateCodeCountdown();
   updateAmbassadorActionButtons();

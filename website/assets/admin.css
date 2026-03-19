@@ -248,6 +248,26 @@ textarea {
   padding: 14px 16px;
   color: var(--text);
   background: rgba(4, 12, 18, 0.8);
+  caret-color: var(--accent-2);
+  -webkit-text-fill-color: var(--text);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: rgba(245, 239, 228, 0.55);
+  -webkit-text-fill-color: rgba(245, 239, 228, 0.55);
+}
+
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--text);
+  caret-color: var(--accent-2);
+  transition: background-color 99999s ease-in-out 0s;
+  -webkit-box-shadow: 0 0 0 1000px rgba(4, 12, 18, 0.8) inset;
 }
 
 input:focus,

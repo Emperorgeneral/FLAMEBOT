@@ -45,12 +45,10 @@ const elements = {
   miniAdminForm: document.getElementById('mini-admin-form'),
   miniAdminName: document.getElementById('mini-admin-name'),
   miniAdminEmail: document.getElementById('mini-admin-email'),
-  miniAdminPhoneInput: document.getElementById('mini-admin-phone-input'),
   miniAdminTelegramId: document.getElementById('mini-admin-telegram-id'),
   miniAdminVerificationCode: document.getElementById('mini-admin-verification-code'),
   miniAdminOnboardingKey: document.getElementById('mini-admin-onboarding-key'),
   miniAdminVerificationToken: document.getElementById('mini-admin-verification-token'),
-  miniAdminPhone: document.getElementById('mini-admin-phone'),
   miniAdminCodeCountdown: document.getElementById('mini-admin-code-countdown'),
   miniAdminSendCodeButton: document.getElementById('mini-admin-send-code'),
   miniAdminVerifyCodeButton: document.getElementById('mini-admin-verify-code'),
@@ -220,9 +218,6 @@ function resetAmbassadorOnboarding({ keepInputs = true } = {}) {
   }
   if (elements.miniAdminTelegramId) {
     elements.miniAdminTelegramId.value = '';
-  }
-  if (elements.miniAdminPhone) {
-    elements.miniAdminPhone.value = '';
   }
   if (!keepInputs && elements.miniAdminVerificationCode) {
     elements.miniAdminVerificationCode.value = '';
@@ -638,7 +633,7 @@ async function handleMiniAdminCreate(event) {
       body: {
         name: formData.get('name'),
         email: formData.get('email'),
-        phone_number: String(formData.get('phone_number') || '').trim() || null,
+        telegram_id: String(formData.get('telegram_id') || '').trim() || null,
         verification_token: verificationToken,
       },
     });
@@ -656,9 +651,9 @@ async function handleMiniAdminCreate(event) {
 async function handleAmbassadorSendCode() {
   const name = String(elements.miniAdminName?.value || '').trim();
   const email = String(elements.miniAdminEmail?.value || '').trim();
-  const phoneNumber = String(elements.miniAdminPhoneInput?.value || '').trim();
-  if (!phoneNumber) {
-    showToast('Enter phone number first.', 'error');
+  const telegramId = String(elements.miniAdminTelegramId?.value || '').trim();
+  if (!telegramId) {
+    showToast('Enter Telegram ID first.', 'error');
     return;
   }
   try {
@@ -668,7 +663,7 @@ async function handleAmbassadorSendCode() {
       body: {
         name,
         email,
-        phone_number: phoneNumber,
+        telegram_id: telegramId,
       },
     });
     resetAmbassadorOnboarding({ keepInputs: true });
@@ -682,7 +677,6 @@ async function handleAmbassadorSendCode() {
       elements.miniAdminVerificationCode.value = '';
       elements.miniAdminVerificationCode.focus();
     }
-    const masked = data?.verification?.phone_number_masked || data?.verification?.phone_number || 'Unavailable';
     const tgExact = String(data?.verification?.telegram_id || '').trim();
     const tgMasked = String(data?.verification?.telegram_id_masked || '').trim() || 'Unavailable';
     const chatExact = String(data?.verification?.delivery_chat_id || '').trim();
@@ -691,7 +685,7 @@ async function handleAmbassadorSendCode() {
     const tgUsername = String(data?.verification?.telegram_username || '').trim();
     const botUsername = String(data?.verification?.bot_username || '').trim();
     const botSource = String(data?.verification?.bot_token_source || '').trim();
-    showToast(`Code sent to ${tgUsername ? `@${tgUsername}` : tgMasked} (tg: ${tgExact || tgMasked}, chat: ${chatExact || chatMasked}, source: ${chatSource}) via ${botUsername ? `@${botUsername}` : 'configured bot'} [${botSource || 'unknown source'}]. Matched phone: ${masked}`);
+    showToast(`Code sent to ${tgUsername ? `@${tgUsername}` : tgMasked} (tg: ${tgExact || tgMasked}, chat: ${chatExact || chatMasked}, source: ${chatSource}) via ${botUsername ? `@${botUsername}` : 'configured bot'} [${botSource || 'unknown source'}].`);
   } catch (error) {
     showToast(error.message, 'error');
   } finally {
@@ -732,9 +726,6 @@ async function handleAmbassadorVerifyCode() {
     }
     if (elements.miniAdminTelegramId) {
       elements.miniAdminTelegramId.value = String(data?.verification?.telegram_id || '');
-    }
-    if (elements.miniAdminPhone) {
-      elements.miniAdminPhone.value = String(data?.verification?.phone_number || '');
     }
     startCodeCountdown(Number(data?.verification?.expires_in_sec || 0));
     showToast('Telegram ID verified. You can now create ambassador access.');
@@ -813,7 +804,7 @@ function bindEvents() {
   elements.miniAdminForm.addEventListener('submit', handleMiniAdminCreate);
   elements.miniAdminSendCodeButton?.addEventListener('click', handleAmbassadorSendCode);
   elements.miniAdminVerifyCodeButton?.addEventListener('click', handleAmbassadorVerifyCode);
-  [elements.miniAdminName, elements.miniAdminEmail, elements.miniAdminPhoneInput].forEach((input) => {
+  [elements.miniAdminName, elements.miniAdminEmail, elements.miniAdminTelegramId].forEach((input) => {
     input?.addEventListener('input', () => {
       resetAmbassadorOnboarding({ keepInputs: true });
     });

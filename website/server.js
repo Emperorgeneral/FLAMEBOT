@@ -329,8 +329,13 @@ function serveFile(req, res, filePath, requestPath = '') {
     } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
       // JS/CSS should refresh quickly after deploy; keep long cache only for media.
       const ext = path.extname(filePath).toLowerCase();
+      const baseName = path.basename(filePath).toLowerCase();
       if (ext === '.js' || ext === '.css') {
-        res.setHeader('Cache-Control', 'public, max-age=60, must-revalidate');
+        if (baseName === 'admin.js' || baseName === 'admin.css') {
+          res.setHeader('Cache-Control', 'no-store');
+        } else {
+          res.setHeader('Cache-Control', 'public, max-age=60, must-revalidate');
+        }
       } else {
         res.setHeader('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
       }

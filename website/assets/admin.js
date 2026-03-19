@@ -657,8 +657,8 @@ async function handleAmbassadorSendCode() {
   const name = String(elements.miniAdminName?.value || '').trim();
   const email = String(elements.miniAdminEmail?.value || '').trim();
   const phoneNumber = String(elements.miniAdminPhoneInput?.value || '').trim();
-  if (!name || !email || !phoneNumber) {
-    showToast('Enter name, Gmail, and phone first.', 'error');
+  if (!phoneNumber) {
+    showToast('Enter phone number first.', 'error');
     return;
   }
   try {
@@ -685,10 +685,13 @@ async function handleAmbassadorSendCode() {
     const masked = data?.verification?.phone_number_masked || data?.verification?.phone_number || 'Unavailable';
     const tgExact = String(data?.verification?.telegram_id || '').trim();
     const tgMasked = String(data?.verification?.telegram_id_masked || '').trim() || 'Unavailable';
+    const chatExact = String(data?.verification?.delivery_chat_id || '').trim();
+    const chatMasked = String(data?.verification?.delivery_chat_id_masked || '').trim() || 'Unavailable';
+    const chatSource = String(data?.verification?.delivery_chat_id_source || '').trim() || 'unknown';
     const tgUsername = String(data?.verification?.telegram_username || '').trim();
     const botUsername = String(data?.verification?.bot_username || '').trim();
     const botSource = String(data?.verification?.bot_token_source || '').trim();
-    showToast(`Code sent to ${tgUsername ? `@${tgUsername}` : tgMasked} (tg: ${tgExact || tgMasked}) via ${botUsername ? `@${botUsername}` : 'configured bot'} [${botSource || 'unknown source'}]. Matched phone: ${masked}`);
+    showToast(`Code sent to ${tgUsername ? `@${tgUsername}` : tgMasked} (tg: ${tgExact || tgMasked}, chat: ${chatExact || chatMasked}, source: ${chatSource}) via ${botUsername ? `@${botUsername}` : 'configured bot'} [${botSource || 'unknown source'}]. Matched phone: ${masked}`);
   } catch (error) {
     showToast(error.message, 'error');
   } finally {

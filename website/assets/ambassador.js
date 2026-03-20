@@ -25,6 +25,10 @@ const elements = {
   recentUsersBody: document.getElementById('recent-users-body'),
   tableCaption: document.getElementById('table-caption'),
   usersTableBody: document.getElementById('users-table-body'),
+  passwordForm: document.getElementById('password-form'),
+  passwordCurrent: document.getElementById('password-current'),
+  passwordNew: document.getElementById('password-new'),
+  passwordConfirm: document.getElementById('password-confirm'),
   toast: document.getElementById('toast'),
 };
 
@@ -117,8 +121,41 @@ function renderSession() {
 }
 
 function renderReferralLink() {
-  elements.referralToken.value = state.ambassador?.referral_token || '';
-  elements.referralLink.value = state.ambassador?.prereg_bot_start_url || '';
+  const referralToken = String(state.ambassador?.referral_token || '').trim();
+  const startUrl = String(state.ambassador?.prereg_bot_start_url || '').trim();
+  elements.referralToken.value = referralToken;
+  elements.referralLink.value = startUrl;
+}
+
+async function handlePasswordChange(event) {
+  event.preventDefault();
+  const currentPassword = String(elements.passwordCurrent?.value || '');
+  const newPassword = String(elements.passwordNew?.value || '');
+  const confirmPassword = String(elements.passwordConfirm?.value || '');
+
+  if (!currentPassword || !newPassword || !confirmPassword) {
+    showToast('Fill current password, new password, and confirmation.', 'error');
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    showToast('New password and confirmation do not match.', 'error');
+    return;
+  }
+
+  try {
+    const data = await api('/ambassador/auth/change-password', {
+      method: 'POST',
+      body: {
+        current_password: currentPassword,
+        new_password: newPassword,
+        confirm_password: confirmPassword,
+      },
+    });
+    elements.passwordForm?.reset();
+    showToast(data?.message || 'Password updated.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
 }
 
 function renderRecentUsers() {
@@ -259,6 +296,7 @@ function bindEvents() {
   elements.loginForm.addEventListener('submit', handleLogin);
   elements.refreshButton.addEventListener('click', () => loadReferralData().then(() => showToast('Dashboard refreshed.')).catch((error) => showToast(error.message, 'error')));
   elements.logoutButton.addEventListener('click', handleLogout);
+  elements.passwordForm?.addEventListener('submit', handlePasswordChange);
   elements.navButtons.forEach((button) => {
     button.addEventListener('click', () => setView(button.dataset.view));
   });

@@ -9,7 +9,7 @@
   <meta name="robots" content="noindex, nofollow" />
   <link rel="icon" href="/assets/icon.ico" sizes="any" />
   <link rel="icon" type="image/png" href="/assets/icon.png" />
-  <link rel="stylesheet" href="/assets/admin.css" />
+  <link rel="stylesheet" href="/assets/admin.css?v=20260320a" />
 </head>
 <body>
   <div class="aurora"></div>
@@ -114,6 +114,31 @@
               </div>
             </section>
           </div>
+
+          <section class="panel">
+            <div class="panelHeader stackHeader">
+              <div>
+                <p class="sectionTag">Security</p>
+                <h2>Change password</h2>
+              </div>
+              <p class="hint">Use your current password, then set a new one.</p>
+            </div>
+            <form id="password-form" class="stackForm compactForm" autocomplete="off">
+              <label>
+                <span>Current password</span>
+                <input id="password-current" name="current_password" type="password" placeholder="Current password" required />
+              </label>
+              <label>
+                <span>New password</span>
+                <input id="password-new" name="new_password" type="password" placeholder="New password" required />
+              </label>
+              <label>
+                <span>Confirm new password</span>
+                <input id="password-confirm" name="confirm_password" type="password" placeholder="Confirm new password" required />
+              </label>
+              <button class="primaryButton" type="submit">Update password</button>
+            </form>
+          </section>
         </section>
 
         <section class="viewPanel" data-view-panel="users" hidden>
@@ -147,6 +172,6 @@
   </main>
 
   <div class="toast" id="toast" hidden></div>
-  <script src="/assets/ambassador.js" defer></script>
+  <script src="/assets/ambassador.js?v=20260320a" defer></script>
 </body>
 </html>

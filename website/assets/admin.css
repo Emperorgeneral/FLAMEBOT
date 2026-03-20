@@ -535,3 +535,60 @@ tbody tr:hover {
     min-width: 680px;
   }
 }
+
+@media (max-width: 600px) {
+  .shell {
+    padding: 16px 12px 28px;
+  }
+
+  .panel,
+  .heroCard {
+    padding: 16px;
+    border-radius: 16px;
+  }
+
+  h1 {
+    font-size: clamp(2rem, 10vw, 2.5rem);
+  }
+
+  h2 {
+    font-size: 1.2rem;
+  }
+
+  .brandLockup {
+    padding: 10px 12px;
+    margin-bottom: 14px;
+  }
+
+  input,
+  select,
+  textarea {
+    padding: 12px 14px;
+  }
+
+  .actionsRow {
+    width: 100%;
+  }
+
+  .actionsRow > * {
+    width: 100%;
+  }
+
+  button,
+  .primaryButton,
+  .ghostButton,
+  .rowButton {
+    width: 100%;
+  }
+
+  table {
+    min-width: 560px;
+  }
+
+  .toast {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    max-width: none;
+  }
+}

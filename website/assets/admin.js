@@ -291,7 +291,7 @@ function renderDashboard() {
               <td>${userLabel(user)}</td>
               <td>${escapeHtml(user.telegram_username ? `@${user.telegram_username}` : user.telegram_id || 'Unknown')}</td>
               <td><span class="statusPill" data-status="${escapeHtml(user.status || '')}">${escapeHtml(String(user.status || '').replace('_', ' '))}</span></td>
-              <td>${escapeHtml(user.referred_by_email || 'Owner / direct')}</td>
+              <td>${escapeHtml(user.referred_by_email || (user.referred_by_telegram_id ? `Telegram ${user.referred_by_telegram_id}` : 'Owner / direct'))}</td>
               <td class="subtle">${escapeHtml(formatDate(user.last_activity_at || user.last_login_at || user.created_at))}</td>
             </tr>
           `,
@@ -303,12 +303,18 @@ function renderDashboard() {
 function renderAmbassadorOptions() {
   const selectedUser = state.users.find((user) => (user.record_id || user.flamebot_id) === state.selectedUserId);
   const currentReferrer = selectedUser?.referred_by_telegram_id || '';
+  const ambassadorHasCurrentReferrer = state.ambassadors.some((a) => a.telegram_id === currentReferrer);
+  const extraOption =
+    currentReferrer && !ambassadorHasCurrentReferrer
+      ? [`<option value="${escapeHtml(currentReferrer)}" selected>Telegram ${escapeHtml(currentReferrer)}${selectedUser?.referred_by_email ? ` — ${escapeHtml(selectedUser.referred_by_email)}` : ''}</option>`]
+      : [];
   elements.editorReferrer.innerHTML = ['<option value="">Unassigned</option>']
     .concat(
       state.ambassadors.map(
         (ambassador) => `<option value="${escapeHtml(ambassador.telegram_id || '')}" ${ambassador.telegram_id === currentReferrer ? 'selected' : ''}>${escapeHtml(ambassador.display_label || ambassador.email || ambassador.telegram_id || 'Unknown')}</option>`,
       ),
     )
+    .concat(extraOption)
     .join('');
 }
 
@@ -405,8 +411,7 @@ function renderUsers() {
             <strong>${escapeHtml(user.platform || 'pending')}</strong>
             <div class="subtle">${escapeHtml(user.last_seen_device || 'No device recorded')}</div>
           </td>
-          <td>${escapeHtml(user.referred_by_email || 'Owner / direct')}</td>
-          <td class="subtle">${escapeHtml(formatDate(user.last_login_at || user.first_app_login_at))}</td>
+          <td>${escapeHtml(user.referred_by_email || (user.referred_by_telegram_id ? `Telegram ${user.referred_by_telegram_id}` : 'Owner / direct'))}</td>
           <td class="subtle">${escapeHtml(formatDate(user.last_activity_at || user.backend_last_signal_at || user.created_at))}</td>
           <td><button class="rowButton" data-user-id="${escapeHtml(user.record_id || user.flamebot_id || '')}" type="button">Manage</button></td>
         </tr>

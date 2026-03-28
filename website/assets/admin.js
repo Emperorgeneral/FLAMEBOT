@@ -7,6 +7,7 @@ const state = {
   currentView: 'dashboard',
   overview: null,
   analytics: null,
+  subscriptionSettings: null,
   ambassadors: [],
   users: [],
   userCounts: null,
@@ -40,6 +41,11 @@ const elements = {
   navButtons: Array.from(document.querySelectorAll('[data-view]')),
   viewPanels: Array.from(document.querySelectorAll('[data-view-panel]')),
   statsGrid: document.getElementById('stats-grid'),
+  subscriptionSettingsForm: document.getElementById('subscription-settings-form'),
+  subscriptionEnforcementEnabled: document.getElementById('subscription-enforcement-enabled'),
+  subscriptionMinVersion: document.getElementById('subscription-min-version'),
+  subscriptionProviderReadiness: document.getElementById('subscription-provider-readiness'),
+  subscriptionSettingsSave: document.getElementById('subscription-settings-save'),
   growthTrend: document.getElementById('growth-trend'),
   recentUsersBody: document.getElementById('recent-users-body'),
   miniAdminForm: document.getElementById('mini-admin-form'),
@@ -300,6 +306,21 @@ function renderDashboard() {
     : '<tr><td colspan="5" class="subtle">No users yet.</td></tr>';
 }
 
+function renderSubscriptionSettings() {
+  const settings = state.subscriptionSettings?.settings || {};
+  const providers = state.subscriptionSettings?.providers || {};
+
+  if (elements.subscriptionEnforcementEnabled) {
+    elements.subscriptionEnforcementEnabled.value = String(Boolean(settings.enforcement_enabled));
+  }
+  if (elements.subscriptionMinVersion) {
+    elements.subscriptionMinVersion.value = String(settings.min_supported_app_version || '');
+  }
+  if (elements.subscriptionProviderReadiness) {
+    elements.subscriptionProviderReadiness.value = JSON.stringify(providers, null, 2);
+  }
+}
+
 function renderAmbassadorOptions() {
   const selectedUser = state.users.find((user) => (user.record_id || user.flamebot_id) === state.selectedUserId);
   const currentReferrer = selectedUser?.referred_by_telegram_id || '';
@@ -483,10 +504,15 @@ function setView(view) {
 }
 
 async function loadOverview() {
-  const data = await api('/admin/overview');
-  state.overview = data;
+  const [overviewData, subscriptionSettingsData] = await Promise.all([
+    api('/admin/overview'),
+    api('/admin/subscription/settings'),
+  ]);
+  state.overview = overviewData;
+  state.subscriptionSettings = subscriptionSettingsData;
   state.loaded.overview = true;
   renderDashboard();
+  renderSubscriptionSettings();
 }
 
 async function loadAmbassadors() {
@@ -620,6 +646,28 @@ async function handleRefresh() {
     showToast('Dashboard refreshed.');
   } catch (error) {
     showToast(error.message, 'error');
+  }
+}
+
+async function handleSubscriptionSettingsSubmit(event) {
+  event.preventDefault();
+  try {
+    setButtonBusy(elements.subscriptionSettingsSave, true, 'Save subscription settings', 'Saving...');
+    const payload = {
+      enforcement_enabled: String(elements.subscriptionEnforcementEnabled?.value || 'false') === 'true',
+      min_supported_app_version: String(elements.subscriptionMinVersion?.value || '').trim(),
+    };
+    const data = await api('/admin/subscription/settings', {
+      method: 'POST',
+      body: payload,
+    });
+    state.subscriptionSettings = data;
+    renderSubscriptionSettings();
+    showToast('Subscription settings updated.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    setButtonBusy(elements.subscriptionSettingsSave, false, 'Save subscription settings', 'Saving...');
   }
 }
 
@@ -818,6 +866,7 @@ function bindEvents() {
   elements.filtersForm.addEventListener('submit', applyFilters);
   elements.userEditorForm.addEventListener('submit', handleUserUpdate);
   elements.clearReferrerButton.addEventListener('click', clearReferrer);
+  elements.subscriptionSettingsForm?.addEventListener('submit', handleSubscriptionSettingsSubmit);
   elements.navButtons.forEach((button) => {
     button.addEventListener('click', async () => {
       const nextView = button.dataset.view;

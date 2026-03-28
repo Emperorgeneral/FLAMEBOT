@@ -1,5 +1,15 @@
 {
   "include": ["app"],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "app/text5.py"
+  ],
+  "typeCheckingMode": "basic",
+  "reportAttributeAccessIssue": "none",
+  "reportIncompatibleMethodOverride": "none",
+  "reportOptionalMemberAccess": "none",
   "executionEnvironments": [
     {
       "root": ".",

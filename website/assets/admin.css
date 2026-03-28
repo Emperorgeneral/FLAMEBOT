@@ -247,6 +247,12 @@ textarea {
   font: inherit;
 }
 
+#subscription-provider-readiness {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 0.85rem;
+  line-height: 1.35;
+}
+
 input,
 select,
 textarea {

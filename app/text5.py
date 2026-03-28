@@ -7,6 +7,8 @@ while delegating all Telethon logic to a background worker thread.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import inspect
 import json
 import logging
 import enum
@@ -39,7 +41,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 import time
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Coroutine, Deque, Dict, List, Optional, Sequence, Tuple, cast
 import copy
 from collections import OrderedDict, deque
 
@@ -1502,7 +1504,7 @@ class NetworkStateManager(QtCore.QObject):
         parent: Optional[QtCore.QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._pool = thread_pool or QtCore.QThreadPool.globalInstance()
+        self._pool = thread_pool or QtCore.QThreadPool.globalInstance() or QtCore.QThreadPool()
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(int(poll_ms))
         self._timer.timeout.connect(self._tick)
@@ -2084,7 +2086,7 @@ class _BackendPollTask(QtCore.QRunnable):
                 "get_symbol_settings",
                 "get_psl_settings",
             ]
-            responses = {"_polled": list(requested)}
+            responses: Dict[str, Any] = {"_polled": list(requested)}
             if "ea_status" in requested:
                 responses["ea_status"] = post_backend_json(self.backend_url, "ea_status", self.auth_params, timeout=self.timeout)
             if "get_lot_settings" in requested:
@@ -5048,7 +5050,7 @@ class FlameSplash(QtWidgets.QWidget):
         self.max_button.clicked.connect(self.toggle_max_restore)
         self.close_button = QtWidgets.QPushButton("✕")
         self.close_button.setStyleSheet(button_style)
-        self.close_button.clicked.connect(self.close)
+        self.close_button.clicked.connect(self._close_splash_window)
         controls_layout.addWidget(self.min_button)
         controls_layout.addWidget(self.max_button)
         controls_layout.addWidget(self.close_button)
@@ -5107,6 +5109,12 @@ class FlameSplash(QtWidgets.QWidget):
         self.glow_animation.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
         self._sequence_started = False
         QtCore.QTimer.singleShot(5000, self.start_transition)
+
+    def _close_splash_window(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def toggle_max_restore(self) -> None:
         # For Tool+Frameless windows, `showMaximized()` is not always reliable.
@@ -5301,8 +5309,8 @@ class TelegramWorker(QtCore.QThread):
         self.telegram_id: Optional[str] = None
         self.platform: str = "mt5"  # MT4 or MT5 - set by MainWindow
         self._stopped = False
-        self._message_handlers: Dict[int, object] = {}
-        self._edit_handlers: Dict[int, object] = {}
+        self._message_handlers: Dict[int, Callable[..., Any]] = {}
+        self._edit_handlers: Dict[int, Callable[..., Any]] = {}
         self._auto_reconnect_started = False
         self._auto_reconnect_enabled = False
         # NOTE: We intentionally schedule the auto-reconnect loop via
@@ -5324,7 +5332,7 @@ class TelegramWorker(QtCore.QThread):
         self._last_catchup_monotonic: float = 0.0
         # Track in-flight run_coroutine_threadsafe futures so UI can cancel them
         # immediately when connectivity drops.
-        self._pending_futures: List[asyncio.Future] = []
+        self._pending_futures: List[concurrent.futures.Future[Any]] = []
         self._pending_futures_lock = threading.Lock()
         # Track background tasks created in the worker loop (e.g., icon downloads).
         self._background_tasks: set[asyncio.Task] = set()
@@ -5335,7 +5343,7 @@ class TelegramWorker(QtCore.QThread):
 
         # Per-chat Telethon event handlers. If the client is destroyed/recreated
         # (e.g., offline recovery), we must re-attach these to the new client.
-        self._album_handlers: Dict[int, Any] = {}
+        self._album_handlers: Dict[int, Callable[..., Any]] = {}
 
         # Backend forwarding must not block the Telethon event loop.
         # Use a background queue + worker pool with retries.
@@ -5699,16 +5707,23 @@ class TelegramWorker(QtCore.QThread):
                     offset_id=int(offset_id or 0),
                     min_id=int(base_last),
                 )
-                if not msgs:
+                if isinstance(msgs, list):
+                    msg_list = msgs
+                elif msgs:
+                    msg_list = [msgs]
+                else:
+                    msg_list = []
+
+                if not msg_list:
                     break
 
                 try:
-                    oldest = msgs[-1]
+                    oldest = msg_list[-1]
                     offset_id = int(getattr(oldest, "id", 0) or 0)
                 except Exception:
                     offset_id = 0
 
-                for message in reversed(list(msgs)):
+                for message in reversed(msg_list):
                     try:
                         message_id = int(getattr(message, "id", 0) or 0)
                     except Exception:
@@ -5796,7 +5811,7 @@ class TelegramWorker(QtCore.QThread):
 
                 if max_messages > 0 and processed >= max_messages:
                     break
-                if len(msgs) < int(batch_size):
+                if len(msg_list) < int(batch_size):
                     break
                 if offset_id <= 0:
                     break
@@ -6506,7 +6521,12 @@ class TelegramWorker(QtCore.QThread):
         except Exception:
             pass
 
-    def _run_coro(self, coro: asyncio.Future, on_success=None, on_error=None) -> None:
+    def _run_coro(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        on_success: Optional[Callable[[Any], None]] = None,
+        on_error: Optional[Callable[[BaseException], None]] = None,
+    ) -> None:
         self._loop_ready.wait(timeout=2)
         if not self.loop:
             self.error.emit("Worker not ready")
@@ -6519,7 +6539,7 @@ class TelegramWorker(QtCore.QThread):
         except Exception:
             pass
 
-        def callback(fut: asyncio.Future) -> None:
+        def callback(fut: concurrent.futures.Future[Any]) -> None:
             try:
                 result = fut.result()
             except Exception as exc:
@@ -6582,6 +6602,23 @@ class TelegramWorker(QtCore.QThread):
         async with self._reconnect_lock:  # type: ignore[arg-type]
             await self._destroy_client_unlocked()
 
+    async def _disconnect_client_safely(self) -> None:
+        if not self.client:
+            return
+        try:
+            maybe_awaitable = self.client.disconnect()
+            if inspect.isawaitable(maybe_awaitable):
+                await asyncio.wait_for(cast(Awaitable[None], maybe_awaitable), timeout=8)
+            return
+        except Exception:
+            pass
+        try:
+            maybe_awaitable = self.client.disconnect()
+            if inspect.isawaitable(maybe_awaitable):
+                await cast(Awaitable[None], maybe_awaitable)
+        except Exception:
+            pass
+
     async def _destroy_client_unlocked(self) -> None:
         # Cancel only tasks that are bound to the current client.
         # IMPORTANT: Do NOT cancel auto-reconnect here; otherwise reconnect
@@ -6597,13 +6634,7 @@ class TelegramWorker(QtCore.QThread):
         if self.client:
             try:
                 # Avoid hanging shutdown on flaky networks.
-                try:
-                    await asyncio.wait_for(self.client.disconnect(), timeout=8)
-                except Exception:
-                    try:
-                        await self.client.disconnect()
-                    except Exception:
-                        pass
+                await self._disconnect_client_safely()
             except Exception:
                 pass
         self.client = None
@@ -6665,43 +6696,6 @@ class TelegramWorker(QtCore.QThread):
         except Exception:
             return False
 
-    async def _restart_client_and_catch_up(self, reason: str) -> bool:
-        if not self.client:
-            return False
-
-        try:
-            self._emit_debug_log(f"⚠ Telegram reconnect: {reason}")
-        except Exception:
-            pass
-
-        try:
-            await self.client.disconnect()
-        except Exception:
-            pass
-
-        # Small pause helps Telethon settle before reconnecting.
-        await asyncio.sleep(0.35)
-
-        await self.client.connect()
-
-        # IMPORTANT: Do not emit "Session expired" from a reconnect health-check.
-        # On flaky networks, `is_user_authorized()` can temporarily fail/return False
-        # even when the session is still valid. Routing to the wizard must be based
-        # on an explicit login/auto-login failure, not a transient reconnect.
-        try:
-            if self.phone:
-                ok = await self.client.is_user_authorized()
-                if not ok:
-                    self._emit_debug_log("⚠ Telegram reconnect: not authorized (will re-check via auto-login)")
-        except Exception:
-            # Treat as transient.
-            pass
-
-        # Give Telethon a brief moment to resume its internal update loop.
-        await asyncio.sleep(0.35)
-        await self._catch_up_after_reconnect()
-        return True
-
     async def _create_client(self, api_id: int, api_hash: str, phone: str) -> None:
         await self._ensure_reconnect_lock()
         async with self._reconnect_lock:  # type: ignore[arg-type]
@@ -6754,11 +6748,11 @@ class TelegramWorker(QtCore.QThread):
                 edit_h = self._edit_handlers.get(chat_id)
                 album_h = self._album_handlers.get(chat_id)
                 if msg_h:
-                    self.client.add_event_handler(msg_h, events.NewMessage(chats=chat_id))
+                    self.client.add_event_handler(cast(Any, msg_h), events.NewMessage(chats=chat_id))
                 if edit_h:
-                    self.client.add_event_handler(edit_h, events.MessageEdited(chats=chat_id))
+                    self.client.add_event_handler(cast(Any, edit_h), events.MessageEdited(chats=chat_id))
                 if album_h:
-                    self.client.add_event_handler(album_h, events.Album(chats=chat_id))
+                    self.client.add_event_handler(cast(Any, album_h), events.Album(chats=chat_id))
             except Exception:
                 continue
 
@@ -6981,17 +6975,24 @@ class TelegramWorker(QtCore.QThread):
                         offset_id=int(offset_id or 0),
                         min_id=int(base_last_id),
                     )
-                    if not msgs:
+                    if isinstance(msgs, list):
+                        msg_list = msgs
+                    elif msgs:
+                        msg_list = [msgs]
+                    else:
+                        msg_list = []
+
+                    if not msg_list:
                         break
 
                     # Determine next page cursor (oldest message id in this page).
                     try:
-                        oldest = msgs[-1]
+                        oldest = msg_list[-1]
                         offset_id = int(getattr(oldest, "id", 0) or 0)
                     except Exception:
                         offset_id = 0
 
-                    for message in reversed(list(msgs)):
+                    for message in reversed(msg_list):
                         try:
                             message_id = int(getattr(message, "id", 0) or 0)
                         except Exception:
@@ -7102,7 +7103,7 @@ class TelegramWorker(QtCore.QThread):
 
                     if max_messages > 0 and processed >= max_messages:
                         break
-                    if len(msgs) < int(batch_size):
+                    if len(msg_list) < int(batch_size):
                         break
                     if offset_id <= 0:
                         break
@@ -7389,7 +7390,10 @@ class TelegramWorker(QtCore.QThread):
 
             try:
                 if code:
-                    await self.client.sign_in(phone=self.phone, code=code)
+                    phone = str(self.phone or "").strip()
+                    if not phone:
+                        return self._make_login_result(False, "LOGIN_FAILED", _generic_login_failed_message())
+                    await self.client.sign_in(phone=phone, code=code)
                 else:
                     # UI should validate blank inputs; keep response generic.
                     if not password:
@@ -7594,7 +7598,7 @@ class TelegramWorker(QtCore.QThread):
                 else:
                     mime = "image/jpeg"
 
-            data = await self.client.download_media(message, file=bytes)
+            data = await self.client.download_media(message, file=cast(Any, bytes))
             if not data or not isinstance(data, (bytes, bytearray)):
                 return "", mime
 
@@ -7774,9 +7778,9 @@ class TelegramWorker(QtCore.QThread):
             try:
                 latest = await self.client.get_messages(chat_id, limit=1)
                 msg0 = None
-                try:
+                if isinstance(latest, list):
                     msg0 = latest[0] if latest else None
-                except Exception:
+                elif latest:
                     msg0 = latest
                 latest_mid = int(getattr(msg0, "id", 0) or 0) if msg0 is not None else 0
             except Exception:
@@ -7792,21 +7796,21 @@ class TelegramWorker(QtCore.QThread):
         if chat_id in self._message_handlers:
             try:
                 self.client.remove_event_handler(
-                    self._message_handlers[chat_id], events.NewMessage
+                    cast(Any, self._message_handlers[chat_id]), events.NewMessage(chats=chat_id)
                 )
             except Exception:
                 pass
         if chat_id in self._edit_handlers:
             try:
                 self.client.remove_event_handler(
-                    self._edit_handlers[chat_id], events.MessageEdited
+                    cast(Any, self._edit_handlers[chat_id]), events.MessageEdited(chats=chat_id)
                 )
             except Exception:
                 pass
         if chat_id in getattr(self, "_album_handlers", {}):
             try:
                 self.client.remove_event_handler(
-                    self._album_handlers[chat_id], events.Album
+                    cast(Any, self._album_handlers[chat_id]), events.Album(chats=chat_id)
                 )
             except Exception:
                 pass
@@ -8174,9 +8178,9 @@ class TelegramWorker(QtCore.QThread):
             if int(self._last_message_ids.get(chat_id) or 0) <= 0:
                 latest = await self.client.get_messages(chat_id, limit=1)
                 msg0 = None
-                try:
+                if isinstance(latest, list):
                     msg0 = latest[0] if latest else None
-                except Exception:
+                elif latest:
                     msg0 = latest
                 mid = int(getattr(msg0, "id", 0) or 0) if msg0 is not None else 0
                 if mid > 0:
@@ -8368,21 +8372,21 @@ class TelegramWorker(QtCore.QThread):
                 handler = self._message_handlers.get(cid)
                 if handler and client is not None:
                     try:
-                        client.remove_event_handler(handler, events.NewMessage)
+                        client.remove_event_handler(cast(Any, handler), events.NewMessage(chats=cid))
                     except Exception:
                         pass
 
                 edit_handler = self._edit_handlers.get(cid)
                 if edit_handler and client is not None:
                     try:
-                        client.remove_event_handler(edit_handler, events.MessageEdited)
+                        client.remove_event_handler(cast(Any, edit_handler), events.MessageEdited(chats=cid))
                     except Exception:
                         pass
 
                 album_handler = getattr(self, "_album_handlers", {}).get(cid)
                 if album_handler and client is not None:
                     try:
-                        client.remove_event_handler(album_handler, events.Album)
+                        client.remove_event_handler(cast(Any, album_handler), events.Album(chats=cid))
                     except Exception:
                         pass
 
@@ -8696,9 +8700,9 @@ class MainWindow(QtWidgets.QWidget):
         self.user_name = "Telegram User"
         self.user_phone = ""
         # Platform-specific EA state (MT4 and MT5 are independent)
-        self.ea_states = {
-            "mt4": {"prop": {"ea_active": False}, "normal": {"ea_active": False}},
-            "mt5": {"prop": {"ea_active": False}, "normal": {"ea_active": False}}
+        self.ea_states: Dict[str, Dict[str, Dict[str, Optional[bool]]]] = {
+            "mt4": {"prop": {"ea_active": False, "known": False}, "normal": {"ea_active": False, "known": False}},
+            "mt5": {"prop": {"ea_active": False, "known": False}, "normal": {"ea_active": False, "known": False}},
         }
         self.ea_active = False  # Legacy field - will be set based on selected platform
         self.telegram_phone = self.settings.get("telegram_phone", "")
@@ -8960,7 +8964,7 @@ class MainWindow(QtWidgets.QWidget):
 
         # Detect thread exit early (even before UI signals are wired).
         try:
-            self.worker.finished.connect(self._on_telegram_worker_finished, QtCore.Qt.QueuedConnection)
+            self.worker.finished.connect(self._on_telegram_worker_finished)
         except Exception:
             pass
 
@@ -12443,6 +12447,29 @@ class MainWindow(QtWidgets.QWidget):
         method_layout.addWidget(self.sub_bank_btn)
         method_layout.addWidget(self.sub_card_btn)
         method_layout.addWidget(self.sub_crypto_btn)
+
+        self.sub_plan_combo = QtWidgets.QComboBox()
+        self.sub_plan_combo.addItem("Monthly - $10", "month")
+        self.sub_plan_combo.addItem("Yearly - $100", "year")
+        method_layout.addWidget(self.sub_plan_combo)
+
+        self.sub_checkout_hint = QtWidgets.QLabel(
+            "Checkout requires CAPTCHA verification. You will be prompted before opening payment checkout."
+        )
+        self.sub_checkout_hint.setWordWrap(True)
+        method_layout.addWidget(self.sub_checkout_hint)
+
+        self.sub_checkout_btn = QtWidgets.QPushButton("Start Checkout")
+        self.sub_checkout_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        method_layout.addWidget(self.sub_checkout_btn)
+
+        self.sub_verify_payment_btn = QtWidgets.QPushButton("Verify Payment")
+        self.sub_verify_payment_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        method_layout.addWidget(self.sub_verify_payment_btn)
+
+        self.sub_checkout_status = QtWidgets.QLabel("No payment session yet.")
+        self.sub_checkout_status.setWordWrap(True)
+        method_layout.addWidget(self.sub_checkout_status)
         method_layout.addStretch()
 
         # Status view
@@ -12457,10 +12484,33 @@ class MainWindow(QtWidgets.QWidget):
         status_block.setObjectName("card")
         status_block_layout = QtWidgets.QVBoxLayout(status_block)
         status_block_layout.setSpacing(6)
-        status_block_layout.addWidget(QtWidgets.QLabel("Status: Not Subscribed"))
-        status_block_layout.addWidget(QtWidgets.QLabel("Plan: —"))
-        status_block_layout.addWidget(QtWidgets.QLabel("Expiry: —"))
+        self.sub_status_label = QtWidgets.QLabel("Status: Unknown")
+        self.sub_plan_label = QtWidgets.QLabel("Plan: —")
+        self.sub_expiry_label = QtWidgets.QLabel("Expiry: —")
+        self.sub_enforcement_label = QtWidgets.QLabel("Enforcement: —")
+        self.sub_legacy_label = QtWidgets.QLabel("Update requirement: —")
+        self.sub_pricing_label = QtWidgets.QLabel("Pricing: $10 monthly / $100 yearly")
+        self.sub_status_label.setWordWrap(True)
+        self.sub_plan_label.setWordWrap(True)
+        self.sub_expiry_label.setWordWrap(True)
+        self.sub_enforcement_label.setWordWrap(True)
+        self.sub_legacy_label.setWordWrap(True)
+        self.sub_pricing_label.setWordWrap(True)
+        status_block_layout.addWidget(self.sub_status_label)
+        status_block_layout.addWidget(self.sub_plan_label)
+        status_block_layout.addWidget(self.sub_expiry_label)
+        status_block_layout.addWidget(self.sub_enforcement_label)
+        status_block_layout.addWidget(self.sub_legacy_label)
+        status_block_layout.addWidget(self.sub_pricing_label)
         status_layout.addWidget(status_block)
+
+        self.sub_refresh_status_btn = QtWidgets.QPushButton("Refresh Subscription Status")
+        self.sub_refresh_status_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        status_layout.addWidget(self.sub_refresh_status_btn)
+
+        self.sub_steps_label = QtWidgets.QLabel("Checkout steps will appear after loading status or starting checkout.")
+        self.sub_steps_label.setWordWrap(True)
+        status_layout.addWidget(self.sub_steps_label)
         status_layout.addStretch()
 
         self.subscription_stack.addWidget(method_page)
@@ -12484,13 +12534,24 @@ class MainWindow(QtWidgets.QWidget):
         self.subscription_method_group.addButton(self.sub_crypto_btn)
         self.sub_bank_btn.setChecked(True)
 
+        self._subscription_last_payment_id = ""
+        self._subscription_last_payment_session_id = ""
+
         self.content_stack.addWidget(self.subscription_page)
 
         # Wiring: buttons set selection and navigate automatically
         self.wizard_mt5.clicked.connect(lambda: self._on_wizard_platform_selected('mt5'))
         self.wizard_mt4.clicked.connect(lambda: self._on_wizard_platform_selected('mt4'))
-        self.wizard_prop.clicked.connect(lambda: (setattr(self, 'wizard_selected_account', 'prop'), self._on_wizard_account_selected('prop')))
-        self.wizard_normal.clicked.connect(lambda: (setattr(self, 'wizard_selected_account', 'normal'), self._on_wizard_account_selected('normal')))
+        def _select_wizard_prop() -> None:
+            self.wizard_selected_account = 'prop'
+            self._on_wizard_account_selected('prop')
+
+        def _select_wizard_normal() -> None:
+            self.wizard_selected_account = 'normal'
+            self._on_wizard_account_selected('normal')
+
+        self.wizard_prop.clicked.connect(_select_wizard_prop)
+        self.wizard_normal.clicked.connect(_select_wizard_normal)
         def _wizard_back():
             idx = self.settings_wizard_stack.currentIndex()
             if idx > 0:
@@ -13224,6 +13285,9 @@ class MainWindow(QtWidgets.QWidget):
         self.subscription_btn.clicked.connect(self._show_subscription)
         self.subscription_method_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(0))
         self.subscription_status_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(1))
+        self.sub_checkout_btn.clicked.connect(self._start_subscription_checkout)
+        self.sub_verify_payment_btn.clicked.connect(self._verify_subscription_payment)
+        self.sub_refresh_status_btn.clicked.connect(self._refresh_subscription_status)
         self.platform_back.clicked.connect(self._show_message_log)
         self.mt5_button.clicked.connect(lambda: self._on_platform_selected('mt5'))
         self.mt4_button.clicked.connect(lambda: self._on_platform_selected('mt4'))
@@ -13320,7 +13384,11 @@ class MainWindow(QtWidgets.QWidget):
         tg_ts = 0
         try:
             if rest:
-                tg_ts = int(rest[0] or 0)
+                raw_ts = rest[0]
+                if isinstance(raw_ts, (int, float, str)):
+                    tg_ts = int(raw_ts)
+                else:
+                    tg_ts = 0
         except Exception:
             tg_ts = 0
         try:
@@ -13451,7 +13519,7 @@ class MainWindow(QtWidgets.QWidget):
 
         # Lifecycle signals.
         try:
-            self.worker.finished.connect(self._on_telegram_worker_finished, QtCore.Qt.QueuedConnection)
+            self.worker.finished.connect(self._on_telegram_worker_finished)
         except Exception:
             pass
         try:
@@ -14130,7 +14198,11 @@ class MainWindow(QtWidgets.QWidget):
         try:
             if saved_listening_set:
                 ids_to_resume = [gid for gid in self.group_order if gid in saved_listening_set]
-                QtCore.QTimer.singleShot(0, lambda: [self.worker.start_listening(g) for g in ids_to_resume])
+                def _resume_saved_listeners() -> None:
+                    for g in ids_to_resume:
+                        self.worker.start_listening(g)
+
+                QtCore.QTimer.singleShot(0, _resume_saved_listeners)
         except Exception:
             pass
 
@@ -14241,8 +14313,8 @@ class MainWindow(QtWidgets.QWidget):
 
         try:
             task = _ChatRenderPrepTask(seq, int(gid), str(bubble_title or ""), items)
-            task.signals.finished.connect(self._on_chat_render_prepared, QtCore.Qt.QueuedConnection)
-            task.signals.error.connect(self._on_chat_render_prepare_error, QtCore.Qt.QueuedConnection)
+            task.signals.finished.connect(self._on_chat_render_prepared)
+            task.signals.error.connect(self._on_chat_render_prepare_error)
             pool.start(task)
             return True
         except Exception:
@@ -14263,7 +14335,12 @@ class MainWindow(QtWidgets.QWidget):
         try:
             self._chat_render_gid = int(gid)
             self._chat_render_bubble_title = str(bubble_title or "")
-            self._chat_render_items = list(prepared or [])
+            if isinstance(prepared, list):
+                self._chat_render_items = prepared
+            elif isinstance(prepared, tuple):
+                self._chat_render_items = list(prepared)
+            else:
+                self._chat_render_items = []
             self._chat_render_index = 0
         except Exception:
             self._cancel_chat_render()
@@ -14307,7 +14384,8 @@ class MainWindow(QtWidgets.QWidget):
         if gid is None or idx >= len(items):
             self._cancel_chat_render()
             try:
-                self._restore_scroll_anchor_for_group(int(gid))
+                if gid is not None:
+                    self._restore_scroll_anchor_for_group(int(gid))
             except Exception:
                 try:
                     log_widget._scroll_to_bottom()
@@ -15217,8 +15295,8 @@ class MainWindow(QtWidgets.QWidget):
         # Reset EA/settings state.
         try:
             self.ea_states = {
-                "mt4": {"prop": {"ea_active": False}, "normal": {"ea_active": False}},
-                "mt5": {"prop": {"ea_active": False}, "normal": {"ea_active": False}},
+                "mt4": {"prop": {"ea_active": False, "known": False}, "normal": {"ea_active": False, "known": False}},
+                "mt5": {"prop": {"ea_active": False, "known": False}, "normal": {"ea_active": False, "known": False}},
             }
         except Exception:
             pass
@@ -17263,7 +17341,7 @@ class MainWindow(QtWidgets.QWidget):
         if not widget:
             return
         refs = getattr(widget, "_flame_widgets", {})
-        icon_lbl: QtWidgets.QLabel = refs.get("icon")
+        icon_lbl = cast(Optional[QtWidgets.QLabel], refs.get("icon"))
         if icon_lbl:
             pix = self._circle_icon(icon_path, 34)
             if pix:
@@ -17281,11 +17359,11 @@ class MainWindow(QtWidgets.QWidget):
         if not widget:
             return
         refs = getattr(widget, "_flame_widgets", {})
-        badge: QtWidgets.QLabel = refs.get("badge")
-        headset: QtWidgets.QToolButton = refs.get("headset")
-        subtitle: QtWidgets.QLabel = refs.get("subtitle")
-        name_lbl: QtWidgets.QLabel = refs.get("name")
-        timestamp_lbl: QtWidgets.QLabel = refs.get("timestamp")
+        badge = cast(Optional[QtWidgets.QLabel], refs.get("badge"))
+        headset = cast(Optional[QtWidgets.QToolButton], refs.get("headset"))
+        subtitle = cast(Optional[QtWidgets.QLabel], refs.get("subtitle"))
+        name_lbl = cast(Optional[QtWidgets.QLabel], refs.get("name"))
+        timestamp_lbl = cast(Optional[QtWidgets.QLabel], refs.get("timestamp"))
         if name_lbl:
             name_lbl.setText(state.name)
             try:
@@ -18831,7 +18909,8 @@ class MainWindow(QtWidgets.QWidget):
                     cur_val = None
             if cur_val is None:
                 try:
-                    cur_val = float(getattr(self, "custom_lot", None))
+                    raw_custom_lot = getattr(self, "custom_lot", None)
+                    cur_val = float(raw_custom_lot) if raw_custom_lot is not None else None
                 except Exception:
                     cur_val = None
             try:
@@ -19849,9 +19928,9 @@ class MainWindow(QtWidgets.QWidget):
                     if at == (self._normalize_account_type(acct) or "prop"):
                         tid = str(it.get("terminal_id") or "").strip()
                         if tid:
-                            store = getattr(self, "_terminal_id_by_platform", None)
+                            store = cast(Optional[Dict[str, Optional[str]]], getattr(self, "_terminal_id_by_platform", None))
                             if not isinstance(store, dict):
-                                self._terminal_id_by_platform = {"mt4": None, "mt5": None}
+                                self._terminal_id_by_platform = {"mt4": cast(Optional[str], None), "mt5": cast(Optional[str], None)}
                                 store = self._terminal_id_by_platform
                             store[platform] = tid
                 except Exception:
@@ -20596,7 +20675,7 @@ class MainWindow(QtWidgets.QWidget):
         for i, name in enumerate(days):
             combo.addItem(name, i)
 
-    def _get_dow_value(self, combo: QtWidgets.QComboBox) -> Optional[int]:
+    def _get_dow_value(self, combo: Optional[QtWidgets.QComboBox]) -> Optional[int]:
         if combo is None:
             return None
         try:
@@ -20611,7 +20690,7 @@ class MainWindow(QtWidgets.QWidget):
             return None
         return vi if 0 <= vi <= 6 else None
 
-    def _set_dow_value(self, combo: QtWidgets.QComboBox, value: Optional[int]) -> None:
+    def _set_dow_value(self, combo: Optional[QtWidgets.QComboBox], value: Optional[int]) -> None:
         if combo is None:
             return
         target = None
@@ -24585,7 +24664,10 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
         try:
-            entry = float(pos.get("price_open"))
+            entry_raw = pos.get("price_open")
+            if entry_raw is None:
+                return
+            entry = float(entry_raw)
         except Exception:
             return
         if abs(float(entry)) < 1e-12:
@@ -24670,6 +24752,266 @@ class MainWindow(QtWidgets.QWidget):
             self.subscription_method_btn.setChecked(True)
         index = 0 if self.subscription_method_btn.isChecked() else 1
         self.subscription_stack.setCurrentIndex(index)
+        try:
+            self._refresh_subscription_status()
+        except Exception:
+            pass
+
+    def _subscription_selected_provider(self) -> Tuple[str, str, str]:
+        if bool(getattr(self, "sub_crypto_btn", None) and self.sub_crypto_btn.isChecked()):
+            return "nowpayments", "crypto", "crypto"
+        if bool(getattr(self, "sub_card_btn", None) and self.sub_card_btn.isChecked()):
+            return "flutterwave", "card", "card"
+        return "flutterwave", "bank_transfer", "bank_transfer"
+
+    def _subscription_plan_interval(self) -> str:
+        try:
+            value = str(self.sub_plan_combo.currentData() or "month").strip().lower()
+        except Exception:
+            value = "month"
+        return "year" if value in {"year", "yearly", "annual"} else "month"
+
+    def _subscription_device_id(self) -> str:
+        cached = str(getattr(self, "_subscription_cached_device_id", "") or "").strip()
+        if cached:
+            return cached
+        try:
+            machine = f"{socket.gethostname()}:{hex(uuid.getnode())}"
+        except Exception:
+            machine = str(uuid.uuid4().hex)
+        digest = hashlib.sha256(machine.encode("utf-8", errors="ignore")).hexdigest()
+        device_id = f"desktop-{digest[:40]}"
+        self._subscription_cached_device_id = device_id
+        return device_id
+
+    def _subscription_identity_payload(self) -> Optional[dict]:
+        auth = self._backend_auth_params()
+        if not auth:
+            return None
+        try:
+            app_version = str((self.settings.get("app_version") if isinstance(self.settings, dict) else None) or "1.0").strip() or "1.0"
+        except Exception:
+            app_version = "1.0"
+        payload = {
+            "user_id": str(auth.get("user_id") or "").strip(),
+            "flamebot_id": str(auth.get("user_id") or "").strip(),
+            "license_key": str(auth.get("license_key") or "").strip(),
+            "platform": str(auth.get("platform") or "").strip().lower(),
+            "account_type": str(auth.get("account_type") or "prop").strip().lower(),
+            "app_version": app_version,
+            "device_id": self._subscription_device_id(),
+        }
+        terminal_id = str(auth.get("terminal_id") or "").strip()
+        if terminal_id:
+            payload["terminal_id"] = terminal_id
+        return payload
+
+    def _prompt_captcha_token(self, *, title: str, prompt: str) -> Optional[str]:
+        token, ok = QtWidgets.QInputDialog.getText(self, title, prompt)
+        if not ok:
+            return None
+        value = str(token or "").strip()
+        if not value:
+            self._show_toast("CAPTCHA token is required.")
+            return None
+        return value
+
+    def _render_checkout_steps(self, guide: Optional[dict]) -> None:
+        if not isinstance(guide, dict):
+            self.sub_steps_label.setText("Checkout steps unavailable.")
+            return
+        title = str(guide.get("title") or "Checkout steps").strip()
+        steps = guide.get("steps") if isinstance(guide.get("steps"), list) else []
+        if not steps:
+            self.sub_steps_label.setText(title)
+            return
+        lines = [title]
+        for idx, step in enumerate(steps, start=1):
+            lines.append(f"{idx}. {str(step or '').strip()}")
+        self.sub_steps_label.setText("\n".join(lines))
+
+    def _refresh_subscription_status(self) -> None:
+        payload = self._subscription_identity_payload()
+        if not payload:
+            self._show_toast("Missing backend identity. Complete login first.")
+            return
+
+        self.sub_refresh_status_btn.setEnabled(False)
+
+        def _done(resp: Optional[dict]) -> None:
+            try:
+                self.sub_refresh_status_btn.setEnabled(True)
+            except Exception:
+                pass
+            if not isinstance(resp, dict):
+                self._show_toast("Failed to load subscription status.")
+                return
+            if str(resp.get("status") or "").upper() in {"UPGRADE_REQUIRED", "DEVICE_ID_REQUIRED"}:
+                self.sub_status_label.setText(f"Status: {resp.get('status')}")
+                msg = str(resp.get("message") or "Action required").strip()
+                self.sub_legacy_label.setText(f"Update requirement: {msg}")
+                return
+            if str(resp.get("status") or "").upper() != "OK":
+                self._show_toast(str(resp.get("message") or "Unable to load subscription status"))
+                return
+
+            sub = resp.get("subscription") if isinstance(resp.get("subscription"), dict) else {}
+            settings = resp.get("settings") if isinstance(resp.get("settings"), dict) else {}
+            pricing = resp.get("pricing") if isinstance(resp.get("pricing"), dict) else {}
+
+            status_text = str(sub.get("status") or "unknown").strip() or "unknown"
+            reason = str(sub.get("reason") or "").strip()
+            allowed = bool(sub.get("allowed", False))
+            self.sub_status_label.setText(f"Status: {status_text} ({'allowed' if allowed else 'blocked'})")
+            self.sub_plan_label.setText(f"Plan: {str(sub.get('plan_interval') or '—')}")
+            self.sub_expiry_label.setText(f"Expiry: {str(sub.get('current_period_end') or sub.get('trial_ends_at') or '—')}")
+            self.sub_enforcement_label.setText(
+                f"Enforcement: {'ON' if bool(settings.get('enforcement_enabled', False)) else 'OFF'} | Reason: {reason or 'n/a'}"
+            )
+            self.sub_legacy_label.setText(
+                f"Update requirement: min version {str(settings.get('min_supported_app_version') or 'n/a')}"
+            )
+            monthly = int(pricing.get("monthly_usd_cents") or 1000)
+            yearly = int(pricing.get("yearly_usd_cents") or 10000)
+            self.sub_pricing_label.setText(
+                f"Pricing: ${monthly / 100:.2f} monthly / ${yearly / 100:.2f} yearly"
+            )
+
+            guides = resp.get("checkout_guides") if isinstance(resp.get("checkout_guides"), dict) else {}
+            _provider, _method, guide_key = self._subscription_selected_provider()
+            self._render_checkout_steps(guides.get(guide_key))
+
+        if not self._backend_post_async("/app/subscription/status", payload, on_done=_done, timeout=20.0):
+            self.sub_refresh_status_btn.setEnabled(True)
+            self._show_toast("Unable to contact backend.")
+
+    def _start_subscription_checkout(self) -> None:
+        payload = self._subscription_identity_payload()
+        if not payload:
+            self._show_toast("Missing backend identity. Complete login first.")
+            return
+
+        captcha_token = self._prompt_captcha_token(
+            title="CAPTCHA Verification",
+            prompt="Enter CAPTCHA token to continue checkout:",
+        )
+        if not captcha_token:
+            return
+
+        provider, payment_method, guide_key = self._subscription_selected_provider()
+        payload.update(
+            {
+                "provider": provider,
+                "payment_method": payment_method,
+                "plan_interval": self._subscription_plan_interval(),
+                "captcha_token": captcha_token,
+            }
+        )
+
+        self.sub_checkout_btn.setEnabled(False)
+        self.sub_checkout_status.setText("Preparing checkout session...")
+
+        def _done(resp: Optional[dict]) -> None:
+            try:
+                self.sub_checkout_btn.setEnabled(True)
+            except Exception:
+                pass
+            if not isinstance(resp, dict):
+                self.sub_checkout_status.setText("Checkout failed: invalid response.")
+                self._show_toast("Checkout failed.")
+                return
+            if str(resp.get("status") or "").upper() != "OK":
+                msg = str(resp.get("message") or "Checkout failed").strip()
+                self.sub_checkout_status.setText(f"Checkout failed: {msg}")
+                self._show_toast(msg)
+                return
+
+            payment = resp.get("payment") if isinstance(resp.get("payment"), dict) else {}
+            self._subscription_last_payment_id = str(payment.get("id") or "").strip()
+            self._subscription_last_payment_session_id = str(payment.get("payment_session_id") or "").strip()
+            checkout_url = str(payment.get("checkout_url") or "").strip()
+            expires_at = str(payment.get("expires_at") or "").strip()
+            self.sub_checkout_status.setText(
+                f"Checkout ready via {provider}. Session expires at {expires_at or 'unknown time'}."
+            )
+
+            guide = resp.get("guide") if isinstance(resp.get("guide"), dict) else None
+            if guide is None:
+                fallback_guides = {
+                    "crypto": {"title": "Crypto checkout", "steps": ["Open checkout URL and complete transfer."]},
+                    "card": {"title": "Card checkout", "steps": ["Open checkout URL and complete card verification."]},
+                    "bank_transfer": {"title": "Bank transfer checkout", "steps": ["Open checkout URL and complete transfer."]},
+                }
+                guide = fallback_guides.get(guide_key)
+            self._render_checkout_steps(guide)
+
+            if checkout_url:
+                try:
+                    webbrowser.open(checkout_url, new=1, autoraise=True)
+                except Exception:
+                    pass
+                self._show_toast("Checkout opened in your browser.")
+            else:
+                self._show_toast("Checkout session created, but no URL was returned.")
+
+        if not self._backend_post_async("/app/subscription/checkout", payload, on_done=_done, timeout=25.0):
+            self.sub_checkout_btn.setEnabled(True)
+            self.sub_checkout_status.setText("Unable to contact backend.")
+            self._show_toast("Unable to contact backend.")
+
+    def _verify_subscription_payment(self) -> None:
+        payload = self._subscription_identity_payload()
+        if not payload:
+            self._show_toast("Missing backend identity. Complete login first.")
+            return
+        if not self._subscription_last_payment_id and not self._subscription_last_payment_session_id:
+            self._show_toast("Start checkout first to create a payment session.")
+            return
+
+        captcha_token = self._prompt_captcha_token(
+            title="CAPTCHA Verification",
+            prompt="Enter CAPTCHA token to verify payment:",
+        )
+        if not captcha_token:
+            return
+
+        payload["captcha_token"] = captcha_token
+        if self._subscription_last_payment_id:
+            payload["payment_id"] = self._subscription_last_payment_id
+        if self._subscription_last_payment_session_id:
+            payload["payment_session_id"] = self._subscription_last_payment_session_id
+
+        self.sub_verify_payment_btn.setEnabled(False)
+        self.sub_checkout_status.setText("Checking payment status...")
+
+        def _done(resp: Optional[dict]) -> None:
+            try:
+                self.sub_verify_payment_btn.setEnabled(True)
+            except Exception:
+                pass
+            if not isinstance(resp, dict):
+                self.sub_checkout_status.setText("Payment verification failed.")
+                self._show_toast("Payment verification failed.")
+                return
+            status = str(resp.get("status") or "").strip().upper()
+            payment_status = str(resp.get("payment_status") or "").strip().lower()
+            if status == "OK" and payment_status in {"paid", ""}:
+                self.sub_checkout_status.setText("Payment confirmed.")
+                self._show_toast("Payment confirmed. Subscription activated.")
+                self._refresh_subscription_status()
+                return
+            if status in {"PENDING", "OK"} and payment_status == "pending":
+                self.sub_checkout_status.setText("Payment still pending. Please wait and retry.")
+                self._show_toast("Payment is still pending.")
+                return
+            msg = str(resp.get("message") or payment_status or status or "Verification failed").strip()
+            self.sub_checkout_status.setText(f"Verification result: {msg}")
+            self._show_toast(msg)
+
+        if not self._backend_post_async("/app/subscription/verify_payment", payload, on_done=_done, timeout=25.0):
+            self.sub_verify_payment_btn.setEnabled(True)
+            self.sub_checkout_status.setText("Unable to contact backend.")
+            self._show_toast("Unable to contact backend.")
 
     def _on_wizard_account_selected(self, acct: str) -> None:
         """Handle account selection from the compact settings flow.
@@ -24968,9 +25310,9 @@ class MainWindow(QtWidgets.QWidget):
 
                 if tid:
                     try:
-                        store = getattr(self, "_terminal_id_by_platform", None)
+                        store = cast(Optional[Dict[str, Optional[str]]], getattr(self, "_terminal_id_by_platform", None))
                         if not isinstance(store, dict):
-                            self._terminal_id_by_platform = {"mt4": None, "mt5": None}
+                            self._terminal_id_by_platform = {"mt4": cast(Optional[str], None), "mt5": cast(Optional[str], None)}
                             store = self._terminal_id_by_platform
                         store[platform] = tid
                     except Exception:
@@ -25099,7 +25441,7 @@ class MainWindow(QtWidgets.QWidget):
             return text
         return None
 
-    def _ensure_platform_ea_state(self, platform: Optional[str] = None) -> Dict[str, Dict[str, bool]]:
+    def _ensure_platform_ea_state(self, platform: Optional[str] = None) -> Dict[str, Dict[str, Optional[bool]]]:
         platform_key = (platform or getattr(self, "platform", None) or "mt5").lower()
         if platform_key not in {"mt4", "mt5"}:
             platform_key = "mt5"
@@ -25112,7 +25454,7 @@ class MainWindow(QtWidgets.QWidget):
                 platform_state[acct].setdefault("known", False)
         return platform_state
 
-    def _get_ea_context_state(self, platform: Optional[str] = None, account_type: Optional[str] = None) -> Dict[str, bool]:
+    def _get_ea_context_state(self, platform: Optional[str] = None, account_type: Optional[str] = None) -> Dict[str, Optional[bool]]:
         platform_state = self._ensure_platform_ea_state(platform)
         acct = self._normalize_account_type(account_type) or "prop"
         return platform_state.setdefault(acct, {"ea_active": None, "known": False})
@@ -25184,9 +25526,9 @@ class MainWindow(QtWidgets.QWidget):
                 tid = response.get("terminal_id") if isinstance(response, dict) else None
                 tid = str(tid or "").strip() or None
                 if tid:
-                    store = getattr(self, "_terminal_id_by_platform", None)
+                    store = cast(Optional[Dict[str, Optional[str]]], getattr(self, "_terminal_id_by_platform", None))
                     if not isinstance(store, dict):
-                        self._terminal_id_by_platform = {"mt4": None, "mt5": None}
+                        self._terminal_id_by_platform = {"mt4": cast(Optional[str], None), "mt5": cast(Optional[str], None)}
                         store = self._terminal_id_by_platform
                     store[platform] = tid
             except Exception:

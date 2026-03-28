@@ -116,6 +116,34 @@
                 </table>
               </div>
             </section>
+
+            <section class="panel">
+              <div class="panelHeader stackHeader">
+                <div>
+                  <p class="sectionTag">Subscription Controls</p>
+                  <h2>Payment enforcement</h2>
+                </div>
+                <p class="hint">This updates the global backend enforcement toggle and minimum supported app version.</p>
+              </div>
+              <form id="subscription-settings-form" class="stackForm compactForm">
+                <label>
+                  <span>Enable subscription enforcement</span>
+                  <select id="subscription-enforcement-enabled" name="enforcement_enabled">
+                    <option value="false">Disabled</option>
+                    <option value="true">Enabled</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Minimum supported app version</span>
+                  <input id="subscription-min-version" name="min_supported_app_version" type="text" placeholder="e.g. 2.0.0" />
+                </label>
+                <label>
+                  <span>Provider readiness</span>
+                  <textarea id="subscription-provider-readiness" rows="7" readonly></textarea>
+                </label>
+                <button class="primaryButton" id="subscription-settings-save" type="submit">Save subscription settings</button>
+              </form>
+            </section>
           </div>
         </section>
 

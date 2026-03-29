@@ -16,34 +16,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install deps
+      - name: Build macOS bundle and DMG
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
-      - name: Build (PyInstaller)
-        run: |
-          rm -rf build dist
-          python -m PyInstaller --noconfirm --clean --name FlameBot --windowed \
-            --add-data "eas:eas" \
-            app/flamebot_entry.py
-
-      - name: Stage zip folder
-        run: |
-          mkdir -p dist/FlameBot-macOS
-          cp -R dist/FlameBot.app dist/FlameBot-macOS/FlameBot.app
-          cp -R eas dist/FlameBot-macOS/eas
-          cp -f README-Install-mac.txt dist/FlameBot-macOS/README-Install-mac.txt
-
-      - name: Create zip and DMG
-        run: |
-          cd dist
-          ditto -c -k --sequesterRsrc --keepParent FlameBot-macOS FlameBot-macOS.zip
-          hdiutil create -volname "FlameBot" -srcfolder "FlameBot-macOS" -fs HFS+ -format UDRW tmp.dmg
-          hdiutil convert tmp.dmg -format UDZO -imagekey zlib-level=9 -o "FlameBot-macOS.dmg"
-          rm -f tmp.dmg
+          bash ./build_macos.sh
 
       - name: Upload artifact (ZIP)
         uses: actions/upload-artifact@v4

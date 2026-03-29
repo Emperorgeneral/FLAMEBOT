@@ -14,6 +14,8 @@ if ($SkipDeps) {
   Write-Host "[1/4] Installing deps" -ForegroundColor Cyan
   & $Python -m pip install --upgrade pip
   & $Python -m pip install -r requirements.txt
+  Write-Host "[1/4] Verifying critical runtime modules" -ForegroundColor Cyan
+  & $Python -c "import PyQt5, PyQt5.QtWebEngineWidgets, PyQt5.QtWebChannel, telethon; print('Dependency check OK')"
 }
 
 Write-Host "[2/4] Building with PyInstaller" -ForegroundColor Cyan
@@ -24,6 +26,12 @@ $pyiArgs = @(
   '--clean',
   '--name', 'FlameBot',
   '--windowed',
+  '--hidden-import', 'PyQt5.QtWebEngineWidgets',
+  '--hidden-import', 'PyQt5.QtWebEngineCore',
+  '--hidden-import', 'PyQt5.QtWebChannel',
+  '--collect-all', 'PyQt5.QtWebEngineWidgets',
+  '--collect-all', 'PyQt5.QtWebEngineCore',
+  '--collect-all', 'PyQt5.QtWebChannel',
   '--icon', 'app\icon.ico',
   '--add-data', 'eas;eas',
   '--add-data', 'app\country.json;.',

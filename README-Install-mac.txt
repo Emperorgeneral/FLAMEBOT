@@ -1,7 +1,12 @@
 FlameBot Desktop + MT4/MT5 EA Bundle (macOS)
 
+Package formats
+- `FlameBot-macOS.dmg` is the primary macOS installer-style download.
+- `FlameBot-macOS.zip` is the portable archive alternative.
+
 1) Open FlameBot
-   - Open FlameBot.app
+   - If you downloaded the DMG: open `FlameBot-macOS.dmg`, then drag `FlameBot.app` into Applications.
+   - If you downloaded the ZIP: extract it, then open `FlameBot.app`.
 
    Note: If macOS shows a security warning (Gatekeeper):
    - Right-click FlameBot.app -> Open

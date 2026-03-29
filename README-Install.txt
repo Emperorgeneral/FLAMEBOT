@@ -1,7 +1,17 @@
 FlameBot Desktop + MT4/MT5 EA Bundle (Windows)
 
-1) Run FlameBot
-   - Open FlameBot.exe
+Bundled runtime dependencies (no extra installs required)
+- The packaged app includes Python runtime dependencies from requirements.txt.
+- PyQt WebEngine is bundled for inline secure payment forms in-app.
+- Telethon and other required Python modules are bundled into the shipped build.
+- Users should not need to run pip or install Python separately to use the installer build.
+
+1) Install and run FlameBot (recommended)
+    - Run `FlameBot-Setup-v*.exe` and complete the installer wizard.
+    - Launch FlameBot from the Start menu or desktop shortcut.
+
+    Portable fallback:
+    - If using the portable package instead of the installer, open `FlameBot.exe` directly.
 
    Telegram API credentials
    - The app ships with embedded Telegram API ID/Hash (managed mode). You will NOT see any telegram_app.json in the folder.

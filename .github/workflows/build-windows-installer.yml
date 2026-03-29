@@ -1,0 +1,67 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            throw "ISCC.exe was not installed successfully"
+          }
+          Write-Host "Found ISCC.exe at $iscc"
+
+      - name: Build FlameBot portable app and installer
+        shell: powershell
+        run: |
+          .\build_windows.ps1 -Python python
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlameBot-Windows-Installer
+          path: |
+            dist\FlameBot-Setup-v*.exe
+          if-no-files-found: error
+
+      - name: Upload portable app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlameBot-Windows-Portable
+          path: |
+            dist\FlameBot\**
+          if-no-files-found: error
+
+      - name: Upload zip package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlameBot-Windows-Zip
+          path: |
+            dist\FlameBot-Windows.zip
+          if-no-files-found: error

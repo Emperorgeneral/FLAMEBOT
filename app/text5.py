@@ -48,6 +48,14 @@ from collections import OrderedDict, deque
 import ctypes
 from ctypes import wintypes
 from PyQt5 import QtCore, QtGui, QtWidgets
+try:
+    from PyQt5.QtWebEngineWidgets import QWebEngineView
+    from PyQt5.QtWebChannel import QWebChannel
+    _HAS_QT_WEBENGINE = True
+except Exception:
+    QWebEngineView = None  # type: ignore[assignment]
+    QWebChannel = None  # type: ignore[assignment]
+    _HAS_QT_WEBENGINE = False
 from telethon import TelegramClient, events, utils as tg_utils
 from telethon.errors import (
     FloodWaitError,
@@ -8600,6 +8608,33 @@ class TelegramWorker(QtCore.QThread):
         self._listening_chats.clear()
 
 
+class FlutterwaveTokenBridge(QtCore.QObject):
+    """JavaScript bridge to handle Flutterwave inline payment token submission."""
+
+    tokenReceived = QtCore.pyqtSignal(str)
+    tokenError = QtCore.pyqtSignal(str)
+
+    def __init__(self, window_ref) -> None:
+        super().__init__()
+        self.window_ref = weakref.ref(window_ref) if window_ref else None
+
+    @QtCore.pyqtSlot(str)
+    def submitToken(self, token: str) -> None:
+        token = str(token or "").strip()
+        if token:
+            self.tokenReceived.emit(token)
+        else:
+            self.tokenError.emit("Empty token received")
+
+    @QtCore.pyqtSlot(str)
+    def onError(self, error_msg: str) -> None:
+        self.tokenError.emit(str(error_msg or "Unknown error"))
+
+    @QtCore.pyqtSlot()
+    def onCancel(self) -> None:
+        self.tokenError.emit("Payment form canceled by user")
+
+
 class MainWindow(QtWidgets.QWidget):
     # Startup gate: emitted exactly once per app launch.
     boot_resolved = QtCore.pyqtSignal(bool)
@@ -12430,9 +12465,40 @@ class MainWindow(QtWidgets.QWidget):
         method_page = QtWidgets.QWidget()
         method_layout = QtWidgets.QVBoxLayout(method_page)
         method_layout.setSpacing(10)
-        method_title = QtWidgets.QLabel("Subscription Method")
+        method_title = QtWidgets.QLabel("Choose Your Plan")
         method_title.setObjectName("title")
         method_layout.addWidget(method_title)
+
+        self.sub_plan_hint = QtWidgets.QLabel("Choose monthly or yearly first. Payment options stay hidden until a plan is selected.")
+        self.sub_plan_hint.setWordWrap(True)
+        method_layout.addWidget(self.sub_plan_hint)
+
+        sub_plan_row = QtWidgets.QWidget()
+        sub_plan_row_layout = QtWidgets.QHBoxLayout(sub_plan_row)
+        sub_plan_row_layout.setContentsMargins(0, 0, 0, 0)
+        sub_plan_row_layout.setSpacing(10)
+        self.sub_plan_month_btn = QtWidgets.QPushButton("Monthly - $10")
+        self.sub_plan_month_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sub_plan_month_btn.setCheckable(True)
+        self.sub_plan_year_btn = QtWidgets.QPushButton("Yearly - $100")
+        self.sub_plan_year_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sub_plan_year_btn.setCheckable(True)
+        sub_plan_row_layout.addWidget(self.sub_plan_month_btn)
+        sub_plan_row_layout.addWidget(self.sub_plan_year_btn)
+        method_layout.addWidget(sub_plan_row)
+
+        self.sub_payment_heading = QtWidgets.QLabel("Payment Options")
+        self.sub_payment_heading.setObjectName("title")
+        self.sub_payment_heading.setVisible(False)
+        method_layout.addWidget(self.sub_payment_heading)
+
+        self.sub_payment_methods_panel = QtWidgets.QWidget()
+        self.sub_payment_methods_panel_layout = QtWidgets.QVBoxLayout(self.sub_payment_methods_panel)
+        self.sub_payment_methods_panel_layout.setContentsMargins(0, 0, 0, 0)
+        self.sub_payment_methods_panel_layout.setSpacing(8)
+        self.sub_payment_methods_hint = QtWidgets.QLabel("Select a plan first.")
+        self.sub_payment_methods_hint.setWordWrap(True)
+        self.sub_payment_methods_panel_layout.addWidget(self.sub_payment_methods_hint)
 
         self.sub_bank_btn = QtWidgets.QPushButton("🏦 Bank Transfer")
         self.sub_bank_btn.setCursor(QtCore.Qt.PointingHandCursor)
@@ -12444,30 +12510,48 @@ class MainWindow(QtWidgets.QWidget):
         self.sub_crypto_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.sub_crypto_btn.setCheckable(True)
 
-        method_layout.addWidget(self.sub_bank_btn)
-        method_layout.addWidget(self.sub_card_btn)
-        method_layout.addWidget(self.sub_crypto_btn)
+        self.sub_payment_methods_panel_layout.addWidget(self.sub_bank_btn)
+        self.sub_payment_methods_panel_layout.addWidget(self.sub_card_btn)
+        self.sub_payment_methods_panel_layout.addWidget(self.sub_crypto_btn)
+        self.sub_payment_methods_panel.setVisible(False)
+        method_layout.addWidget(self.sub_payment_methods_panel)
 
-        self.sub_plan_combo = QtWidgets.QComboBox()
-        self.sub_plan_combo.addItem("Monthly - $10", "month")
-        self.sub_plan_combo.addItem("Yearly - $100", "year")
-        method_layout.addWidget(self.sub_plan_combo)
+        payment_details_frame = QtWidgets.QFrame()
+        payment_details_frame.setObjectName("card")
+        payment_details_layout = QtWidgets.QVBoxLayout(payment_details_frame)
+        payment_details_layout.setSpacing(8)
+        self.sub_payment_detail_title = QtWidgets.QLabel("Payment Details")
+        self.sub_payment_detail_title.setObjectName("title")
+        self.sub_payment_detail_body = QtWidgets.QLabel("Choose a plan, then select a payment method.")
+        self.sub_payment_detail_body.setWordWrap(True)
+        self.sub_payment_detail_fields = QtWidgets.QLabel("")
+        self.sub_payment_detail_fields.setWordWrap(True)
+        self.sub_payment_detail_link = QtWidgets.QLabel("")
+        self.sub_payment_detail_link.setWordWrap(True)
+        self.sub_payment_qr_label = QtWidgets.QLabel()
+        self.sub_payment_qr_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.sub_payment_qr_label.setMinimumHeight(170)
+        self.sub_payment_qr_label.hide()
+        payment_details_layout.addWidget(self.sub_payment_detail_title)
+        payment_details_layout.addWidget(self.sub_payment_detail_body)
+        payment_details_layout.addWidget(self.sub_payment_detail_fields)
+        payment_details_layout.addWidget(self.sub_payment_detail_link)
+        payment_details_layout.addWidget(self.sub_payment_qr_label)
 
-        self.sub_checkout_hint = QtWidgets.QLabel(
-            "Checkout requires CAPTCHA verification. You will be prompted before opening payment checkout."
-        )
-        self.sub_checkout_hint.setWordWrap(True)
-        method_layout.addWidget(self.sub_checkout_hint)
+        # Inline payment form (Flutterwave embedded widget)
+        self.sub_payment_web_engine = None
+        self.sub_payment_web_channel = None
+        if _HAS_QT_WEBENGINE and QWebEngineView is not None and QWebChannel is not None:
+            self.sub_payment_web_engine = QWebEngineView()
+            self.sub_payment_web_engine.setMinimumHeight(400)
+            self.sub_payment_web_engine.hide()
+            self.sub_payment_web_channel = QWebChannel()
+            self.sub_payment_web_engine.page().setWebChannel(self.sub_payment_web_channel)
+            payment_details_layout.addWidget(self.sub_payment_web_engine)
+        
+        method_layout.addWidget(payment_details_frame)
 
-        self.sub_checkout_btn = QtWidgets.QPushButton("Start Checkout")
-        self.sub_checkout_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        method_layout.addWidget(self.sub_checkout_btn)
-
-        self.sub_verify_payment_btn = QtWidgets.QPushButton("Verify Payment")
-        self.sub_verify_payment_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        method_layout.addWidget(self.sub_verify_payment_btn)
-
-        self.sub_checkout_status = QtWidgets.QLabel("No payment session yet.")
+        self.sub_checkout_status = QtWidgets.QLabel("Choose a plan, then select a payment method.")
         self.sub_checkout_status.setWordWrap(True)
         method_layout.addWidget(self.sub_checkout_status)
         method_layout.addStretch()
@@ -12508,7 +12592,7 @@ class MainWindow(QtWidgets.QWidget):
         self.sub_refresh_status_btn.setCursor(QtCore.Qt.PointingHandCursor)
         status_layout.addWidget(self.sub_refresh_status_btn)
 
-        self.sub_steps_label = QtWidgets.QLabel("Checkout steps will appear after loading status or starting checkout.")
+        self.sub_steps_label = QtWidgets.QLabel("Choose monthly or yearly to continue.")
         self.sub_steps_label.setWordWrap(True)
         status_layout.addWidget(self.sub_steps_label)
         status_layout.addStretch()
@@ -12532,11 +12616,23 @@ class MainWindow(QtWidgets.QWidget):
         self.subscription_method_group.addButton(self.sub_bank_btn)
         self.subscription_method_group.addButton(self.sub_card_btn)
         self.subscription_method_group.addButton(self.sub_crypto_btn)
-        self.sub_bank_btn.setChecked(True)
 
         self._subscription_last_payment_id = ""
         self._subscription_last_payment_session_id = ""
+        self._subscription_status_request_inflight = False
+        self._subscription_poll_deadline_ts = 0.0
+        self._subscription_poll_success_notified = False
+        self._subscription_status_poll_timer = QtCore.QTimer(self)
+        self._subscription_status_poll_timer.setInterval(5000)
+        self._subscription_status_poll_timer.timeout.connect(self._poll_subscription_status)
 
+        self._flutterwave_token_bridge = None
+        if self.sub_payment_web_engine is not None and self.sub_payment_web_channel is not None:
+            self._flutterwave_token_bridge = FlutterwaveTokenBridge(self)
+            self._flutterwave_token_bridge.tokenReceived.connect(self._on_flutterwave_token_received)
+            self._flutterwave_token_bridge.tokenError.connect(self._on_flutterwave_token_error)
+            self.sub_payment_web_channel.registerObject("flutterwave_bridge", self._flutterwave_token_bridge)
+        
         self.content_stack.addWidget(self.subscription_page)
 
         # Wiring: buttons set selection and navigate automatically
@@ -13285,8 +13381,11 @@ class MainWindow(QtWidgets.QWidget):
         self.subscription_btn.clicked.connect(self._show_subscription)
         self.subscription_method_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(0))
         self.subscription_status_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(1))
-        self.sub_checkout_btn.clicked.connect(self._start_subscription_checkout)
-        self.sub_verify_payment_btn.clicked.connect(self._verify_subscription_payment)
+        self.sub_plan_month_btn.clicked.connect(lambda checked: self._on_subscription_plan_toggled("month", checked))
+        self.sub_plan_year_btn.clicked.connect(lambda checked: self._on_subscription_plan_toggled("year", checked))
+        self.sub_bank_btn.clicked.connect(self._on_subscription_payment_method_clicked)
+        self.sub_card_btn.clicked.connect(self._on_subscription_payment_method_clicked)
+        self.sub_crypto_btn.clicked.connect(self._on_subscription_payment_method_clicked)
         self.sub_refresh_status_btn.clicked.connect(self._refresh_subscription_status)
         self.platform_back.clicked.connect(self._show_message_log)
         self.mt5_button.clicked.connect(lambda: self._on_platform_selected('mt5'))
@@ -24757,19 +24856,21 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _subscription_selected_provider(self) -> Tuple[str, str, str]:
+    def _subscription_selected_provider(self) -> Optional[Tuple[str, str, str]]:
         if bool(getattr(self, "sub_crypto_btn", None) and self.sub_crypto_btn.isChecked()):
             return "nowpayments", "crypto", "crypto"
         if bool(getattr(self, "sub_card_btn", None) and self.sub_card_btn.isChecked()):
             return "flutterwave", "card", "card"
-        return "flutterwave", "bank_transfer", "bank_transfer"
+        if bool(getattr(self, "sub_bank_btn", None) and self.sub_bank_btn.isChecked()):
+            return "flutterwave", "bank_transfer", "bank_transfer"
+        return None
 
     def _subscription_plan_interval(self) -> str:
-        try:
-            value = str(self.sub_plan_combo.currentData() or "month").strip().lower()
-        except Exception:
-            value = "month"
-        return "year" if value in {"year", "yearly", "annual"} else "month"
+        if bool(getattr(self, "sub_plan_year_btn", None) and self.sub_plan_year_btn.isChecked()):
+            return "year"
+        if bool(getattr(self, "sub_plan_month_btn", None) and self.sub_plan_month_btn.isChecked()):
+            return "month"
+        return ""
 
     def _subscription_device_id(self) -> str:
         cached = str(getattr(self, "_subscription_cached_device_id", "") or "").strip()
@@ -24806,15 +24907,166 @@ class MainWindow(QtWidgets.QWidget):
             payload["terminal_id"] = terminal_id
         return payload
 
-    def _prompt_captcha_token(self, *, title: str, prompt: str) -> Optional[str]:
-        token, ok = QtWidgets.QInputDialog.getText(self, title, prompt)
-        if not ok:
-            return None
-        value = str(token or "").strip()
-        if not value:
-            self._show_toast("CAPTCHA token is required.")
-            return None
-        return value
+    def _subscription_clear_method_selection(self) -> None:
+        try:
+            self.subscription_method_group.setExclusive(False)
+            for btn in (self.sub_bank_btn, self.sub_card_btn, self.sub_crypto_btn):
+                btn.setChecked(False)
+        finally:
+            self.subscription_method_group.setExclusive(True)
+
+    def _subscription_set_method_buttons_enabled(self, enabled: bool) -> None:
+        for btn in (self.sub_bank_btn, self.sub_card_btn, self.sub_crypto_btn):
+            btn.setEnabled(bool(enabled))
+
+    def _subscription_reset_payment_details(self, message: str) -> None:
+        self.sub_payment_detail_title.setText("Payment Details")
+        self.sub_payment_detail_body.setText(str(message or ""))
+        self.sub_payment_detail_fields.setText("")
+        self.sub_payment_detail_fields.show()
+        self.sub_payment_detail_link.setText("")
+        self.sub_payment_detail_link.show()
+        self.sub_payment_qr_label.clear()
+        self.sub_payment_qr_label.hide()
+        self.sub_checkout_status.setText(str(message or ""))
+        # Hide and clear the inline payment web engine
+        try:
+            self.sub_payment_web_engine.hide()
+            self.sub_payment_web_engine.setHtml("")
+        except Exception:
+            pass
+
+    def _on_subscription_plan_toggled(self, interval: str, checked: bool) -> None:
+        if interval == "month" and checked:
+            self.sub_plan_year_btn.setChecked(False)
+        elif interval == "year" and checked:
+            self.sub_plan_month_btn.setChecked(False)
+
+        selected_plan = self._subscription_plan_interval()
+        has_plan = bool(selected_plan)
+
+        self._subscription_stop_status_polling()
+        self._subscription_last_payment_id = ""
+        self._subscription_last_payment_session_id = ""
+        self._subscription_clear_method_selection()
+        self.sub_payment_heading.setVisible(has_plan)
+        self.sub_payment_methods_panel.setVisible(has_plan)
+
+        if has_plan:
+            self.sub_payment_methods_hint.setText("Select how you want to pay. FlameBot will confirm your payment automatically.")
+            self.sub_steps_label.setText("Select a payment option to view payment steps.")
+            self._subscription_reset_payment_details("Select a payment method to create a payment session.")
+            return
+
+        self.sub_payment_methods_hint.setText("Select a plan first.")
+        self.sub_steps_label.setText("Choose monthly or yearly to continue.")
+        self._subscription_reset_payment_details("Choose a plan, then select a payment method.")
+
+    def _on_subscription_payment_method_clicked(self) -> None:
+        if not self._subscription_plan_interval():
+            self._subscription_clear_method_selection()
+            self._subscription_reset_payment_details("Choose a plan, then select a payment method.")
+            self._show_toast("Choose monthly or yearly first.")
+            return
+        self._start_subscription_checkout()
+
+    def _subscription_render_payment_display(self, display: Optional[dict], payment: Optional[dict] = None) -> None:
+        if not isinstance(display, dict):
+            self._subscription_reset_payment_details("Payment session created. Follow the payment steps below.")
+            return
+
+        title = str(display.get("title") or "Payment Details").strip() or "Payment Details"
+        message = str(display.get("message") or "").strip() or "Follow the payment steps below."
+        lines = []
+
+        wallet_address = str(display.get("wallet_address") or "").strip()
+        if wallet_address:
+            lines.append(f"Wallet address: {wallet_address}")
+        amount = str(display.get("amount") or "").strip()
+        currency = str(display.get("currency") or "").strip()
+        if amount:
+            amount_line = f"Amount: {amount}"
+            if currency:
+                amount_line = f"{amount_line} {currency}"
+            lines.append(amount_line)
+        network = str(display.get("network") or "").strip()
+        if network:
+            lines.append(f"Network: {network}")
+
+        fields = display.get("fields") if isinstance(display.get("fields"), list) else []
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            label = str(field.get("label") or "").strip()
+            value = str(field.get("value") or "").strip()
+            if label and value:
+                lines.append(f"{label}: {value}")
+
+        checkout_url = str(display.get("checkout_url") or (payment or {}).get("checkout_url") or "").strip()
+
+        self.sub_payment_detail_title.setText(title)
+        self.sub_payment_detail_body.setText(message)
+        self.sub_payment_detail_fields.setText("\n".join(lines))
+        self.sub_payment_detail_link.setText(f"Secure payment page: {checkout_url}" if checkout_url else "")
+
+        qr_data_url = str(display.get("qr_code_data_url") or "").strip()
+        if qr_data_url.startswith("data:image/png;base64,"):
+            try:
+                raw = base64.b64decode(qr_data_url.split(",", 1)[1])
+                pixmap = QtGui.QPixmap()
+                if pixmap.loadFromData(raw, "PNG"):
+                    self.sub_payment_qr_label.setPixmap(
+                        pixmap.scaled(180, 180, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                    )
+                    self.sub_payment_qr_label.show()
+                else:
+                    self.sub_payment_qr_label.clear()
+                    self.sub_payment_qr_label.hide()
+            except Exception:
+                self.sub_payment_qr_label.clear()
+                self.sub_payment_qr_label.hide()
+        else:
+            self.sub_payment_qr_label.clear()
+            self.sub_payment_qr_label.hide()
+
+    def _subscription_parse_deadline_ts(self, raw_value: str) -> float:
+        text = str(raw_value or "").strip()
+        if not text:
+            return 0.0
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).timestamp()
+        except Exception:
+            return 0.0
+
+    def _subscription_start_status_polling(self, *, expires_at: str, interval_sec: int) -> None:
+        deadline_ts = self._subscription_parse_deadline_ts(expires_at)
+        if deadline_ts <= 0.0:
+            deadline_ts = time.time() + 3600.0
+        self._subscription_poll_deadline_ts = deadline_ts
+        self._subscription_poll_success_notified = False
+        self._subscription_status_poll_timer.setInterval(max(3, int(interval_sec or 5)) * 1000)
+        self._subscription_status_poll_timer.start()
+
+    def _subscription_stop_status_polling(self) -> None:
+        try:
+            self._subscription_status_poll_timer.stop()
+        except Exception:
+            pass
+        self._subscription_poll_deadline_ts = 0.0
+        self._subscription_poll_success_notified = False
+
+    def _poll_subscription_status(self) -> None:
+        if bool(getattr(self, "_subscription_status_request_inflight", False)):
+            return
+        deadline_ts = float(getattr(self, "_subscription_poll_deadline_ts", 0.0) or 0.0)
+        if deadline_ts > 0.0 and time.time() >= deadline_ts:
+            self._subscription_stop_status_polling()
+            self.sub_checkout_status.setText("Payment session expired before confirmation. Select a plan and payment method to try again.")
+            return
+        self._refresh_subscription_status(quiet=True, from_poll=True)
 
     def _render_checkout_steps(self, guide: Optional[dict]) -> None:
         if not isinstance(guide, dict):
@@ -24830,21 +25082,28 @@ class MainWindow(QtWidgets.QWidget):
             lines.append(f"{idx}. {str(step or '').strip()}")
         self.sub_steps_label.setText("\n".join(lines))
 
-    def _refresh_subscription_status(self) -> None:
+    def _refresh_subscription_status(self, quiet: bool = False, from_poll: bool = False) -> None:
         payload = self._subscription_identity_payload()
         if not payload:
-            self._show_toast("Missing backend identity. Complete login first.")
+            if not quiet:
+                self._show_toast("Missing backend identity. Complete login first.")
             return
 
+        if bool(getattr(self, "_subscription_status_request_inflight", False)):
+            return
+
+        self._subscription_status_request_inflight = True
         self.sub_refresh_status_btn.setEnabled(False)
 
         def _done(resp: Optional[dict]) -> None:
+            self._subscription_status_request_inflight = False
             try:
                 self.sub_refresh_status_btn.setEnabled(True)
             except Exception:
                 pass
             if not isinstance(resp, dict):
-                self._show_toast("Failed to load subscription status.")
+                if not quiet:
+                    self._show_toast("Failed to load subscription status.")
                 return
             if str(resp.get("status") or "").upper() in {"UPGRADE_REQUIRED", "DEVICE_ID_REQUIRED"}:
                 self.sub_status_label.setText(f"Status: {resp.get('status')}")
@@ -24852,7 +25111,8 @@ class MainWindow(QtWidgets.QWidget):
                 self.sub_legacy_label.setText(f"Update requirement: {msg}")
                 return
             if str(resp.get("status") or "").upper() != "OK":
-                self._show_toast(str(resp.get("message") or "Unable to load subscription status"))
+                if not quiet:
+                    self._show_toast(str(resp.get("message") or "Unable to load subscription status"))
                 return
 
             sub = resp.get("subscription") if isinstance(resp.get("subscription"), dict) else {}
@@ -24878,12 +25138,30 @@ class MainWindow(QtWidgets.QWidget):
             )
 
             guides = resp.get("checkout_guides") if isinstance(resp.get("checkout_guides"), dict) else {}
-            _provider, _method, guide_key = self._subscription_selected_provider()
-            self._render_checkout_steps(guides.get(guide_key))
+            selected = self._subscription_selected_provider()
+            if selected is None:
+                if self._subscription_plan_interval():
+                    self.sub_steps_label.setText("Select a payment option to view payment steps.")
+                else:
+                    self.sub_steps_label.setText("Choose monthly or yearly to continue.")
+            else:
+                _provider, _method, guide_key = selected
+                self._render_checkout_steps(guides.get(guide_key))
+
+            if from_poll:
+                is_active = status_text.lower() == "active" or reason == "subscription_active"
+                if is_active:
+                    self._subscription_stop_status_polling()
+                    self.sub_checkout_status.setText("Payment confirmed automatically. Subscription activated.")
+                    if not bool(getattr(self, "_subscription_poll_success_notified", False)):
+                        self._subscription_poll_success_notified = True
+                        self._show_toast("Payment confirmed. Subscription activated.")
 
         if not self._backend_post_async("/app/subscription/status", payload, on_done=_done, timeout=20.0):
+            self._subscription_status_request_inflight = False
             self.sub_refresh_status_btn.setEnabled(True)
-            self._show_toast("Unable to contact backend.")
+            if not quiet:
+                self._show_toast("Unable to contact backend.")
 
     def _start_subscription_checkout(self) -> None:
         payload = self._subscription_identity_payload()
@@ -24891,31 +25169,34 @@ class MainWindow(QtWidgets.QWidget):
             self._show_toast("Missing backend identity. Complete login first.")
             return
 
-        captcha_token = self._prompt_captcha_token(
-            title="CAPTCHA Verification",
-            prompt="Enter CAPTCHA token to continue checkout:",
-        )
-        if not captcha_token:
+        selected = self._subscription_selected_provider()
+        if selected is None:
+            self._show_toast("Select a payment method first.")
             return
 
-        provider, payment_method, guide_key = self._subscription_selected_provider()
+        plan_interval = self._subscription_plan_interval()
+        if not plan_interval:
+            self._show_toast("Choose monthly or yearly first.")
+            return
+
+        provider, payment_method, guide_key = selected
         payload.update(
             {
                 "provider": provider,
                 "payment_method": payment_method,
-                "plan_interval": self._subscription_plan_interval(),
-                "captcha_token": captcha_token,
+                "plan_interval": plan_interval,
             }
         )
 
-        self.sub_checkout_btn.setEnabled(False)
-        self.sub_checkout_status.setText("Preparing checkout session...")
+        self._subscription_stop_status_polling()
+        self._subscription_last_payment_id = ""
+        self._subscription_last_payment_session_id = ""
+        self._subscription_set_method_buttons_enabled(False)
+        self.sub_checkout_status.setText("Preparing payment session...")
+        self.sub_payment_detail_body.setText("Preparing payment session...")
 
         def _done(resp: Optional[dict]) -> None:
-            try:
-                self.sub_checkout_btn.setEnabled(True)
-            except Exception:
-                pass
+            self._subscription_set_method_buttons_enabled(True)
             if not isinstance(resp, dict):
                 self.sub_checkout_status.setText("Checkout failed: invalid response.")
                 self._show_toast("Checkout failed.")
@@ -24931,87 +25212,454 @@ class MainWindow(QtWidgets.QWidget):
             self._subscription_last_payment_session_id = str(payment.get("payment_session_id") or "").strip()
             checkout_url = str(payment.get("checkout_url") or "").strip()
             expires_at = str(payment.get("expires_at") or "").strip()
-            self.sub_checkout_status.setText(
-                f"Checkout ready via {provider}. Session expires at {expires_at or 'unknown time'}."
-            )
+            self.sub_checkout_status.setText("Payment session ready. Complete payment and wait for automatic confirmation.")
 
             guide = resp.get("guide") if isinstance(resp.get("guide"), dict) else None
             if guide is None:
                 fallback_guides = {
-                    "crypto": {"title": "Crypto checkout", "steps": ["Open checkout URL and complete transfer."]},
-                    "card": {"title": "Card checkout", "steps": ["Open checkout URL and complete card verification."]},
-                    "bank_transfer": {"title": "Bank transfer checkout", "steps": ["Open checkout URL and complete transfer."]},
+                    "crypto": {"title": "Crypto checkout", "steps": ["Send the exact amount to the displayed wallet address."]},
+                    "card": {"title": "Card checkout", "steps": ["Open the secure checkout page and complete card verification."]},
+                    "bank_transfer": {"title": "Bank transfer checkout", "steps": ["Open the secure checkout page and complete the transfer." ]},
                 }
                 guide = fallback_guides.get(guide_key)
             self._render_checkout_steps(guide)
+            display = resp.get("display") if isinstance(resp.get("display"), dict) else None
+
+            # ----------------------------------------------------------
+            # Inline form: card and bank-transfer (Flutterwave only)
+            # ----------------------------------------------------------
+            inline_form_enabled = bool(payment.get("inline_form_enabled", False))
+            flutterwave_public_key = str(payment.get("flutterwave_public_key") or "").strip()
+            customer_email = str(payment.get("customer_email") or "").strip()
+            external_reference = str(payment.get("external_reference") or "").strip()
+            provider_name = str(payment.get("provider") or "").strip().lower()
+            pm = str(payment.get("payment_method") or payment_method or "").strip().lower()
+
+            can_render_inline = (
+                inline_form_enabled
+                and provider_name == "flutterwave"
+                and pm in {"card", "transfer", "bank_transfer", "banktransfer"}
+                and self.sub_payment_web_engine is not None
+                and self._flutterwave_token_bridge is not None
+            )
+            if can_render_inline:
+                # Render the embedded Flutterwave inline checkout form
+                self._subscription_render_payment_display(display, payment)
+                self._render_inline_payment_form(
+                    amount_usd_cents=int(payment.get("amount_usd_cents") or 0),
+                    currency=str(payment.get("currency") or "USD"),
+                    payment_method=pm,
+                    plan_interval=plan_interval,
+                    checkout_session_tx_ref=external_reference,
+                    customer_email=customer_email,
+                    flutterwave_public_key=flutterwave_public_key,
+                )
+                self.sub_checkout_status.setText(
+                    "Enter your payment details in the secure form below. "
+                    "Your card/bank details are tokenized by Flutterwave — FlameBot never touches them."
+                )
+                self._show_toast("Secure payment form loaded.")
+                return
+
+            if inline_form_enabled and provider_name == "flutterwave" and pm in {"card", "transfer", "bank_transfer", "banktransfer"}:
+                self._show_toast("Inline payment requires PyQt WebEngine. Falling back to secure hosted checkout.")
+
+            # ----------------------------------------------------------
+            # Fallback for crypto or when inline form not available
+            # ----------------------------------------------------------
+            self._subscription_render_payment_display(display, payment)
+            self._subscription_start_status_polling(
+                expires_at=expires_at,
+                interval_sec=int(payment.get("poll_interval_sec") or 5),
+            )
 
             if checkout_url:
                 try:
                     webbrowser.open(checkout_url, new=1, autoraise=True)
                 except Exception:
                     pass
-                self._show_toast("Checkout opened in your browser.")
+                self._show_toast("Secure payment page opened in your browser.")
             else:
-                self._show_toast("Checkout session created, but no URL was returned.")
+                self._show_toast("Payment session created. Follow the details shown in the app.")
 
         if not self._backend_post_async("/app/subscription/checkout", payload, on_done=_done, timeout=25.0):
-            self.sub_checkout_btn.setEnabled(True)
+            self._subscription_set_method_buttons_enabled(True)
             self.sub_checkout_status.setText("Unable to contact backend.")
             self._show_toast("Unable to contact backend.")
 
-    def _verify_subscription_payment(self) -> None:
-        payload = self._subscription_identity_payload()
-        if not payload:
-            self._show_toast("Missing backend identity. Complete login first.")
-            return
-        if not self._subscription_last_payment_id and not self._subscription_last_payment_session_id:
-            self._show_toast("Start checkout first to create a payment session.")
+    # ------------------------------------------------------------------
+    # Flutterwave inline payment form (PCI-compliant tokenization)
+    # ------------------------------------------------------------------
+
+    def _generate_flutterwave_inline_html(
+        self,
+        amount_usd: float,
+        currency: str,
+        payment_method: str,
+        plan_label: str,
+    ) -> str:
+        """Generate the HTML/JavaScript for the Flutterwave inline payment form.
+
+        The page:
+        1. Loads qwebchannel.js (Qt built-in)
+        2. Loads Flutterwave inline checkout script
+        3. Presents card or bank-transfer fields
+        4. On completion, sends tokenized payment info to PyQt5 via the bridge
+        """
+        pm = str(payment_method or "").strip().lower()
+        if pm == "card":
+            form_type = "card"
+            payment_options = "card"
+            form_title = "Card Payment"
+            form_hint = "Enter your card details. Your data is tokenized by Flutterwave—never stored by FlameBot."
+        elif pm in {"transfer", "bank_transfer", "banktransfer"}:
+            form_type = "bank_transfer"
+            payment_options = "banktransfer"
+            form_title = "Bank Transfer"
+            form_hint = "Pay via bank transfer. Flutterwave will provide the transfer details securely."
+        else:
+            form_type = "card"
+            payment_options = "card,banktransfer"
+            form_title = "Choose Payment Method"
+            form_hint = "Enter your payment details. Tokenized by Flutterwave's PCI-compliant infrastructure."
+
+        amount_display = f"${amount_usd:.2f} {currency}"
+        safe_plan_label = str(plan_label or "FlameBot Subscription").replace('"', '')
+        safe_form_title = str(form_title).replace('"', '')
+
+        # Build public key JS snippet for Flutterwave init.
+        # The public key is used only for the inline checkout widget (tokenization only).
+        # We read it from any stored config; if absent the form shows an error gracefully.
+        public_key_js = "window.FLW_PUBLIC_KEY || ''"
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FlameBot Payment</title>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="https://checkout.flutterwave.com/v3.js"></script>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f1117;
+      color: #e0e0e0;
+      margin: 0;
+      padding: 16px;
+    }}
+    h2 {{
+      font-size: 17px;
+      color: #f5f5f5;
+      margin-bottom: 4px;
+    }}
+    .hint {{
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 16px;
+    }}
+    .amount-badge {{
+      display: inline-block;
+      padding: 6px 14px;
+      background: #1e2330;
+      border: 1px solid #2f3540;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      color: #7eb9ff;
+      margin-bottom: 16px;
+    }}
+    #pay-btn {{
+      display: block;
+      width: 100%;
+      padding: 12px 0;
+      background: #ff6b35;
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 12px;
+    }}
+    #pay-btn:hover {{ background: #e55a25; }}
+    #pay-btn:disabled {{
+      background: #444;
+      cursor: not-allowed;
+    }}
+    #status-msg {{
+      margin-top: 12px;
+      font-size: 13px;
+      min-height: 36px;
+    }}
+    .err {{ color: #ff6b6b; }}
+    .ok  {{ color: #6bffb8; }}
+    .info {{ color: #aaa; }}
+    .shield-row {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 14px;
+      font-size: 11px;
+      color: #555;
+    }}
+    .shield-row svg {{ flex-shrink: 0; }}
+  </style>
+</head>
+<body>
+  <h2>{safe_form_title}</h2>
+  <p class="hint">{form_hint}</p>
+  <div class="amount-badge">Amount: {amount_display}</div>
+  <br>
+  <button id="pay-btn">Pay {amount_display} · {safe_plan_label}</button>
+  <div id="status-msg" class="info">Ready — click the button above to open the secure payment form.</div>
+  <div class="shield-row">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="#555">
+      <path d="M8 .5l6 2.25V8c0 3.03-2.56 5.51-6 7-3.44-1.49-6-3.97-6-7V2.75L8 .5zm0 1.16L3 3.59V8c0 2.4 2.04 4.52 5 5.84 2.96-1.32 5-3.44 5-5.84V3.59L8 1.66z"/>
+    </svg>
+    Secured by Flutterwave · PCI DSS Level 1 · FlameBot never stores card data
+  </div>
+
+  <script>
+    var _bridge = null;
+
+    // Establish Qt WebChannel bridge
+    new QWebChannel(qt.webChannelTransport, function(channel) {{
+      _bridge = channel.objects.flutterwave_bridge;
+    }});
+
+    function sendToken(token) {{
+      if (_bridge && typeof _bridge.submitToken === 'function') {{
+        _bridge.submitToken(token);
+      }} else {{
+        // Retry once bridge initialises
+        setTimeout(function() {{
+          if (_bridge && typeof _bridge.submitToken === 'function') {{
+            _bridge.submitToken(token);
+          }}
+        }}, 500);
+      }}
+    }}
+
+    function sendError(msg) {{
+      if (_bridge && typeof _bridge.onError === 'function') {{
+        _bridge.onError(msg);
+      }}
+    }}
+
+    function sendCancel() {{
+      if (_bridge && typeof _bridge.onCancel === 'function') {{
+        _bridge.onCancel();
+      }}
+    }}
+
+    function setStatus(msg, cls) {{
+      var el = document.getElementById('status-msg');
+      el.textContent = msg;
+      el.className = cls || 'info';
+    }}
+
+    document.getElementById('pay-btn').addEventListener('click', function() {{
+      var btn = document.getElementById('pay-btn');
+      btn.disabled = true;
+      setStatus('Opening secure payment form...', 'info');
+
+      // Validate Flutterwave SDK is available
+      if (typeof FlutterwaveCheckout === 'undefined') {{
+        setStatus('Payment SDK failed to load. Check your connection and retry.', 'err');
+        btn.disabled = false;
+        return;
+      }}
+
+      FlutterwaveCheckout({{
+        public_key: {public_key_js},
+        tx_ref: window.FLW_TX_REF || ('flamebot-inline-' + Date.now()),
+        amount: {amount_usd:.2f},
+        currency: '{currency}',
+        payment_options: '{payment_options}',
+        customer: {{
+          email: window.FLW_CUSTOMER_EMAIL || 'flamebot@inline.local',
+          name: window.FLW_CUSTOMER_NAME || 'FlameBot User',
+        }},
+        customizations: {{
+          title: 'FlameBot Subscription',
+          description: '{safe_plan_label}',
+          logo: '',
+        }},
+        callback: function(data) {{
+          // data.status: 'successful', 'pending', 'failed'
+          if (data.status === 'successful' || data.status === 'completed') {{
+            setStatus('Payment authorised! Activating subscription...', 'ok');
+            btn.disabled = true;
+            // Send the transaction reference / token to PyQt5
+            var token = data.transaction_id
+              || data.flw_ref
+              || (data.data && (data.data.flw_ref || data.data.id))
+              || JSON.stringify(data);
+            sendToken(String(token));
+          }} else if (data.status === 'pending') {{
+            setStatus('Payment pending. Waiting for confirmation...', 'info');
+            var token = data.transaction_id || data.flw_ref || JSON.stringify(data);
+            sendToken('PENDING:' + String(token));
+            btn.disabled = false;
+          }} else {{
+            setStatus('Payment not completed (' + (data.status || 'unknown') + '). Try again.', 'err');
+            btn.disabled = false;
+            sendError('Payment status: ' + (data.status || 'unknown'));
+          }}
+        }},
+        onclose: function() {{
+          setStatus('Payment window closed. Click the button to try again.', 'info');
+          btn.disabled = false;
+          sendCancel();
+        }},
+      }});
+    }});
+  </script>
+</body>
+</html>"""
+        return html
+
+    def _render_inline_payment_form(
+        self,
+        amount_usd_cents: int,
+        currency: str,
+        payment_method: str,
+        plan_interval: str,
+        checkout_session_tx_ref: str,
+        customer_email: str,
+        flutterwave_public_key: str,
+    ) -> None:
+        """Render the Flutterwave inline payment form in the embedded QWebEngineView.
+
+        Injects configuration (public key, tx_ref, customer details) into
+        the page via JavaScript after it loads, keeping the HTML template generic.
+        """
+        if self.sub_payment_web_engine is None:
+            self.sub_checkout_status.setText("Inline payment form is unavailable on this build.")
             return
 
-        captcha_token = self._prompt_captcha_token(
-            title="CAPTCHA Verification",
-            prompt="Enter CAPTCHA token to verify payment:",
+        amount_usd = round(float(amount_usd_cents) / 100.0, 2)
+        pm = str(payment_method or "").strip().lower()
+        plan_label = f"FlameBot {'Yearly' if 'year' in plan_interval else 'Monthly'} Plan"
+
+        html = self._generate_flutterwave_inline_html(
+            amount_usd=amount_usd,
+            currency=str(currency or "USD"),
+            payment_method=pm,
+            plan_label=plan_label,
         )
-        if not captcha_token:
-            return
 
-        payload["captcha_token"] = captcha_token
-        if self._subscription_last_payment_id:
-            payload["payment_id"] = self._subscription_last_payment_id
-        if self._subscription_last_payment_session_id:
-            payload["payment_session_id"] = self._subscription_last_payment_session_id
-
-        self.sub_verify_payment_btn.setEnabled(False)
-        self.sub_checkout_status.setText("Checking payment status...")
-
-        def _done(resp: Optional[dict]) -> None:
+        # Inject runtime variables via loadFinished signal + runJavaScript
+        def _inject_config() -> None:
+            inject_js = f"""
+                window.FLW_PUBLIC_KEY = {json.dumps(str(flutterwave_public_key or ''))};
+                window.FLW_TX_REF = {json.dumps(str(checkout_session_tx_ref or ''))};
+                window.FLW_CUSTOMER_EMAIL = {json.dumps(str(customer_email or 'flamebot@inline.local'))};
+                window.FLW_CUSTOMER_NAME = 'FlameBot User';
+            """
             try:
-                self.sub_verify_payment_btn.setEnabled(True)
+                self.sub_payment_web_engine.page().runJavaScript(inject_js)
             except Exception:
                 pass
+
+        try:
+            self.sub_payment_web_engine.loadFinished.disconnect()
+        except TypeError:
+            pass
+        self.sub_payment_web_engine.loadFinished.connect(lambda _ok: _inject_config())
+
+        # Show the web engine and hide static labels for card/bank methods
+        self.sub_payment_web_engine.show()
+        self.sub_payment_detail_fields.hide()
+        self.sub_payment_detail_link.hide()
+        self.sub_payment_qr_label.hide()
+
+        self.sub_payment_web_engine.setHtml(html, QtCore.QUrl("https://flamebot.local/"))
+
+    def _on_flutterwave_token_received(self, token: str) -> None:
+        """Handle a tokenized payment result coming back from the inline JS form."""
+        token = str(token or "").strip()
+        if not token:
+            self._on_flutterwave_token_error("Received empty token from payment form.")
+            return
+
+        # Determine if the token signals a pending transaction
+        is_pending = token.startswith("PENDING:")
+        clean_token = token[len("PENDING:"):] if is_pending else token
+
+        payment_session_id = str(getattr(self, "_subscription_last_payment_session_id", "") or "").strip()
+        if not payment_session_id:
+            self.sub_checkout_status.setText("Token received but no active payment session. Contact support.")
+            return
+
+        selected = self._subscription_selected_provider()
+        payment_method = selected[1] if selected else ""
+        identity_payload = self._subscription_identity_payload()
+        if not identity_payload:
+            self.sub_checkout_status.setText("Missing identity. Please log in and retry.")
+            return
+
+        self.sub_checkout_status.setText("Submitting token to backend for verification...")
+        self._subscription_set_method_buttons_enabled(False)
+
+        charge_payload = {
+            **identity_payload,
+            "payment_session_id": payment_session_id,
+            "token": clean_token,
+            "payment_method": payment_method,
+        }
+
+        def _charge_done(resp: Optional[dict]) -> None:
+            self._subscription_set_method_buttons_enabled(True)
             if not isinstance(resp, dict):
-                self.sub_checkout_status.setText("Payment verification failed.")
+                self.sub_checkout_status.setText("Charge failed: no response from backend.")
                 self._show_toast("Payment verification failed.")
                 return
-            status = str(resp.get("status") or "").strip().upper()
-            payment_status = str(resp.get("payment_status") or "").strip().lower()
-            if status == "OK" and payment_status in {"paid", ""}:
-                self.sub_checkout_status.setText("Payment confirmed.")
-                self._show_toast("Payment confirmed. Subscription activated.")
-                self._refresh_subscription_status()
-                return
-            if status in {"PENDING", "OK"} and payment_status == "pending":
-                self.sub_checkout_status.setText("Payment still pending. Please wait and retry.")
-                self._show_toast("Payment is still pending.")
-                return
-            msg = str(resp.get("message") or payment_status or status or "Verification failed").strip()
-            self.sub_checkout_status.setText(f"Verification result: {msg}")
-            self._show_toast(msg)
 
-        if not self._backend_post_async("/app/subscription/verify_payment", payload, on_done=_done, timeout=25.0):
-            self.sub_verify_payment_btn.setEnabled(True)
-            self.sub_checkout_status.setText("Unable to contact backend.")
+            status = str(resp.get("status") or "").upper()
+            if status == "OK":
+                # Subscription already activated; stop polling and notify
+                self._subscription_stop_status_polling()
+                self._subscription_poll_success_notified = True
+                self.sub_checkout_status.setText("Payment confirmed! Your subscription is now active.")
+                self._show_toast("Subscription activated!")
+                self._refresh_subscription_status()
+                try:
+                    self.sub_payment_web_engine.setHtml(
+                        "<html><body style='background:#0f1117;color:#6bffb8;"
+                        "font-family:sans-serif;padding:24px;text-align:center'>"
+                        "<h2>Payment Confirmed!</h2><p>Your subscription is now active.</p></body></html>",
+                        QtCore.QUrl("https://flamebot.local/"),
+                    )
+                except Exception:
+                    pass
+            elif status == "PENDING":
+                # Payment is pending (webhook not yet arrived); keep polling
+                self.sub_checkout_status.setText("Payment submitted. Waiting for provider confirmation...")
+                self._show_toast("Payment submitted — waiting for confirmation.")
+            else:
+                msg = str(resp.get("message") or "Charge failed.").strip()
+                self.sub_checkout_status.setText(f"Charge failed: {msg}")
+                self._show_toast(msg)
+
+        if not self._backend_post_async(
+            "/app/subscription/charge-token",
+            charge_payload,
+            on_done=_charge_done,
+            timeout=30.0,
+        ):
+            self._subscription_set_method_buttons_enabled(True)
+            self.sub_checkout_status.setText("Unable to contact backend for charge.")
             self._show_toast("Unable to contact backend.")
+
+    def _on_flutterwave_token_error(self, error_msg: str) -> None:
+        """Handle errors reported by the inline JS payment form."""
+        msg = str(error_msg or "Payment form error.").strip()
+        self.sub_checkout_status.setText(f"Payment error: {msg}")
+        self._show_toast(msg)
+        self._subscription_set_method_buttons_enabled(True)
 
     def _on_wizard_account_selected(self, acct: str) -> None:
         """Handle account selection from the compact settings flow.

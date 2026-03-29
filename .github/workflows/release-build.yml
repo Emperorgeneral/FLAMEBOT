@@ -90,12 +90,28 @@ jobs:
           path: dist/FlameBot-Windows.zip
           if-no-files-found: error
 
+      - name: Upload release artifact (Windows installer)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows-installer
+          path: dist/FlameBot-Setup-v*.exe
+          if-no-files-found: error
+
       - name: Upload release artifact (macOS zip)
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: release-assets-macos
+          name: release-assets-macos-zip
           path: dist/FlameBot-macOS.zip
+          if-no-files-found: error
+
+      - name: Upload release artifact (macOS dmg)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-macos-dmg
+          path: dist/FlameBot-macOS.dmg
           if-no-files-found: error
 
   release:
@@ -121,7 +137,9 @@ jobs:
         with:
           token: ${{ secrets.RELEASE_TOKEN || github.token }}
           files: |
+            release/FlameBot-Setup-v*.exe
             release/FlameBot-Windows.zip
+            release/FlameBot-macOS.dmg
             release/FlameBot-macOS.zip
 
       - name: Create release (workflow dispatch)
@@ -133,5 +151,7 @@ jobs:
           name: ${{ inputs.tag }}
           draft: true
           files: |
+            release/FlameBot-Setup-v*.exe
             release/FlameBot-Windows.zip
+            release/FlameBot-macOS.dmg
             release/FlameBot-macOS.zip

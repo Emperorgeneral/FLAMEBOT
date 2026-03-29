@@ -41,12 +41,20 @@ jobs:
           path: dist/FlameBot-macOS.zip
           if-no-files-found: error
 
+      - name: Upload artifact (DMG)
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlameBot-macOS-arm64-dmg
+          path: dist/FlameBot-macOS.dmg
+          if-no-files-found: error
+
       - name: Attach to GitHub Release (if tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/FlameBot-macOS.zip
+            dist/FlameBot-macOS.dmg
           tag_name: ${{ github.ref_name }}
           fail_on_unmatched_files: true
         env:

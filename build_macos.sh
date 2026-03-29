@@ -9,6 +9,8 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 echo "[1/4] Installing deps"
 "$PYTHON_BIN" -m pip install --upgrade pip
 "$PYTHON_BIN" -m pip install -r requirements.txt
+echo "[1/4] Verifying critical runtime modules"
+"$PYTHON_BIN" -c "import PyQt5, PyQt5.QtWebEngineWidgets, PyQt5.QtWebChannel, telethon; print('Dependency check OK')"
 
 echo "[2/4] Building with PyInstaller (macOS)"
 ENTRY="app/flamebot_entry.py"
@@ -20,6 +22,12 @@ PYI_ARGS=(
   --clean
   --name FlameBot
   --windowed
+  --hidden-import PyQt5.QtWebEngineWidgets
+  --hidden-import PyQt5.QtWebEngineCore
+  --hidden-import PyQt5.QtWebChannel
+  --collect-all PyQt5.QtWebEngineWidgets
+  --collect-all PyQt5.QtWebEngineCore
+  --collect-all PyQt5.QtWebChannel
   --add-data "eas:eas"
   --add-data "app/country.json:."
   --add-data "app/splash.png:."
@@ -41,9 +49,15 @@ cp -R "dist/FlameBot.app" "dist/FlameBot-macOS/FlameBot.app"
 cp -R "eas" "dist/FlameBot-macOS/eas"
 cp -f "README-Install-mac.txt" "dist/FlameBot-macOS/README-Install-mac.txt"
 
-echo "[4/4] Creating zip"
+echo "[4/4] Creating zip and DMG"
 cd dist
 rm -f "FlameBot-macOS.zip"
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "FlameBot-macOS" "FlameBot-macOS.zip"
 
+rm -f "FlameBot-macOS.dmg" "tmp.dmg"
+/usr/bin/hdiutil create -volname "FlameBot" -srcfolder "FlameBot-macOS" -fs HFS+ -format UDRW tmp.dmg
+/usr/bin/hdiutil convert tmp.dmg -format UDZO -imagekey zlib-level=9 -o "FlameBot-macOS.dmg"
+rm -f "tmp.dmg"
+
 echo "Done: dist/FlameBot-macOS.zip"
+echo "Done: dist/FlameBot-macOS.dmg"

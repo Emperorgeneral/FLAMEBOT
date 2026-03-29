@@ -49,8 +49,8 @@ import ctypes
 from ctypes import wintypes
 from PyQt5 import QtCore, QtGui, QtWidgets
 try:
-    from PyQt5.QtWebEngineWidgets import QWebEngineView
-    from PyQt5.QtWebChannel import QWebChannel
+    from PyQt5.QtWebEngineWidgets import QWebEngineView  # type: ignore[reportMissingImports]
+    from PyQt5.QtWebChannel import QWebChannel  # type: ignore[reportMissingImports]
     _HAS_QT_WEBENGINE = True
 except Exception:
     QWebEngineView = None  # type: ignore[assignment]
@@ -12619,6 +12619,8 @@ class MainWindow(QtWidgets.QWidget):
 
         self._subscription_last_payment_id = ""
         self._subscription_last_payment_session_id = ""
+        self._subscription_primary_contact_email = ""
+        self._subscription_requires_primary_email = True
         self._subscription_status_request_inflight = False
         self._subscription_poll_deadline_ts = 0.0
         self._subscription_poll_success_notified = False
@@ -24993,7 +24995,8 @@ class MainWindow(QtWidgets.QWidget):
         if network:
             lines.append(f"Network: {network}")
 
-        fields = display.get("fields") if isinstance(display.get("fields"), list) else []
+        raw_fields = display.get("fields")
+        fields: List[dict] = raw_fields if isinstance(raw_fields, list) else []
         for field in fields:
             if not isinstance(field, dict):
                 continue
@@ -25118,6 +25121,12 @@ class MainWindow(QtWidgets.QWidget):
             sub = resp.get("subscription") if isinstance(resp.get("subscription"), dict) else {}
             settings = resp.get("settings") if isinstance(resp.get("settings"), dict) else {}
             pricing = resp.get("pricing") if isinstance(resp.get("pricing"), dict) else {}
+            contact = resp.get("contact") if isinstance(resp.get("contact"), dict) else {}
+
+            primary_email = str(contact.get("primary_email") or "").strip().lower()
+            requires_primary_email = bool(contact.get("requires_primary_email", not bool(primary_email)))
+            self._subscription_primary_contact_email = primary_email
+            self._subscription_requires_primary_email = requires_primary_email
 
             status_text = str(sub.get("status") or "unknown").strip() or "unknown"
             reason = str(sub.get("reason") or "").strip()
@@ -25136,6 +25145,9 @@ class MainWindow(QtWidgets.QWidget):
             self.sub_pricing_label.setText(
                 f"Pricing: ${monthly / 100:.2f} monthly / ${yearly / 100:.2f} yearly"
             )
+
+            if requires_primary_email and not from_poll:
+                self.sub_checkout_status.setText("Before payment, enter your Gmail address for receipts and subscription notifications.")
 
             guides = resp.get("checkout_guides") if isinstance(resp.get("checkout_guides"), dict) else {}
             selected = self._subscription_selected_provider()
@@ -25163,6 +25175,32 @@ class MainWindow(QtWidgets.QWidget):
             if not quiet:
                 self._show_toast("Unable to contact backend.")
 
+    def _subscription_is_valid_gmail(self, email: str) -> bool:
+        value = str(email or "").strip().lower()
+        return bool(re.fullmatch(r"[a-z0-9._%+-]+@gmail\.com", value))
+
+    def _subscription_prompt_primary_email(self, *, current_email: str = "") -> Optional[str]:
+        seed = str(current_email or "").strip().lower()
+        while True:
+            entered, ok = QtWidgets.QInputDialog.getText(
+                self,
+                "Primary Contact Email",
+                "Enter your Gmail address to continue to payment.\nThis will be used for receipts and subscription notifications.",
+                QtWidgets.QLineEdit.Normal,
+                seed,
+            )
+            if not ok:
+                return None
+            normalized = str(entered or "").strip().lower()
+            if self._subscription_is_valid_gmail(normalized):
+                return normalized
+            seed = normalized
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid Gmail",
+                "Please enter a valid Gmail address (example@gmail.com).",
+            )
+
     def _start_subscription_checkout(self) -> None:
         payload = self._subscription_identity_payload()
         if not payload:
@@ -25188,104 +25226,143 @@ class MainWindow(QtWidgets.QWidget):
             }
         )
 
-        self._subscription_stop_status_polling()
-        self._subscription_last_payment_id = ""
-        self._subscription_last_payment_session_id = ""
-        self._subscription_set_method_buttons_enabled(False)
-        self.sub_checkout_status.setText("Preparing payment session...")
-        self.sub_payment_detail_body.setText("Preparing payment session...")
+        cached_email = str(getattr(self, "_subscription_primary_contact_email", "") or "").strip().lower()
+        requires_primary = bool(getattr(self, "_subscription_requires_primary_email", False)) or not bool(cached_email)
 
-        def _done(resp: Optional[dict]) -> None:
-            self._subscription_set_method_buttons_enabled(True)
-            if not isinstance(resp, dict):
-                self.sub_checkout_status.setText("Checkout failed: invalid response.")
-                self._show_toast("Checkout failed.")
-                return
-            if str(resp.get("status") or "").upper() != "OK":
-                msg = str(resp.get("message") or "Checkout failed").strip()
-                self.sub_checkout_status.setText(f"Checkout failed: {msg}")
-                self._show_toast(msg)
-                return
+        def _run_checkout(checkout_payload: dict) -> None:
+            self._subscription_stop_status_polling()
+            self._subscription_last_payment_id = ""
+            self._subscription_last_payment_session_id = ""
+            self._subscription_set_method_buttons_enabled(False)
+            self.sub_checkout_status.setText("Preparing payment session...")
+            self.sub_payment_detail_body.setText("Preparing payment session...")
 
-            payment = resp.get("payment") if isinstance(resp.get("payment"), dict) else {}
-            self._subscription_last_payment_id = str(payment.get("id") or "").strip()
-            self._subscription_last_payment_session_id = str(payment.get("payment_session_id") or "").strip()
-            checkout_url = str(payment.get("checkout_url") or "").strip()
-            expires_at = str(payment.get("expires_at") or "").strip()
-            self.sub_checkout_status.setText("Payment session ready. Complete payment and wait for automatic confirmation.")
+            def _done(resp: Optional[dict]) -> None:
+                self._subscription_set_method_buttons_enabled(True)
+                if not isinstance(resp, dict):
+                    self.sub_checkout_status.setText("Checkout failed: invalid response.")
+                    self._show_toast("Checkout failed.")
+                    return
+                response_status = str(resp.get("status") or "").upper()
+                if response_status != "OK":
+                    msg = str(resp.get("message") or "Checkout failed").strip()
+                    self.sub_checkout_status.setText(f"Checkout failed: {msg}")
+                    if response_status == "EMAIL_REQUIRED":
+                        self._subscription_requires_primary_email = True
+                    self._show_toast(msg)
+                    return
 
-            guide = resp.get("guide") if isinstance(resp.get("guide"), dict) else None
-            if guide is None:
-                fallback_guides = {
-                    "crypto": {"title": "Crypto checkout", "steps": ["Send the exact amount to the displayed wallet address."]},
-                    "card": {"title": "Card checkout", "steps": ["Open the secure checkout page and complete card verification."]},
-                    "bank_transfer": {"title": "Bank transfer checkout", "steps": ["Open the secure checkout page and complete the transfer." ]},
-                }
-                guide = fallback_guides.get(guide_key)
-            self._render_checkout_steps(guide)
-            display = resp.get("display") if isinstance(resp.get("display"), dict) else None
+                payment = resp.get("payment") if isinstance(resp.get("payment"), dict) else {}
+                self._subscription_last_payment_id = str(payment.get("id") or "").strip()
+                self._subscription_last_payment_session_id = str(payment.get("payment_session_id") or "").strip()
+                checkout_url = str(payment.get("checkout_url") or "").strip()
+                expires_at = str(payment.get("expires_at") or "").strip()
+                self.sub_checkout_status.setText("Payment session ready. Complete payment and wait for automatic confirmation.")
 
-            # ----------------------------------------------------------
-            # Inline form: card and bank-transfer (Flutterwave only)
-            # ----------------------------------------------------------
-            inline_form_enabled = bool(payment.get("inline_form_enabled", False))
-            flutterwave_public_key = str(payment.get("flutterwave_public_key") or "").strip()
-            customer_email = str(payment.get("customer_email") or "").strip()
-            external_reference = str(payment.get("external_reference") or "").strip()
-            provider_name = str(payment.get("provider") or "").strip().lower()
-            pm = str(payment.get("payment_method") or payment_method or "").strip().lower()
+                guide = resp.get("guide") if isinstance(resp.get("guide"), dict) else None
+                if guide is None:
+                    fallback_guides = {
+                        "crypto": {"title": "Crypto checkout", "steps": ["Send the exact amount to the displayed wallet address."]},
+                        "card": {"title": "Card checkout", "steps": ["Open the secure checkout page and complete card verification."]},
+                        "bank_transfer": {"title": "Bank transfer checkout", "steps": ["Open the secure checkout page and complete the transfer."]},
+                    }
+                    guide = fallback_guides.get(guide_key)
+                self._render_checkout_steps(guide)
+                display = resp.get("display") if isinstance(resp.get("display"), dict) else None
 
-            can_render_inline = (
-                inline_form_enabled
-                and provider_name == "flutterwave"
-                and pm in {"card", "transfer", "bank_transfer", "banktransfer"}
-                and self.sub_payment_web_engine is not None
-                and self._flutterwave_token_bridge is not None
-            )
-            if can_render_inline:
-                # Render the embedded Flutterwave inline checkout form
+                inline_form_enabled = bool(payment.get("inline_form_enabled", False))
+                flutterwave_public_key = str(payment.get("flutterwave_public_key") or "").strip()
+                customer_email = str(payment.get("customer_email") or "").strip()
+                external_reference = str(payment.get("external_reference") or "").strip()
+                provider_name = str(payment.get("provider") or "").strip().lower()
+                pm = str(payment.get("payment_method") or payment_method or "").strip().lower()
+
+                can_render_inline = (
+                    inline_form_enabled
+                    and provider_name == "flutterwave"
+                    and pm in {"card", "transfer", "bank_transfer", "banktransfer"}
+                    and self.sub_payment_web_engine is not None
+                    and self._flutterwave_token_bridge is not None
+                )
+                if can_render_inline:
+                    self._subscription_render_payment_display(display, payment)
+                    self._render_inline_payment_form(
+                        amount_usd_cents=int(payment.get("amount_usd_cents") or 0),
+                        currency=str(payment.get("currency") or "USD"),
+                        payment_method=pm,
+                        plan_interval=plan_interval,
+                        checkout_session_tx_ref=external_reference,
+                        customer_email=customer_email,
+                        flutterwave_public_key=flutterwave_public_key,
+                    )
+                    self.sub_checkout_status.setText(
+                        "Enter your payment details in the secure form below. "
+                        "Your card/bank details are tokenized by Flutterwave — FlameBot never touches them."
+                    )
+                    self._show_toast("Secure payment form loaded.")
+                    return
+
+                if inline_form_enabled and provider_name == "flutterwave" and pm in {"card", "transfer", "bank_transfer", "banktransfer"}:
+                    self._show_toast("Inline payment requires PyQt WebEngine. Falling back to secure hosted checkout.")
+
                 self._subscription_render_payment_display(display, payment)
-                self._render_inline_payment_form(
-                    amount_usd_cents=int(payment.get("amount_usd_cents") or 0),
-                    currency=str(payment.get("currency") or "USD"),
-                    payment_method=pm,
-                    plan_interval=plan_interval,
-                    checkout_session_tx_ref=external_reference,
-                    customer_email=customer_email,
-                    flutterwave_public_key=flutterwave_public_key,
+                self._subscription_start_status_polling(
+                    expires_at=expires_at,
+                    interval_sec=int(payment.get("poll_interval_sec") or 5),
                 )
-                self.sub_checkout_status.setText(
-                    "Enter your payment details in the secure form below. "
-                    "Your card/bank details are tokenized by Flutterwave — FlameBot never touches them."
-                )
-                self._show_toast("Secure payment form loaded.")
+
+                if checkout_url:
+                    try:
+                        webbrowser.open(checkout_url, new=1, autoraise=True)
+                    except Exception:
+                        pass
+                    self._show_toast("Secure payment page opened in your browser.")
+                else:
+                    self._show_toast("Payment session created. Follow the details shown in the app.")
+
+            if not self._backend_post_async("/app/subscription/checkout", checkout_payload, on_done=_done, timeout=25.0):
+                self._subscription_set_method_buttons_enabled(True)
+                self.sub_checkout_status.setText("Unable to contact backend.")
+                self._show_toast("Unable to contact backend.")
+
+        if requires_primary:
+            entered_email = self._subscription_prompt_primary_email(current_email=cached_email)
+            if not entered_email:
+                self.sub_checkout_status.setText("Checkout paused. Gmail address is required before payment.")
+                self._show_toast("Payment canceled.")
                 return
 
-            if inline_form_enabled and provider_name == "flutterwave" and pm in {"card", "transfer", "bank_transfer", "banktransfer"}:
-                self._show_toast("Inline payment requires PyQt WebEngine. Falling back to secure hosted checkout.")
+            save_payload = self._subscription_identity_payload()
+            if not save_payload:
+                self._show_toast("Missing backend identity. Complete login first.")
+                return
+            save_payload["email"] = entered_email
 
-            # ----------------------------------------------------------
-            # Fallback for crypto or when inline form not available
-            # ----------------------------------------------------------
-            self._subscription_render_payment_display(display, payment)
-            self._subscription_start_status_polling(
-                expires_at=expires_at,
-                interval_sec=int(payment.get("poll_interval_sec") or 5),
-            )
+            self._subscription_set_method_buttons_enabled(False)
+            self.sub_checkout_status.setText("Saving contact email...")
 
-            if checkout_url:
-                try:
-                    webbrowser.open(checkout_url, new=1, autoraise=True)
-                except Exception:
-                    pass
-                self._show_toast("Secure payment page opened in your browser.")
-            else:
-                self._show_toast("Payment session created. Follow the details shown in the app.")
+            def _email_saved(resp: Optional[dict]) -> None:
+                self._subscription_set_method_buttons_enabled(True)
+                if not isinstance(resp, dict) or str(resp.get("status") or "").upper() != "OK":
+                    msg = "Unable to save contact email."
+                    if isinstance(resp, dict):
+                        msg = str(resp.get("message") or msg).strip() or msg
+                    self.sub_checkout_status.setText(msg)
+                    self._show_toast(msg)
+                    return
+                self._subscription_primary_contact_email = entered_email
+                self._subscription_requires_primary_email = False
+                payload["contact_email"] = entered_email
+                _run_checkout(payload)
 
-        if not self._backend_post_async("/app/subscription/checkout", payload, on_done=_done, timeout=25.0):
-            self._subscription_set_method_buttons_enabled(True)
-            self.sub_checkout_status.setText("Unable to contact backend.")
-            self._show_toast("Unable to contact backend.")
+            if not self._backend_post_async("/app/subscription/contact-email", save_payload, on_done=_email_saved, timeout=20.0):
+                self._subscription_set_method_buttons_enabled(True)
+                self.sub_checkout_status.setText("Unable to contact backend.")
+                self._show_toast("Unable to contact backend.")
+            return
+
+        payload["contact_email"] = cached_email
+        _run_checkout(payload)
 
     # ------------------------------------------------------------------
     # Flutterwave inline payment form (PCI-compliant tokenization)

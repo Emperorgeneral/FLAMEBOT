@@ -8,6 +8,7 @@ const state = {
   overview: null,
   analytics: null,
   subscriptionSettings: null,
+  plans: [],
   ambassadors: [],
   users: [],
   userCounts: null,
@@ -46,6 +47,15 @@ const elements = {
   subscriptionMinVersion: document.getElementById('subscription-min-version'),
   subscriptionProviderReadiness: document.getElementById('subscription-provider-readiness'),
   subscriptionSettingsSave: document.getElementById('subscription-settings-save'),
+  planCreateForm: document.getElementById('plan-create-form'),
+  planCode: document.getElementById('plan-code'),
+  planDisplayName: document.getElementById('plan-display-name'),
+  planDurationDays: document.getElementById('plan-duration-days'),
+  planPriceCents: document.getElementById('plan-price-cents'),
+  planSortOrder: document.getElementById('plan-sort-order'),
+  planIsActive: document.getElementById('plan-is-active'),
+  planCreateBtn: document.getElementById('plan-create-btn'),
+  plansTableBody: document.getElementById('plans-table-body'),
   growthTrend: document.getElementById('growth-trend'),
   recentUsersBody: document.getElementById('recent-users-body'),
   miniAdminForm: document.getElementById('mini-admin-form'),
@@ -319,6 +329,48 @@ function renderSubscriptionSettings() {
   if (elements.subscriptionProviderReadiness) {
     elements.subscriptionProviderReadiness.value = JSON.stringify(providers, null, 2);
   }
+  // Plans may be embedded in the settings response.
+  if (Array.isArray(state.subscriptionSettings?.plans)) {
+    state.plans = state.subscriptionSettings.plans;
+  }
+  renderPlans();
+}
+
+function renderPlans() {
+  if (!elements.plansTableBody) return;
+  const plans = state.plans || [];
+  if (!plans.length) {
+    elements.plansTableBody.innerHTML = '<tr><td colspan="6" class="subtle">No plans yet. Create one above.</td></tr>';
+    return;
+  }
+  elements.plansTableBody.innerHTML = plans
+    .map(
+      (plan) => `
+        <tr>
+          <td><strong>${escapeHtml(plan.plan_code)}</strong></td>
+          <td>${escapeHtml(plan.display_name)}</td>
+          <td>${escapeHtml(plan.duration_days)}</td>
+          <td>$${escapeHtml((plan.price_usd_cents / 100).toFixed(2))}</td>
+          <td><span class="statusPill" data-status="${plan.is_active ? 'paid' : 'pre_registered'}">${plan.is_active ? 'Active' : 'Inactive'}</span></td>
+          <td>
+            <button class="rowButton" data-plan-toggle="${escapeHtml(plan.id)}" data-plan-active="${plan.is_active}" type="button">${plan.is_active ? 'Deactivate' : 'Activate'}</button>
+            <button class="rowButton" data-plan-edit="${escapeHtml(plan.id)}" type="button">Edit price</button>
+            <button class="rowButton" data-plan-delete="${escapeHtml(plan.id)}" type="button">Delete</button>
+          </td>
+        </tr>
+      `,
+    )
+    .join('');
+
+  elements.plansTableBody.querySelectorAll('[data-plan-toggle]').forEach((btn) => {
+    btn.addEventListener('click', () => handlePlanToggle(btn.dataset.planToggle, btn.dataset.planActive !== 'true'));
+  });
+  elements.plansTableBody.querySelectorAll('[data-plan-edit]').forEach((btn) => {
+    btn.addEventListener('click', () => handlePlanEditPrice(btn.dataset.planEdit));
+  });
+  elements.plansTableBody.querySelectorAll('[data-plan-delete]').forEach((btn) => {
+    btn.addEventListener('click', () => handlePlanDelete(btn.dataset.planDelete));
+  });
 }
 
 function renderAmbassadorOptions() {
@@ -649,6 +701,91 @@ async function handleRefresh() {
   }
 }
 
+async function reloadPlans() {
+  try {
+    const data = await api('/admin/subscription/plans');
+    state.plans = data.plans || [];
+    renderPlans();
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function handlePlanCreate(event) {
+  event.preventDefault();
+  try {
+    setButtonBusy(elements.planCreateBtn, true, 'Create plan', 'Creating...');
+    const payload = {
+      plan_code: String(elements.planCode?.value || '').trim().toLowerCase(),
+      display_name: String(elements.planDisplayName?.value || '').trim(),
+      duration_days: Number(elements.planDurationDays?.value || 0),
+      price_usd_cents: Number(elements.planPriceCents?.value || 0),
+      sort_order: Number(elements.planSortOrder?.value || 0),
+      is_active: String(elements.planIsActive?.value || 'true') === 'true',
+    };
+    await api('/admin/subscription/plans', { method: 'POST', body: payload });
+    elements.planCreateForm?.reset();
+    await reloadPlans();
+    showToast('Plan created.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    setButtonBusy(elements.planCreateBtn, false, 'Create plan', 'Creating...');
+  }
+}
+
+async function handlePlanToggle(planId, setActive) {
+  try {
+    const data = await api(`/admin/subscription/plans/${encodeURIComponent(planId)}`, {
+      method: 'PATCH',
+      body: { is_active: setActive },
+    });
+    state.plans = state.plans.map((p) => (p.id === planId ? data.plan : p));
+    renderPlans();
+    showToast(`Plan ${setActive ? 'activated' : 'deactivated'}.`);
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function handlePlanEditPrice(planId) {
+  const plan = state.plans.find((p) => p.id === planId);
+  if (!plan) return;
+  const currentCents = plan.price_usd_cents;
+  const input = window.prompt(`Update price for "${plan.display_name}" (enter USD cents, e.g. 1000 = $10.00):`, String(currentCents));
+  if (input === null) return;
+  const newCents = Number(input);
+  if (!Number.isFinite(newCents) || newCents < 0) {
+    showToast('Invalid price. Enter a non-negative integer in cents.', 'error');
+    return;
+  }
+  try {
+    const data = await api(`/admin/subscription/plans/${encodeURIComponent(planId)}`, {
+      method: 'PATCH',
+      body: { price_usd_cents: Math.round(newCents) },
+    });
+    state.plans = state.plans.map((p) => (p.id === planId ? data.plan : p));
+    renderPlans();
+    showToast('Plan price updated.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function handlePlanDelete(planId) {
+  const plan = state.plans.find((p) => p.id === planId);
+  if (!plan) return;
+  if (!window.confirm(`Delete plan "${plan.display_name}" (${plan.plan_code})? This cannot be undone.`)) return;
+  try {
+    await api(`/admin/subscription/plans/${encodeURIComponent(planId)}`, { method: 'DELETE' });
+    state.plans = state.plans.filter((p) => p.id !== planId);
+    renderPlans();
+    showToast('Plan deleted.');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
 async function handleSubscriptionSettingsSubmit(event) {
   event.preventDefault();
   try {
@@ -867,6 +1004,7 @@ function bindEvents() {
   elements.userEditorForm.addEventListener('submit', handleUserUpdate);
   elements.clearReferrerButton.addEventListener('click', clearReferrer);
   elements.subscriptionSettingsForm?.addEventListener('submit', handleSubscriptionSettingsSubmit);
+  elements.planCreateForm?.addEventListener('submit', handlePlanCreate);
   elements.navButtons.forEach((button) => {
     button.addEventListener('click', async () => {
       const nextView = button.dataset.view;

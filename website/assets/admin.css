@@ -392,6 +392,10 @@ button {
   max-width: 100%;
 }
 
+.plansTableWrap {
+  margin-top: 16px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

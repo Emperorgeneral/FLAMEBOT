@@ -1785,7 +1785,7 @@ def post_backend_json(base_url: str, path: str, payload: dict, timeout: float = 
     request = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": "FlameBot/1.0"},
         method="POST",
     )
     # Retry a couple times on transient network errors.
@@ -2423,6 +2423,7 @@ class _BackendRegisterTask(QtCore.QRunnable):
                         "Content-Type": "application/json",
                         "Accept": "application/json",
                         "Connection": "keep-alive",
+                        "User-Agent": "FlameBot/1.0",
                     }
                     conn.request("POST", p, body=body, headers=headers)
                     resp = conn.getresponse()
@@ -12580,6 +12581,8 @@ class MainWindow(QtWidgets.QWidget):
         self._subscription_last_payment_session_id = ""
         self._subscription_primary_contact_email = ""
         self._subscription_requires_primary_email = True
+        self._profile_email_prompt_shown = False
+        self._profile_email_check_inflight = False
         self._subscription_status_request_inflight = False
         self._subscription_poll_deadline_ts = 0.0
         self._subscription_poll_success_notified = False
@@ -14076,6 +14079,10 @@ class MainWindow(QtWidgets.QWidget):
                         pass
                 try:
                     self._fetch_user_app_state()
+                except Exception:
+                    pass
+                try:
+                    self._ensure_profile_contact_email_prompt()
                 except Exception:
                     pass
                 return
@@ -20194,7 +20201,7 @@ class MainWindow(QtWidgets.QWidget):
         request = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": "FlameBot/1.0"},
             method="POST",
         )
         try:
@@ -23151,6 +23158,11 @@ class MainWindow(QtWidgets.QWidget):
         except Exception as e:
             self._dev_log("fetch_user_app_state_failed", str(e), exc=e)
 
+        try:
+            self._ensure_profile_contact_email_prompt()
+        except Exception:
+            pass
+
         # Verified: unblock the app.
         try:
             self._hide_verification_overlay()
@@ -24874,19 +24886,46 @@ class MainWindow(QtWidgets.QWidget):
         return device_id
 
     def _subscription_identity_payload(self) -> Optional[dict]:
-        auth = self._backend_auth_params()
+        # Subscription APIs should tolerate account-tab drift by using any valid
+        # license available for the current platform (fallback to selected account).
+        platform_key = (getattr(self, "platform", None) or "mt5").lower()
+        if platform_key not in {"mt4", "mt5"}:
+            platform_key = "mt5"
+
+        auth = self._resolve_backend_auth_for_platform(platform_key) or self._backend_auth_params()
         if not auth:
             return None
+
+        flamebot_id = str(auth.get("user_id") or "").strip() or str((getattr(self, "flamebot_ids", {}) or {}).get(platform_key, "") or "").strip()
+        license_key = str(auth.get("license_key") or "").strip()
+        if not license_key:
+            try:
+                lic_map = (getattr(self, "licenses_by_platform", {}) or {}).get(platform_key, {}) or {}
+                selected = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop") or "prop"
+                license_key = str(lic_map.get(selected) or "").strip()
+                if not license_key:
+                    for acct in ("prop", "normal"):
+                        candidate = str(lic_map.get(acct) or "").strip()
+                        if candidate:
+                            license_key = candidate
+                            break
+            except Exception:
+                license_key = ""
+
+        if not flamebot_id or not license_key:
+            return None
+
         try:
             app_version = str((self.settings.get("app_version") if isinstance(self.settings, dict) else None) or "1.0").strip() or "1.0"
         except Exception:
             app_version = "1.0"
+
         payload = {
-            "user_id": str(auth.get("user_id") or "").strip(),
-            "flamebot_id": str(auth.get("user_id") or "").strip(),
-            "license_key": str(auth.get("license_key") or "").strip(),
-            "platform": str(auth.get("platform") or "").strip().lower(),
-            "account_type": str(auth.get("account_type") or "prop").strip().lower(),
+            "user_id": flamebot_id,
+            "flamebot_id": flamebot_id,
+            "license_key": license_key,
+            "platform": platform_key,
+            "account_type": self._normalize_account_type(auth.get("account_type") or getattr(self, "current_account_type", None) or "prop") or "prop",
             "app_version": app_version,
             "device_id": self._subscription_device_id(),
         }
@@ -25185,6 +25224,62 @@ class MainWindow(QtWidgets.QWidget):
                 "Please enter a valid Gmail address (example@gmail.com).",
             )
 
+    def _ensure_profile_contact_email_prompt(self, *, force: bool = False) -> None:
+        if bool(getattr(self, "_profile_email_check_inflight", False)):
+            return
+
+        if bool(getattr(self, "_profile_email_prompt_shown", False)) and not force:
+            return
+
+        payload = self._subscription_identity_payload()
+        if not payload:
+            return
+
+        self._profile_email_check_inflight = True
+
+        def _done(resp: Optional[dict]) -> None:
+            self._profile_email_check_inflight = False
+            if not isinstance(resp, dict) or str(resp.get("status") or "").upper() != "OK":
+                return
+
+            contact = resp.get("contact") if isinstance(resp.get("contact"), dict) else {}
+            primary_email = str(contact.get("primary_email") or "").strip().lower()
+            requires_primary_email = bool(contact.get("requires_primary_email", not bool(primary_email)))
+
+            self._subscription_primary_contact_email = primary_email
+            self._subscription_requires_primary_email = requires_primary_email
+
+            if not requires_primary_email:
+                return
+
+            # Prompt once per session unless explicitly forced.
+            self._profile_email_prompt_shown = True
+            entered_email = self._subscription_prompt_primary_email(current_email=primary_email)
+            if not entered_email:
+                self._show_toast("Email setup skipped. You can add it later from the next prompt.")
+                return
+
+            save_payload = self._subscription_identity_payload()
+            if not save_payload:
+                return
+            save_payload["email"] = entered_email
+
+            def _saved(save_resp: Optional[dict]) -> None:
+                if not isinstance(save_resp, dict) or str(save_resp.get("status") or "").upper() != "OK":
+                    msg = "Unable to save contact email."
+                    if isinstance(save_resp, dict):
+                        msg = str(save_resp.get("message") or msg).strip() or msg
+                    self._show_toast(msg)
+                    return
+
+                self._subscription_primary_contact_email = entered_email
+                self._subscription_requires_primary_email = False
+                self._show_toast("Email saved successfully.")
+
+            self._backend_post_async("/app/profile/contact-email", save_payload, on_done=_saved, timeout=20.0)
+
+        self._backend_post_async("/app/profile/contact-email/status", payload, on_done=_done, timeout=20.0)
+
     def _start_subscription_checkout(self) -> None:
         payload = self._subscription_identity_payload()
         if not payload:
@@ -25278,39 +25373,8 @@ class MainWindow(QtWidgets.QWidget):
                 self._show_toast("Unable to contact backend.")
 
         if requires_primary:
-            entered_email = self._subscription_prompt_primary_email(current_email=cached_email)
-            if not entered_email:
-                self.sub_checkout_status.setText("Checkout paused. Gmail address is required before payment.")
-                self._show_toast("Payment canceled.")
-                return
-
-            save_payload = self._subscription_identity_payload()
-            if not save_payload:
-                self._show_toast("Missing backend identity. Complete login first.")
-                return
-            save_payload["email"] = entered_email
-
-            self._subscription_set_method_buttons_enabled(False)
-            self.sub_checkout_status.setText("Saving contact email...")
-
-            def _email_saved(resp: Optional[dict]) -> None:
-                self._subscription_set_method_buttons_enabled(True)
-                if not isinstance(resp, dict) or str(resp.get("status") or "").upper() != "OK":
-                    msg = "Unable to save contact email."
-                    if isinstance(resp, dict):
-                        msg = str(resp.get("message") or msg).strip() or msg
-                    self.sub_checkout_status.setText(msg)
-                    self._show_toast(msg)
-                    return
-                self._subscription_primary_contact_email = entered_email
-                self._subscription_requires_primary_email = False
-                payload["contact_email"] = entered_email
-                _run_checkout(payload)
-
-            if not self._backend_post_async("/app/subscription/contact-email", save_payload, on_done=_email_saved, timeout=20.0):
-                self._subscription_set_method_buttons_enabled(True)
-                self.sub_checkout_status.setText("Unable to contact backend.")
-                self._show_toast("Unable to contact backend.")
+            self.sub_checkout_status.setText("Add your contact email first to continue with payment.")
+            self._ensure_profile_contact_email_prompt(force=True)
             return
 
         payload["contact_email"] = cached_email

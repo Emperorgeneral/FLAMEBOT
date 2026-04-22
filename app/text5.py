@@ -6754,7 +6754,7 @@ class TelegramWorker(QtCore.QThread):
             connection_retries=5,
             device_model="FlameBot",
             system_version="Windows 10",
-            app_version=_resolve_client_app_version((self.settings or {}).get("app_version") if isinstance(self.settings, dict) else None),
+            app_version=str(FLAMEBOT_APP_VERSION or "1.0"),
             lang_code="en",
         )
         await self.client.connect()

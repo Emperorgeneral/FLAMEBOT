@@ -12954,6 +12954,15 @@ class MainWindow(QtWidgets.QWidget):
         self._toast_timer.start(duration_ms)
 
     def _toggle_drawer(self, open_drawer: Optional[bool] = None) -> None:
+        if bool(getattr(self, "_profile_email_gate_locked", False)):
+            try:
+                if bool(getattr(self, "_drawer_open", False)):
+                    self._drawer_open = False
+                    self.drawer_overlay.hide()
+                    self.drawer.hide()
+            except Exception:
+                pass
+            return
         target_state = not self._drawer_open if open_drawer is None else open_drawer
         self._drawer_open = target_state
         if self._drawer_open:
@@ -13011,6 +13020,10 @@ class MainWindow(QtWidgets.QWidget):
             self._recenter_verification_dialog()
         except Exception:
             pass
+        try:
+            self._recenter_profile_email_dialog()
+        except Exception:
+            pass
         # Reflow symbol grid on resize so columns adapt to new width
         try:
             if hasattr(self, "symbol_container") and getattr(self, "_symbol_list_updating", False) is False:
@@ -13024,6 +13037,55 @@ class MainWindow(QtWidgets.QWidget):
         try:
             if event.type() == QtCore.QEvent.WindowStateChange:
                 QtCore.QTimer.singleShot(0, self._recenter_verification_dialog)
+                QtCore.QTimer.singleShot(0, self._recenter_profile_email_dialog)
+        except Exception:
+            pass
+
+    def _recenter_profile_email_dialog(self) -> None:
+        dlg = getattr(self, "_profile_email_prompt_dialog", None)
+        if dlg is None:
+            return
+        try:
+            if not dlg.isVisible():
+                return
+        except Exception:
+            return
+        try:
+            if self.isMinimized():
+                return
+        except Exception:
+            pass
+
+        try:
+            geo = self.geometry()
+            x = int(geo.x() + (geo.width() - dlg.width()) / 2)
+            y = int(geo.y() + (geo.height() - dlg.height()) / 2)
+        except Exception:
+            return
+
+        try:
+            screen = None
+            try:
+                screen = QtWidgets.QApplication.screenAt(geo.center())
+            except Exception:
+                screen = None
+            if screen is None:
+                try:
+                    screen = QtWidgets.QApplication.primaryScreen()
+                except Exception:
+                    screen = None
+
+            if screen is not None:
+                avail = screen.availableGeometry()
+                max_x = int(avail.x() + max(0, avail.width() - dlg.width()))
+                max_y = int(avail.y() + max(0, avail.height() - dlg.height()))
+                x = min(max(int(avail.x()), x), max_x)
+                y = min(max(int(avail.y()), y), max_y)
+        except Exception:
+            pass
+
+        try:
+            dlg.move(int(x), int(y))
         except Exception:
             pass
 
@@ -25170,7 +25232,7 @@ class MainWindow(QtWidgets.QWidget):
                 self._subscription_update_plan_buttons(plans_list)
 
             if requires_primary_email and not from_poll:
-                self.sub_checkout_status.setText("Before payment, enter your Gmail address for receipts and subscription notifications.")
+                self.sub_checkout_status.setText("Before payment, enter your email address for receipts and subscription notifications.")
 
             guides = resp.get("checkout_guides") if isinstance(resp.get("checkout_guides"), dict) else {}
             selected = self._subscription_selected_provider()
@@ -25198,31 +25260,142 @@ class MainWindow(QtWidgets.QWidget):
             if not quiet:
                 self._show_toast("Unable to contact backend.")
 
-    def _subscription_is_valid_gmail(self, email: str) -> bool:
+    def _subscription_is_valid_email(self, email: str) -> bool:
         value = str(email or "").strip().lower()
-        return bool(re.fullmatch(r"[a-z0-9._%+-]+@gmail\.com", value))
+        return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value))
 
-    def _subscription_prompt_primary_email(self, *, current_email: str = "") -> Optional[str]:
-        seed = str(current_email or "").strip().lower()
-        while True:
-            entered, ok = QtWidgets.QInputDialog.getText(
-                self,
-                "Primary Contact Email",
-                "Enter your Gmail address to continue to payment.\nThis will be used for receipts and subscription notifications.",
-                QtWidgets.QLineEdit.Normal,
-                seed,
-            )
-            if not ok:
-                return None
-            normalized = str(entered or "").strip().lower()
-            if self._subscription_is_valid_gmail(normalized):
-                return normalized
-            seed = normalized
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Invalid Gmail",
-                "Please enter a valid Gmail address (example@gmail.com).",
-            )
+    def _apply_profile_email_gate_lock(self, locked: bool) -> None:
+        self._profile_email_gate_locked = bool(locked)
+        target = getattr(self, "main_stack", None)
+        if target is None:
+            return
+        try:
+            if locked:
+                if getattr(self, "_profile_email_gate_prev_main_stack_enabled", None) is None:
+                    self._profile_email_gate_prev_main_stack_enabled = bool(target.isEnabled())
+                target.setEnabled(False)
+            else:
+                prev = getattr(self, "_profile_email_gate_prev_main_stack_enabled", None)
+                self._profile_email_gate_prev_main_stack_enabled = None
+                if prev is None:
+                    target.setEnabled(True)
+                else:
+                    target.setEnabled(bool(prev))
+        except Exception:
+            pass
+        try:
+            menu_btn = getattr(self, "menu_button", None)
+            if menu_btn is not None:
+                if locked:
+                    if getattr(self, "_profile_email_gate_prev_menu_enabled", None) is None:
+                        self._profile_email_gate_prev_menu_enabled = bool(menu_btn.isEnabled())
+                    menu_btn.setEnabled(False)
+                    if bool(getattr(self, "_drawer_open", False)):
+                        self._toggle_drawer(False)
+                else:
+                    prev_menu = getattr(self, "_profile_email_gate_prev_menu_enabled", None)
+                    self._profile_email_gate_prev_menu_enabled = None
+                    if prev_menu is None:
+                        menu_btn.setEnabled(True)
+                    else:
+                        menu_btn.setEnabled(bool(prev_menu))
+        except Exception:
+            pass
+
+    def _subscription_prompt_primary_email(
+        self,
+        *,
+        current_email: str = "",
+        on_email: Optional[Callable[[str], None]] = None,
+        current_first_name: str = "",
+        current_last_name: str = "",
+    ) -> None:
+        seed_email = str(current_email or "").strip().lower()
+        seed_first = str(current_first_name or "").strip()
+        seed_last = str(current_last_name or "").strip()
+        existing = getattr(self, "_profile_email_prompt_dialog", None)
+        if isinstance(existing, QtWidgets.QDialog):
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Primary Contact Info")
+        dlg.setWindowFlags(
+            QtCore.Qt.Dialog
+            | QtCore.Qt.CustomizeWindowHint
+            | QtCore.Qt.WindowTitleHint
+        )
+        dlg.setModal(False)
+        dlg.setMinimumWidth(420)
+        dlg.resize(460, 310)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(10)
+
+        label = QtWidgets.QLabel("Enter your contact information to continue.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        first_name_edit = QtWidgets.QLineEdit(seed_first)
+        first_name_edit.setPlaceholderText("First Name *")
+        first_name_edit.setMinimumHeight(36)
+        layout.addWidget(first_name_edit)
+
+        last_name_edit = QtWidgets.QLineEdit(seed_last)
+        last_name_edit.setPlaceholderText("Last Name (optional)")
+        last_name_edit.setMinimumHeight(36)
+        layout.addWidget(last_name_edit)
+
+        email_edit = QtWidgets.QLineEdit(seed_email)
+        email_edit.setPlaceholderText("Email Address *")
+        email_edit.setMinimumHeight(36)
+        layout.addWidget(email_edit)
+
+        btn_ok = QtWidgets.QPushButton("Save")
+        btn_ok.setMinimumHeight(36)
+        layout.addWidget(btn_ok)
+
+        self._profile_email_prompt_dialog = dlg
+
+        def _clear_dialog_ref() -> None:
+            if getattr(self, "_profile_email_prompt_dialog", None) is dlg:
+                self._profile_email_prompt_dialog = None
+
+        def _submit() -> None:
+            first_name = str(first_name_edit.text() or "").strip()
+            last_name = str(last_name_edit.text() or "").strip()
+            normalized_email = str(email_edit.text() or "").strip().lower()
+            if not first_name:
+                QtWidgets.QMessageBox.warning(self, "Missing Name", "Please enter your first name.")
+                first_name_edit.setFocus()
+                return
+            if not self._subscription_is_valid_email(normalized_email):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid Email",
+                    "Please enter a valid email address (example@domain.com).",
+                )
+                email_edit.setFocus()
+                return
+
+            _clear_dialog_ref()
+            dlg.accept()
+            if callable(on_email):
+                on_email(normalized_email, first_name, last_name)
+
+        btn_ok.clicked.connect(_submit)
+        email_edit.returnPressed.connect(_submit)
+        dlg.finished.connect(lambda _=0: _clear_dialog_ref())
+        dlg.show()
+        try:
+            self._recenter_profile_email_dialog()
+        except Exception:
+            pass
+        if seed_first:
+            email_edit.setFocus()
+        else:
+            first_name_edit.setFocus()
 
     def _ensure_profile_contact_email_prompt(self, *, force: bool = False) -> None:
         if bool(getattr(self, "_profile_email_check_inflight", False)):
@@ -25244,39 +25417,73 @@ class MainWindow(QtWidgets.QWidget):
 
             contact = resp.get("contact") if isinstance(resp.get("contact"), dict) else {}
             primary_email = str(contact.get("primary_email") or "").strip().lower()
+            stored_first_name = str(contact.get("first_name") or "").strip()
+            stored_last_name = str(contact.get("last_name") or "").strip()
             requires_primary_email = bool(contact.get("requires_primary_email", not bool(primary_email)))
+            requires_first_name = bool(contact.get("requires_first_name", not bool(stored_first_name)))
 
             self._subscription_primary_contact_email = primary_email
             self._subscription_requires_primary_email = requires_primary_email
+            self._subscription_contact_first_name = stored_first_name
 
-            if not requires_primary_email:
+            if not requires_primary_email and not requires_first_name:
+                self._apply_profile_email_gate_lock(False)
                 return
 
             # Prompt once per session unless explicitly forced.
             self._profile_email_prompt_shown = True
-            entered_email = self._subscription_prompt_primary_email(current_email=primary_email)
-            if not entered_email:
-                self._show_toast("Email setup skipped. You can add it later from the next prompt.")
-                return
+            self._apply_profile_email_gate_lock(True)
 
-            save_payload = self._subscription_identity_payload()
-            if not save_payload:
-                return
-            save_payload["email"] = entered_email
-
-            def _saved(save_resp: Optional[dict]) -> None:
-                if not isinstance(save_resp, dict) or str(save_resp.get("status") or "").upper() != "OK":
-                    msg = "Unable to save contact email."
-                    if isinstance(save_resp, dict):
-                        msg = str(save_resp.get("message") or msg).strip() or msg
-                    self._show_toast(msg)
+            def _on_email_entered(entered_email: str, entered_first_name: str, entered_last_name: str) -> None:
+                save_payload = self._subscription_identity_payload()
+                if not save_payload:
+                    self._show_toast("Missing backend identity. Please wait and try again.")
+                    self._subscription_prompt_primary_email(
+                        current_email=entered_email,
+                        current_first_name=entered_first_name,
+                        current_last_name=entered_last_name,
+                        on_email=_on_email_entered,
+                    )
                     return
+                save_payload["email"] = entered_email
+                save_payload["first_name"] = entered_first_name
+                save_payload["last_name"] = entered_last_name
 
-                self._subscription_primary_contact_email = entered_email
-                self._subscription_requires_primary_email = False
-                self._show_toast("Email saved successfully.")
+                def _saved(save_resp: Optional[dict]) -> None:
+                    if not isinstance(save_resp, dict) or str(save_resp.get("status") or "").upper() != "OK":
+                        msg = "Unable to save contact info."
+                        if isinstance(save_resp, dict):
+                            msg = str(save_resp.get("message") or msg).strip() or msg
+                        self._show_toast(msg)
+                        self._subscription_prompt_primary_email(
+                            current_email=entered_email,
+                            current_first_name=entered_first_name,
+                            current_last_name=entered_last_name,
+                            on_email=_on_email_entered,
+                        )
+                        return
 
-            self._backend_post_async("/app/profile/contact-email", save_payload, on_done=_saved, timeout=20.0)
+                    saved_contact = save_resp.get("contact") if isinstance(save_resp.get("contact"), dict) else {}
+                    self._subscription_primary_contact_email = entered_email
+                    self._subscription_requires_primary_email = False
+                    self._subscription_contact_first_name = entered_first_name
+                    self._apply_profile_email_gate_lock(False)
+                    prompt_dlg = getattr(self, "_profile_email_prompt_dialog", None)
+                    if isinstance(prompt_dlg, QtWidgets.QDialog):
+                        try:
+                            prompt_dlg.accept()
+                        except Exception:
+                            pass
+                    self._show_toast("Contact info saved successfully.")
+
+                self._backend_post_async("/app/profile/contact-email", save_payload, on_done=_saved, timeout=20.0)
+
+            self._subscription_prompt_primary_email(
+                current_email=primary_email,
+                current_first_name=stored_first_name,
+                current_last_name=stored_last_name,
+                on_email=_on_email_entered,
+            )
 
         self._backend_post_async("/app/profile/contact-email/status", payload, on_done=_done, timeout=20.0)
 
@@ -25305,9 +25512,6 @@ class MainWindow(QtWidgets.QWidget):
                 "plan_interval": self._subscription_plan_interval(),  # backwards compat
             }
         )
-
-        cached_email = str(getattr(self, "_subscription_primary_contact_email", "") or "").strip().lower()
-        requires_primary = bool(getattr(self, "_subscription_requires_primary_email", False)) or not bool(cached_email)
 
         def _run_checkout(checkout_payload: dict) -> None:
             self._subscription_stop_status_polling()
@@ -25372,13 +25576,42 @@ class MainWindow(QtWidgets.QWidget):
                 self.sub_checkout_status.setText("Unable to contact backend.")
                 self._show_toast("Unable to contact backend.")
 
-        if requires_primary:
-            self.sub_checkout_status.setText("Add your contact email first to continue with payment.")
-            self._ensure_profile_contact_email_prompt(force=True)
+        status_payload = self._subscription_identity_payload()
+        if not status_payload:
+            self._show_toast("Missing backend identity. Complete login first.")
             return
 
-        payload["contact_email"] = cached_email
-        _run_checkout(payload)
+        self.sub_checkout_status.setText("Checking contact email status...")
+
+        def _after_status(resp: Optional[dict]) -> None:
+            if not isinstance(resp, dict) or str(resp.get("status") or "").upper() != "OK":
+                self.sub_checkout_status.setText("Unable to verify contact email. Please retry.")
+                self._show_toast("Unable to verify contact email.")
+                return
+
+            contact = resp.get("contact") if isinstance(resp.get("contact"), dict) else {}
+            primary_email = str(contact.get("primary_email") or "").strip().lower()
+            stored_first_name = str(contact.get("first_name") or "").strip()
+            requires_primary_email = bool(contact.get("requires_primary_email", not bool(primary_email)))
+            requires_first_name = bool(contact.get("requires_first_name", not bool(stored_first_name)))
+
+            self._subscription_primary_contact_email = primary_email
+            self._subscription_requires_primary_email = requires_primary_email
+            self._subscription_contact_first_name = stored_first_name
+
+            if requires_primary_email or requires_first_name:
+                self.sub_checkout_status.setText("Add your contact info first to continue with payment.")
+                self._ensure_profile_contact_email_prompt(force=True)
+                return
+
+            checkout_payload = dict(payload)
+            checkout_payload["contact_email"] = primary_email
+            _run_checkout(checkout_payload)
+
+        if not self._backend_post_async("/app/profile/contact-email/status", status_payload, on_done=_after_status, timeout=20.0):
+            self.sub_checkout_status.setText("Unable to verify contact email. Please retry.")
+            self._show_toast("Unable to contact backend.")
+            return
 
         # Payments are hosted-only. The app never renders card/bank forms or collects payment details.
 

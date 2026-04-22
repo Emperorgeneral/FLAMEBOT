@@ -45,6 +45,11 @@ from typing import Any, Awaitable, Callable, Coroutine, Deque, Dict, List, Optio
 import copy
 from collections import OrderedDict, deque
 
+try:
+    from version import APP_VERSION as FLAMEBOT_APP_VERSION
+except Exception:
+    FLAMEBOT_APP_VERSION = "1.0"
+
 import ctypes
 from ctypes import wintypes
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -116,6 +121,26 @@ APP_STATE_STUCK_SEC = float(os.environ.get("FLAMEBOT_APP_STATE_STUCK_SEC", "20")
 # Splash should remain visible long enough for the full intro UX.
 # Default: 25 seconds (matches the old FlameApp behavior you requested).
 SPLASH_MIN_VISIBLE_MS = int(os.environ.get("FLAMEBOT_SPLASH_MIN_VISIBLE_MS", "25000"))
+
+
+def _coarse_version_tuple(value: str) -> Tuple[int, int, int]:
+    text_v = str(value or "").strip()
+    match = re.match(r"^\s*(\d+)\.(\d+)(?:\.(\d+))?", text_v)
+    if not match:
+        return (0, 0, 0)
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+
+
+def _resolve_client_app_version(settings_value: Any = None) -> str:
+    env_override = str(os.environ.get("FLAMEBOT_APP_VERSION") or "").strip()
+    if env_override:
+        return env_override
+
+    settings_version = str(settings_value or "").strip()
+    packaged_version = str(FLAMEBOT_APP_VERSION or "1.0").strip() or "1.0"
+    if _coarse_version_tuple(settings_version) >= _coarse_version_tuple(packaged_version):
+        return settings_version or packaged_version
+    return packaged_version
 
 
 @contextlib.contextmanager
@@ -6729,7 +6754,7 @@ class TelegramWorker(QtCore.QThread):
             connection_retries=5,
             device_model="FlameBot",
             system_version="Windows 10",
-            app_version="1.0",
+            app_version=_resolve_client_app_version((self.settings or {}).get("app_version") if isinstance(self.settings, dict) else None),
             lang_code="en",
         )
         await self.client.connect()
@@ -12451,10 +12476,10 @@ class MainWindow(QtWidgets.QWidget):
         sub_plan_row_layout = QtWidgets.QHBoxLayout(sub_plan_row)
         sub_plan_row_layout.setContentsMargins(0, 0, 0, 0)
         sub_plan_row_layout.setSpacing(10)
-        self.sub_plan_month_btn = QtWidgets.QPushButton("Monthly - $10")
+        self.sub_plan_month_btn = QtWidgets.QPushButton("Monthly - loading...")
         self.sub_plan_month_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.sub_plan_month_btn.setCheckable(True)
-        self.sub_plan_year_btn = QtWidgets.QPushButton("Yearly - $100")
+        self.sub_plan_year_btn = QtWidgets.QPushButton("Yearly - loading...")
         self.sub_plan_year_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.sub_plan_year_btn.setCheckable(True)
         sub_plan_row_layout.addWidget(self.sub_plan_month_btn)
@@ -15639,7 +15664,9 @@ class MainWindow(QtWidgets.QWidget):
 
         title = QtWidgets.QLabel("FlameBot Telegram Copier")
         title.setStyleSheet("font-weight: 700; font-size: 15px;")
-        version = QtWidgets.QLabel("Version: v1.0")
+        version = QtWidgets.QLabel(
+            f"Version: v{_resolve_client_app_version((self.settings or {}).get('app_version') if isinstance(self.settings, dict) else None)}"
+        )
         build_mode = QtWidgets.QLabel(
             "Build: Packaged (.exe/.app)" if bool(getattr(sys, "frozen", False)) else "Build: Source (python)"
         )
@@ -24978,9 +25005,10 @@ class MainWindow(QtWidgets.QWidget):
             return None
 
         try:
-            app_version = str((self.settings.get("app_version") if isinstance(self.settings, dict) else None) or "1.0").strip() or "1.0"
+            settings_app_version = self.settings.get("app_version") if isinstance(self.settings, dict) else None
         except Exception:
-            app_version = "1.0"
+            settings_app_version = None
+        app_version = _resolve_client_app_version(settings_app_version)
 
         payload = {
             "user_id": flamebot_id,
@@ -25193,6 +25221,10 @@ class MainWindow(QtWidgets.QWidget):
                 self.sub_status_label.setText(f"Status: {resp.get('status')}")
                 msg = str(resp.get("message") or "Action required").strip()
                 self.sub_legacy_label.setText(f"Update requirement: {msg}")
+                pricing = resp.get("pricing") if isinstance(resp.get("pricing"), dict) else {}
+                plans_list = pricing.get("plans") if isinstance(pricing.get("plans"), list) else []
+                if plans_list:
+                    self._subscription_update_plan_buttons(plans_list)
                 return
             if str(resp.get("status") or "").upper() != "OK":
                 if not quiet:
@@ -25221,15 +25253,27 @@ class MainWindow(QtWidgets.QWidget):
             self.sub_legacy_label.setText(
                 f"Update requirement: min version {str(settings.get('min_supported_app_version') or 'n/a')}"
             )
-            monthly = int(pricing.get("monthly_usd_cents") or 1000)
-            yearly = int(pricing.get("yearly_usd_cents") or 10000)
-            self.sub_pricing_label.setText(
-                f"Pricing: ${monthly / 100:.2f} monthly / ${yearly / 100:.2f} yearly"
-            )
+            monthly_raw = pricing.get("monthly_usd_cents")
+            yearly_raw = pricing.get("yearly_usd_cents")
+            if monthly_raw is not None and yearly_raw is not None:
+                monthly = int(monthly_raw)
+                yearly = int(yearly_raw)
+                self.sub_pricing_label.setText(
+                    f"Pricing: ${monthly / 100:.2f} monthly / ${yearly / 100:.2f} yearly"
+                )
+            else:
+                self.sub_pricing_label.setText("Pricing: unavailable")
             # Update plan button labels dynamically from DB-sourced plans list.
             plans_list = pricing.get("plans") if isinstance(pricing.get("plans"), list) else []
             if plans_list:
                 self._subscription_update_plan_buttons(plans_list)
+            elif monthly_raw is not None and yearly_raw is not None:
+                monthly = int(monthly_raw)
+                yearly = int(yearly_raw)
+                self.sub_plan_month_btn.setText(f"Monthly - ${monthly / 100:.2f}")
+                self.sub_plan_year_btn.setText(f"Yearly - ${yearly / 100:.2f}")
+                self.sub_plan_month_btn._plan_code = "monthly"  # type: ignore[attr-defined]
+                self.sub_plan_year_btn._plan_code = "yearly"  # type: ignore[attr-defined]
 
             if requires_primary_email and not from_poll:
                 self.sub_checkout_status.setText("Before payment, enter your email address for receipts and subscription notifications.")

@@ -659,6 +659,28 @@ QT_GLOBAL_MAX_THREADS = _env_int("FLAMEBOT_QT_POOL_MAX_THREADS", 16)
 # on slower connections/VPNs and can cause intermittent "handshake timed out".
 DEFAULT_HTTP_TIMEOUT = float(os.environ.get("FLAMEBOT_HTTP_TIMEOUT", "8"))
 
+# Menu-only gate for Virtual Terminal while backend rollout stabilizes.
+# Keep implementation code intact; this only changes menu behavior/text.
+VT_MENU_COMING_SOON = os.environ.get("FLAMEBOT_VT_MENU_COMING_SOON", "1") == "1"
+
+# Virtual Terminal broker server presets.
+# Users can still type any custom server string from their broker account.
+VT_BROKER_SERVER_PRESETS: List[Tuple[str, str]] = [
+    ("Use custom server (type manually)", ""),
+    ("Exness - Trial (example)", "Exness-MT5Trial9"),
+    ("Exness (CY) Ltd", "ExnessCY"),
+    ("Exness (KE) Limited", "ExnessKE"),
+    ("Exness (MU) Ltd", "ExnessMU"),
+    ("Exness (SC) Ltd", "ExnessSC"),
+    ("Exness (UK) Ltd", "ExnessUK"),
+    ("Exness (VG) Ltd", "ExnessVG"),
+    ("Exness B.V.", "ExnessBV"),
+    ("Exness Investment Bank Limited", "ExnessInvestmentBankLtd"),
+    ("Exness Limited Jordan LLC", "ExnessJO"),
+    ("IC Markets (example)", "ICMarketsSC-Demo"),
+    ("Pepperstone (example)", "Pepperstone-Demo"),
+]
+
 
 def _prepare_chat_render_entries(items: Sequence[object]) -> List[Tuple[str, str, str, bool, str]]:
     prepared: List[Tuple[str, str, str, bool, str]] = []
@@ -1457,6 +1479,38 @@ class _NetworkProbeSignals(QtCore.QObject):
     finished = QtCore.pyqtSignal(int, bool, str)  # seq, online, detail
 
 
+def _safe_qt_emit(signal: Any, *args: Any) -> bool:
+    """Emit a Qt signal defensively.
+
+    Background QRunnable tasks can outlive their receiver during teardown.
+    In that case Qt raises RuntimeError("wrapped C/C++ object ... has been deleted").
+    Treat that as a benign race and avoid crashing the app.
+    """
+    try:
+        signal.emit(*args)
+        return True
+    except RuntimeError as e:
+        msg = str(e or "")
+        low = msg.lower()
+        if "wrapped c/c++ object" in low or "has been deleted" in low:
+            try:
+                logging.getLogger("flame_ui").debug("Dropped late Qt signal emit: %s", msg)
+            except Exception:
+                pass
+            return False
+        try:
+            logging.getLogger("flame_ui").error("Qt signal emit RuntimeError: %s", msg)
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        try:
+            logging.getLogger("flame_ui").error("Qt signal emit failed: %s", e)
+        except Exception:
+            pass
+        return False
+
+
 class _NetworkProbeTask(QtCore.QRunnable):
     def __init__(self, seq: int, timeout_sec: float = 0.8) -> None:
         super().__init__()
@@ -1517,7 +1571,7 @@ class _NetworkProbeTask(QtCore.QRunnable):
         except Exception as e:
             online = False
             detail = f"{e.__class__.__name__}: {e}"
-        self.signals.finished.emit(self.seq, bool(online), str(detail or ""))
+        _safe_qt_emit(self.signals.finished, self.seq, bool(online), str(detail or ""))
 
 
 class NetworkStateManager(QtCore.QObject):
@@ -2128,9 +2182,9 @@ class _BackendPollTask(QtCore.QRunnable):
                 responses["get_symbol_settings"] = post_backend_json(self.backend_url, "get_symbol_settings", self.auth_params, timeout=self.timeout)
             if "get_psl_settings" in requested:
                 responses["get_psl_settings"] = post_backend_json(self.backend_url, "get_psl_settings", self.auth_params, timeout=self.timeout)
-            self.signals.finished.emit(self.seq, self.auth_params, responses)
+            _safe_qt_emit(self.signals.finished, self.seq, self.auth_params, responses)
         except Exception as e:
-            self.signals.error.emit(self.seq, self.auth_params, str(e))
+            _safe_qt_emit(self.signals.error, self.seq, self.auth_params, str(e))
 
 
 class _BackendMultiPostSignals(QtCore.QObject):
@@ -2153,9 +2207,9 @@ class _BackendMultiPostTask(QtCore.QRunnable):
             results: Dict[str, Optional[dict]] = {}
             for path, payload in self.posts:
                 results[path] = post_backend_json(self.backend_url, path, payload, timeout=self.timeout)
-            self.signals.finished.emit(self.seq, results)
+            _safe_qt_emit(self.signals.finished, self.seq, results)
         except Exception as e:
-            self.signals.error.emit(self.seq, str(e))
+            _safe_qt_emit(self.signals.error, self.seq, str(e))
 
 
 class _BackendRegisterSignals(QtCore.QObject):
@@ -2568,7 +2622,7 @@ class _BackendRegisterTask(QtCore.QRunnable):
                         if bool(retryable):
                             _sleep_with_cancel(2.0)
                             continue
-                        self.signals.error.emit(self.seq, dict(self.context), str(nonce_err or "Registration challenge failed"))
+                        _safe_qt_emit(self.signals.error, self.seq, dict(self.context), str(nonce_err or "Registration challenge failed"))
                         return
 
                     # Update shared state so the UI click can always open the latest URL.
@@ -2589,7 +2643,8 @@ class _BackendRegisterTask(QtCore.QRunnable):
 
                     # Inform UI about the current verification link.
                     try:
-                        self.signals.challenge.emit(
+                        _safe_qt_emit(
+                            self.signals.challenge,
                             self.seq,
                             dict(self.context),
                             {
@@ -2619,7 +2674,7 @@ class _BackendRegisterTask(QtCore.QRunnable):
                     # Otherwise: link expired without user action; loop regenerates a new one.
             else:
                 # No event means no way to proceed safely.
-                self.signals.error.emit(self.seq, dict(self.context), "Telegram verification is not ready. Please retry.")
+                _safe_qt_emit(self.signals.error, self.seq, dict(self.context), "Telegram verification is not ready. Please retry.")
                 return
 
             def _do_verify_once(*, nonce_value: str) -> dict:
@@ -2663,7 +2718,7 @@ class _BackendRegisterTask(QtCore.QRunnable):
                     status = ""
 
                 if status == "OK":
-                    self.signals.finished.emit(self.seq, dict(self.context), resp)
+                    _safe_qt_emit(self.signals.finished, self.seq, dict(self.context), resp)
                     break
 
                 if status in {"PENDING", "NET_ERROR"}:
@@ -2683,10 +2738,11 @@ class _BackendRegisterTask(QtCore.QRunnable):
                     continue
 
                 # Hard error
-                self.signals.finished.emit(self.seq, dict(self.context), resp)
+                _safe_qt_emit(self.signals.finished, self.seq, dict(self.context), resp)
                 break
             else:
-                self.signals.error.emit(
+                _safe_qt_emit(
+                    self.signals.error,
                     self.seq,
                     dict(self.context),
                     "Telegram verification timed out. Open Telegram and press Start in the bot chat, then retry.",
@@ -2698,7 +2754,7 @@ class _BackendRegisterTask(QtCore.QRunnable):
             except Exception:
                 pass
         except Exception as e:
-            self.signals.error.emit(self.seq, dict(self.context), f"{e.__class__.__name__}: {e}")
+            _safe_qt_emit(self.signals.error, self.seq, dict(self.context), f"{e.__class__.__name__}: {e}")
 
 
 class _BackendRefreshSymbolsSignals(QtCore.QObject):
@@ -2771,9 +2827,9 @@ class _BackendRefreshSymbolsTask(QtCore.QRunnable):
 
             responses["get_psl_settings"] = post_backend_json(self.backend_url, "get_psl_settings", self.auth_params, timeout=self.timeout)
 
-            self.signals.finished.emit(self.seq, self.auth_params, responses)
+            _safe_qt_emit(self.signals.finished, self.seq, self.auth_params, responses)
         except Exception as e:
-            self.signals.error.emit(self.seq, self.auth_params, str(e))
+            _safe_qt_emit(self.signals.error, self.seq, self.auth_params, str(e))
 
 
 class _ChatRenderPrepSignals(QtCore.QObject):
@@ -2797,9 +2853,9 @@ class _ChatRenderPrepTask(QtCore.QRunnable):
     def run(self) -> None:
         try:
             prepared = _prepare_chat_render_entries(self.items)
-            self.signals.finished.emit(self.seq, self.gid, self.bubble_title, prepared)
+            _safe_qt_emit(self.signals.finished, self.seq, self.gid, self.bubble_title, prepared)
         except Exception as e:
-            self.signals.error.emit(self.seq, self.gid, f"{e.__class__.__name__}: {e}")
+            _safe_qt_emit(self.signals.error, self.seq, self.gid, f"{e.__class__.__name__}: {e}")
 
 
 def is_windows_dark_mode() -> bool:
@@ -5383,6 +5439,9 @@ class TelegramWorker(QtCore.QThread):
         # Use a background queue + worker pool with retries.
         self._backend_post_queue: Optional[asyncio.Queue] = None
         self._backend_post_tasks: List[asyncio.Task] = []
+        # Track first enqueue timestamp per request key so we can report queue lag
+        # exactly before the first network send attempt.
+        self._backend_enqueue_ts: Dict[str, float] = {}
         # Run many in-flight backend posts so desktop sender can saturate backend.
         # Default target from throughput tuning requirement.
         # Set FLAMEBOT_BACKEND_POST_WORKERS to override.
@@ -5914,6 +5973,81 @@ class TelegramWorker(QtCore.QThread):
         except Exception:
             pass
 
+    def _terminal_signal_trace(self, endpoint: str, payload: Optional[dict], stage: str, **extra: object) -> None:
+        ep = str(endpoint or "").strip().lstrip("/")
+        if ep not in {"push_signal", "push_trade_command"}:
+            return
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        except Exception:
+            ts = "n/a"
+        try:
+            obj = payload if isinstance(payload, dict) else {}
+        except Exception:
+            obj = {}
+        try:
+            cid = str(obj.get("correlation_id") or "").strip()
+        except Exception:
+            cid = ""
+        try:
+            chat_id = str(obj.get("chat_id") or obj.get("tg_chat_id") or "").strip()
+        except Exception:
+            chat_id = ""
+        try:
+            message_id = str(obj.get("message_id") or obj.get("tg_message_id") or "").strip()
+        except Exception:
+            message_id = ""
+        try:
+            event_type = str(obj.get("event_type") or "").strip()
+        except Exception:
+            event_type = ""
+        try:
+            is_edit = int(bool(obj.get("is_edit")))
+        except Exception:
+            is_edit = 0
+        parts = [
+            f"[{ts}]",
+            "[signal-trace]",
+            f"stage={str(stage or '').strip().upper()}",
+            f"endpoint={ep}",
+        ]
+        if cid:
+            parts.append(f"cid={cid}")
+        if chat_id:
+            parts.append(f"chat_id={chat_id}")
+        if message_id:
+            parts.append(f"message_id={message_id}")
+        if event_type:
+            parts.append(f"event={event_type}")
+        parts.append(f"is_edit={is_edit}")
+        for key, value in extra.items():
+            if value is None:
+                continue
+            try:
+                text = str(value).strip()
+            except Exception:
+                text = ""
+            if not text:
+                continue
+            parts.append(f"{key}={text}")
+        try:
+            print(" ".join(parts), flush=True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _backend_trace_key(endpoint: str, payload: Optional[dict]) -> str:
+        ep = str(endpoint or "").strip().lstrip("/")
+        cid = ""
+        try:
+            if isinstance(payload, dict):
+                cid = str(payload.get("correlation_id") or "").strip()
+        except Exception:
+            cid = ""
+        if cid:
+            return f"{ep}:{cid}"
+        return f"{ep}:{id(payload)}"
+
     def _dev_log_exc(self, context: str, exc: BaseException) -> None:
         """Developer-only logging for raw exceptions.
 
@@ -5957,6 +6091,7 @@ class TelegramWorker(QtCore.QThread):
                         not_before = float(item.get("not_before", 0.0) or 0.0)
                         assert self._backend_post_queue is not None
                         self._backend_post_queue.put_nowait((ep, dict(payload), attempts, not_before))
+                        self._terminal_signal_trace(ep, cast(Optional[dict], payload), "replay", attempts=attempts, not_before=f"{not_before:.3f}")
                     except Exception:
                         continue
         except Exception:
@@ -5977,7 +6112,17 @@ class TelegramWorker(QtCore.QThread):
                 self._note_backend_outbox_item(ep, pl, attempts=0, not_before=float(now), last_error="")
             except Exception:
                 pass
+            try:
+                self._backend_enqueue_ts[self._backend_trace_key(ep, pl)] = float(now)
+            except Exception:
+                pass
             self._backend_post_queue.put_nowait((ep, pl, 0, float(now)))
+            qsize = None
+            try:
+                qsize = int(self._backend_post_queue.qsize())
+            except Exception:
+                qsize = None
+            self._terminal_signal_trace(ep, pl, "queued", queue_size=qsize)
         except Exception as e:
             self._dev_log_exc("enqueue_backend_post", e)
 
@@ -6045,15 +6190,19 @@ class TelegramWorker(QtCore.QThread):
                 # If this item isn't due yet, requeue and wait a bit.
                 try:
                     if float(not_before or 0.0) > float(now):
+                        self._terminal_signal_trace(str(endpoint), cast(Optional[dict], payload), "deferred", attempts=attempts, not_before=f"{float(not_before):.3f}")
                         try:
-                            self._backend_post_queue.put_nowait((endpoint, payload, int(attempts or 0), float(not_before)))
+                            wait_sec = max(0.05, min(30.0, float(not_before) - float(now)))
                         except Exception:
-                            pass
+                            wait_sec = 0.1
                         try:
-                            await asyncio.sleep(min(0.8, max(0.05, float(not_before) - float(now))))
+                            await asyncio.sleep(float(wait_sec))
                         except Exception:
                             await asyncio.sleep(0.05)
-                        continue
+                        try:
+                            now = time.time()
+                        except Exception:
+                            now = 0.0
                 except Exception:
                     pass
 
@@ -6062,6 +6211,42 @@ class TelegramWorker(QtCore.QThread):
 
                 for attempt in range(1, int(self._backend_post_retries) + 1):
                     try:
+                        try:
+                            if int(attempts or 0) == 0 and int(attempt) == 1:
+                                bkey = self._backend_trace_key(str(endpoint), cast(Optional[dict], payload))
+                                enq_ts = float(self._backend_enqueue_ts.get(bkey, 0.0) or 0.0)
+                                lag = max(0.0, float(now) - enq_ts) if enq_ts > 0.0 else 0.0
+                                qsz = None
+                                try:
+                                    qsz = int(self._backend_post_queue.qsize())
+                                except Exception:
+                                    qsz = None
+                                outbox_len = None
+                                try:
+                                    outbox_len = int(len(self._backend_outbox or {}))
+                                except Exception:
+                                    outbox_len = None
+                                has_secret = False
+                                try:
+                                    has_secret = bool(str(getattr(self, "telegram_ingest_secret", "") or "").strip())
+                                except Exception:
+                                    has_secret = False
+                                self._terminal_signal_trace(
+                                    str(endpoint),
+                                    cast(Optional[dict], payload),
+                                    "first_send",
+                                    worker=worker_index,
+                                    queue_lag_sec=f"{lag:.3f}",
+                                    queue_size=qsz,
+                                    outbox_items=outbox_len,
+                                    workers=int(self._backend_post_workers or 0),
+                                    timeout_sec=f"{float(self._backend_post_timeout):.2f}",
+                                    has_secret=int(has_secret),
+                                    auto_reconnect=int(bool(getattr(self, "_auto_reconnect_enabled", False))),
+                                )
+                        except Exception:
+                            pass
+                        self._terminal_signal_trace(str(endpoint), cast(Optional[dict], payload), "send", worker=worker_index, batch_attempt=int(attempts or 0), try_no=attempt)
                         status, _body = await asyncio.to_thread(
                             self._post_json_blocking,
                             url,
@@ -6104,18 +6289,22 @@ class TelegramWorker(QtCore.QThread):
                                     last_err = f"HTTP {status} (unauthorized: {detail}; {hint})"
                                 else:
                                     last_err = f"HTTP {status} (unauthorized; {hint})"
+                            self._terminal_signal_trace(str(endpoint), cast(Optional[dict], payload), "auth_fail", worker=worker_index, try_no=attempt, status=status, detail=detail or last_err)
                             break
 
                         # Retry on transient backend errors (esp. 503 when DB persist fails).
                         if int(status) >= 500:
                             last_err = f"HTTP {status}"
+                            self._terminal_signal_trace(str(endpoint), cast(Optional[dict], payload), "retry_http", worker=worker_index, try_no=attempt, status=status, detail=detail or "server_error")
                             await asyncio.sleep(min(2.0, 0.2 * (2 ** (attempt - 1))))
                             continue
 
+                        self._terminal_signal_trace(str(endpoint), cast(Optional[dict], payload), "ok", worker=worker_index, try_no=attempt, status=status, detail=detail or "accepted")
                         last_err = None
                         break
                     except Exception as e:
                         last_err = f"{e.__class__.__name__}: {e}"
+                        self._terminal_signal_trace(str(endpoint), cast(Optional[dict], payload), "retry_exc", worker=worker_index, try_no=attempt, error=last_err)
                         await asyncio.sleep(min(2.0, 0.2 * (2 ** (attempt - 1))))
 
                 # Update durable outbox state.
@@ -6154,6 +6343,7 @@ class TelegramWorker(QtCore.QThread):
                         jitter = 0.0
                     delay = float(min(90.0, max(1.0, backoff + jitter)))
                     next_time = float(now) + delay
+                    self._terminal_signal_trace(str(endpoint), cast(Optional[dict], payload), "requeued", attempts=a, delay_sec=f"{delay:.3f}", next_time=f"{next_time:.3f}", error=last_err)
 
                     try:
                         if isinstance(payload, dict):
@@ -6173,6 +6363,11 @@ class TelegramWorker(QtCore.QThread):
                         pass
                 else:
                     # Delivered; remove from outbox if present.
+                    self._terminal_signal_trace(str(endpoint), cast(Optional[dict], payload), "delivered", worker=worker_index)
+                    try:
+                        self._backend_enqueue_ts.pop(self._backend_trace_key(str(endpoint), cast(Optional[dict], payload)), None)
+                    except Exception:
+                        pass
                     try:
                         if outbox_key:
                             self._backend_outbox.pop(str(outbox_key), None)
@@ -8734,11 +8929,15 @@ class MainWindow(QtWidgets.QWidget):
         self.user_name = "Telegram User"
         self.user_phone = ""
         # Platform-specific EA state (MT4 and MT5 are independent)
-        self.ea_states: Dict[str, Dict[str, Dict[str, Optional[bool]]]] = {
-            "mt4": {"prop": {"ea_active": False, "known": False}, "normal": {"ea_active": False, "known": False}},
-            "mt5": {"prop": {"ea_active": False, "known": False}, "normal": {"ea_active": False, "known": False}},
+        # ea_active   = presence (heartbeat fresh)
+        # ea_authorized = DB binding still owned by this terminal (not revoked)
+        # last_seen_at = ISO timestamp of last heartbeat (for offline-age display)
+        self.ea_states: Dict[str, Dict[str, Dict[str, Any]]] = {
+            "mt4": {"prop": {"ea_active": False, "ea_authorized": False, "known": False, "last_seen_at": None}, "normal": {"ea_active": False, "ea_authorized": False, "known": False, "last_seen_at": None}},
+            "mt5": {"prop": {"ea_active": False, "ea_authorized": False, "known": False, "last_seen_at": None}, "normal": {"ea_active": False, "ea_authorized": False, "known": False, "last_seen_at": None}},
         }
         self.ea_active = False  # Legacy field - will be set based on selected platform
+        self.ea_authorized = False  # DB-binding flag (parallel to ea_active)
         self.telegram_phone = self.settings.get("telegram_phone", "")
         # Persisted Telegram identity (numeric id) to detect account switches.
         self._saved_telegram_id = str(self.settings.get("telegram_id", "") or "").strip()
@@ -9588,6 +9787,10 @@ class MainWindow(QtWidgets.QWidget):
             self.trade_bunker_btn.setEnabled(True)
             self.subscription_btn.setEnabled(True)
             self.expert_btn.setEnabled(True)
+            try:
+                self.terminal_btn.setEnabled(True)
+            except Exception:
+                pass
         except Exception:
             pass
         try:
@@ -10854,6 +11057,7 @@ class MainWindow(QtWidgets.QWidget):
 
         # Sync EA status for this platform from cached context state
         self.ea_active = self._get_platform_ea_active(new_platform)
+        self.ea_authorized = self._get_platform_ea_authorized(new_platform)
         self._ea_active_account = self._get_platform_active_account(new_platform)
 
         try:
@@ -11252,9 +11456,32 @@ class MainWindow(QtWidgets.QWidget):
         wizard_layout.addLayout(center_row)
         self.main_stack.addWidget(wizard_page)
         dashboard_page = QtWidgets.QWidget()
-        dashboard_layout = QtWidgets.QHBoxLayout(dashboard_page)
+        dashboard_layout = QtWidgets.QVBoxLayout(dashboard_page)
         dashboard_layout.setSpacing(0)
         dashboard_layout.setContentsMargins(4, 4, 4, 4)
+
+        # Global, persistent subscription status banner pinned above all dashboard routes.
+        self.sub_banner = QtWidgets.QWidget()
+        self.sub_banner.setObjectName("sub_banner")
+        self.sub_banner.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.sub_banner.setMaximumHeight(30)
+        sub_banner_layout = QtWidgets.QHBoxLayout(self.sub_banner)
+        sub_banner_layout.setContentsMargins(10, 3, 8, 3)
+        sub_banner_layout.setSpacing(6)
+        self.sub_banner_label = QtWidgets.QLabel("")
+        self.sub_banner_label.setObjectName("sub_banner_label")
+        self.sub_banner_label.setWordWrap(False)
+        sub_banner_layout.addWidget(self.sub_banner_label, 1)
+        self.sub_banner_dismiss_btn = QtWidgets.QPushButton("X")
+        self.sub_banner_dismiss_btn.setObjectName("sub_banner_dismiss")
+        self.sub_banner_dismiss_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sub_banner_dismiss_btn.setFixedSize(18, 18)
+        self.sub_banner_dismiss_btn.setFlat(False)
+        self.sub_banner_dismiss_btn.clicked.connect(self._dismiss_subscription_banner)
+        sub_banner_layout.addWidget(self.sub_banner_dismiss_btn)
+        self.sub_banner.hide()
+        dashboard_layout.addWidget(self.sub_banner)
+
         self.sidebar = QtWidgets.QFrame()
         self.sidebar.setObjectName("sidebar")
         self.sidebar.setMinimumWidth(280)
@@ -11338,6 +11565,7 @@ class MainWindow(QtWidgets.QWidget):
         message_layout = QtWidgets.QVBoxLayout(self.message_panel)
         message_layout.setContentsMargins(12, 12, 12, 12)
         message_layout.setSpacing(10)
+
         self.content_stack = QtWidgets.QStackedWidget()
         message_layout.addWidget(self.content_stack)
         self.message_log_page = QtWidgets.QWidget()
@@ -12094,6 +12322,247 @@ class MainWindow(QtWidgets.QWidget):
             pass
         _update_expert_context_indicator()
         self.content_stack.addWidget(self.expert_page)
+
+        # ------------------------------------------------------------------
+        # Virtual Terminal page (Phase 3 UI)
+        # Talks to flame-backend /vps/* routes; backend dispatches to the
+        # flame-vps-orchestrator service. Hidden from the menu when the
+        # backend feature flag is off (routes return 404 in that case).
+        # ------------------------------------------------------------------
+        self.virtual_terminal_page = QtWidgets.QWidget()
+        vt_outer = QtWidgets.QVBoxLayout(self.virtual_terminal_page)
+        vt_outer.setSpacing(12)
+        vt_outer.setContentsMargins(12, 12, 12, 12)
+
+        vt_header = QtWidgets.QLabel("Virtual Terminal")
+        vt_header.setObjectName("title")
+        vt_header.setStyleSheet("font-size: 28px; font-weight: 800;")
+        vt_outer.addWidget(vt_header)
+
+        self.vt_subtitle = QtWidgets.QLabel(
+            "Run MT4/MT5 + EA on a managed terminal. Sessions stay live even when the app is closed."
+        )
+        self.vt_subtitle.setObjectName("muted")
+        self.vt_subtitle.setWordWrap(True)
+        self.vt_subtitle.setStyleSheet("font-size: 13px; color: #d7d7e0;")
+        vt_outer.addWidget(self.vt_subtitle)
+
+        # --- Entitlements row ---
+        self.vt_entitlement_label = QtWidgets.QLabel("Entitlements: loading…")
+        self.vt_entitlement_label.setWordWrap(True)
+        self.vt_entitlement_label.setStyleSheet(
+            "background: rgba(255, 122, 47, 0.14); border-radius: 10px; "
+            "padding: 8px 12px; font-size: 13px; font-weight: 700; color: #ffe8d7;"
+        )
+        vt_outer.addWidget(self.vt_entitlement_label)
+
+        ent_row = QtWidgets.QHBoxLayout()
+        ent_row.setSpacing(8)
+        self.vt_unlock_platform_btn = QtWidgets.QPushButton("Unlock second platform")
+        self.vt_unlock_platform_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.vt_unlock_platform_btn.setMinimumHeight(34)
+        self.vt_extra_slot_btn = QtWidgets.QPushButton("Add extra slot (this platform)")
+        self.vt_extra_slot_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.vt_extra_slot_btn.setMinimumHeight(34)
+        self.vt_refresh_btn = QtWidgets.QPushButton("↻ Refresh")
+        self.vt_refresh_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.vt_refresh_btn.setMinimumHeight(34)
+        ent_row.addWidget(self.vt_unlock_platform_btn)
+        ent_row.addWidget(self.vt_extra_slot_btn)
+        ent_row.addStretch()
+        ent_row.addWidget(self.vt_refresh_btn)
+        vt_outer.addLayout(ent_row)
+
+        # --- Request new terminal ---
+        new_box = QtWidgets.QFrame()
+        new_box.setObjectName("card")
+        new_layout = QtWidgets.QHBoxLayout(new_box)
+        new_layout.setContentsMargins(8, 8, 8, 8)
+        new_layout.setSpacing(8)
+        new_layout.addWidget(QtWidgets.QLabel("New:"))
+        self.vt_new_platform = QtWidgets.QComboBox()
+        self.vt_new_platform.addItem("MT5", "mt5")
+        self.vt_new_platform.addItem("MT4", "mt4")
+        self.vt_new_platform.setMinimumHeight(34)
+        self.vt_new_account = QtWidgets.QComboBox()
+        self.vt_new_account.addItem("Normal", "normal")
+        self.vt_new_account.addItem("Prop", "prop")
+        self.vt_new_account.setMinimumHeight(34)
+        new_layout.addWidget(self.vt_new_platform)
+        new_layout.addWidget(self.vt_new_account)
+        new_layout.addStretch()
+        self.vt_request_btn = QtWidgets.QPushButton("Request Terminal")
+        self.vt_request_btn.setObjectName("primary")
+        self.vt_request_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.vt_request_btn.setMinimumHeight(36)
+        new_layout.addWidget(self.vt_request_btn)
+        vt_outer.addWidget(new_box)
+
+        # --- Terminals list + detail (split) ---
+        vt_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        vt_split.setChildrenCollapsible(False)
+
+        self.vt_terminals_list = QtWidgets.QListWidget()
+        self.vt_terminals_list.setMinimumWidth(290)
+        self.vt_terminals_list.setStyleSheet("font-size: 14px; padding: 4px;")
+        vt_split.addWidget(self.vt_terminals_list)
+
+        detail_panel = QtWidgets.QWidget()
+        detail_layout = QtWidgets.QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(8, 0, 0, 0)
+        detail_layout.setSpacing(8)
+
+        self.vt_detail_title = QtWidgets.QLabel("Select a terminal")
+        self.vt_detail_title.setObjectName("title")
+        self.vt_detail_title.setStyleSheet("font-size: 24px; font-weight: 800;")
+        detail_layout.addWidget(self.vt_detail_title)
+
+        self.vt_detail_status = QtWidgets.QLabel("—")
+        self.vt_detail_status.setWordWrap(True)
+        self.vt_detail_status.setStyleSheet("font-size: 15px; color: #f3f3f8;")
+        detail_layout.addWidget(self.vt_detail_status)
+
+        login_title = QtWidgets.QLabel("Broker Login")
+        login_title.setStyleSheet("font-size: 17px; font-weight: 700; color: #f7f7fb;")
+        detail_layout.addWidget(login_title)
+
+        # Broker login form (sealed sodium box built in Phase 2.5; for now we
+        # send a base64 placeholder so the round-trip is exercisable).
+        login_box = QtWidgets.QFrame()
+        login_box.setObjectName("card")
+        login_form = QtWidgets.QFormLayout(login_box)
+        login_form.setContentsMargins(8, 8, 8, 8)
+        self.vt_server_preset = QtWidgets.QComboBox()
+        self.vt_server_preset.setMinimumHeight(34)
+        self.vt_server_preset.setStyleSheet("font-size: 14px;")
+        try:
+            for preset_label, preset_value in VT_BROKER_SERVER_PRESETS:
+                self.vt_server_preset.addItem(str(preset_label), str(preset_value))
+        except Exception:
+            pass
+        self.vt_broker_server = QtWidgets.QLineEdit()
+        self.vt_broker_server.setPlaceholderText("Broker server (e.g. ICMarketsSC-Demo)")
+        self.vt_broker_server.setMinimumHeight(34)
+        self.vt_broker_server.setStyleSheet("font-size: 14px;")
+        self.vt_broker_login = QtWidgets.QLineEdit()
+        self.vt_broker_login.setPlaceholderText("Account number")
+        self.vt_broker_login.setMinimumHeight(34)
+        self.vt_broker_login.setStyleSheet("font-size: 14px;")
+        self.vt_broker_password = QtWidgets.QLineEdit()
+        self.vt_broker_password.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.vt_broker_password.setPlaceholderText("Password (sealed locally before send)")
+        self.vt_broker_password.setMinimumHeight(34)
+        self.vt_broker_password.setStyleSheet("font-size: 14px;")
+        self.vt_broker_server_hint = QtWidgets.QLabel(
+            "Use the exact server shown in your broker's MT account details."
+        )
+        self.vt_broker_server_hint.setWordWrap(True)
+        self.vt_broker_server_hint.setObjectName("muted")
+        self.vt_broker_server_hint.setStyleSheet("font-size: 12px; color: #b9b9c4;")
+        login_form.addRow("Server preset", self.vt_server_preset)
+        login_form.addRow("Server", self.vt_broker_server)
+        login_form.addRow("", self.vt_broker_server_hint)
+        login_form.addRow("Login", self.vt_broker_login)
+        login_form.addRow("Password", self.vt_broker_password)
+        self.vt_login_btn = QtWidgets.QPushButton("Submit broker credentials")
+        self.vt_login_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.vt_login_btn.setMinimumHeight(36)
+        login_form.addRow("", self.vt_login_btn)
+        detail_layout.addWidget(login_box)
+
+        # EA + lifecycle action row
+        actions_title = QtWidgets.QLabel("Terminal Controls")
+        actions_title.setStyleSheet("font-size: 17px; font-weight: 700; color: #f7f7fb;")
+        detail_layout.addWidget(actions_title)
+        actions = QtWidgets.QHBoxLayout()
+        actions.setSpacing(6)
+        self.vt_attach_btn = QtWidgets.QPushButton("Attach EA")
+        self.vt_detach_btn = QtWidgets.QPushButton("Detach EA")
+        self.vt_restart_btn = QtWidgets.QPushButton("Restart")
+        self.vt_stop_btn = QtWidgets.QPushButton("Stop")
+        self.vt_forget_btn = QtWidgets.QPushButton("Forget")
+        for b in (self.vt_attach_btn, self.vt_detach_btn, self.vt_restart_btn, self.vt_stop_btn, self.vt_forget_btn):
+            b.setCursor(QtCore.Qt.PointingHandCursor)
+            b.setMinimumHeight(34)
+            actions.addWidget(b)
+        actions.addStretch()
+        detail_layout.addLayout(actions)
+
+        # Switch account type within the same terminal slot.
+        switch_row = QtWidgets.QHBoxLayout()
+        switch_row.setSpacing(6)
+        switch_row.addWidget(QtWidgets.QLabel("Switch account type:"))
+        self.vt_switch_account = QtWidgets.QComboBox()
+        self.vt_switch_account.addItem("Normal", "normal")
+        self.vt_switch_account.addItem("Prop", "prop")
+        self.vt_switch_account.setMinimumHeight(34)
+        self.vt_switch_btn = QtWidgets.QPushButton("Switch")
+        self.vt_switch_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.vt_switch_btn.setMinimumHeight(34)
+        switch_row.addWidget(self.vt_switch_account)
+        switch_row.addWidget(self.vt_switch_btn)
+        switch_row.addStretch()
+        detail_layout.addLayout(switch_row)
+
+        # Event log
+        log_lbl = QtWidgets.QLabel("Event log")
+        log_lbl.setObjectName("muted")
+        log_lbl.setStyleSheet("font-size: 14px; font-weight: 700; color: #d8d8e2;")
+        detail_layout.addWidget(log_lbl)
+        self.vt_event_log = QtWidgets.QPlainTextEdit()
+        self.vt_event_log.setReadOnly(True)
+        self.vt_event_log.setMinimumHeight(180)
+        self.vt_event_log.setStyleSheet("font-size: 13px; line-height: 1.3; padding: 6px;")
+        detail_layout.addWidget(self.vt_event_log, 1)
+
+        detail_scroll = QtWidgets.QScrollArea()
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        detail_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        detail_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        detail_scroll.setWidget(detail_panel)
+
+        vt_split.addWidget(detail_scroll)
+        try:
+            vt_split.setStretchFactor(0, 0)
+            vt_split.setStretchFactor(1, 1)
+        except Exception:
+            pass
+        vt_outer.addWidget(vt_split, 1)
+
+        # Initial state for the detail panel (no selection).
+        self._vt_selected_terminal_id: Optional[str] = None
+        self._vt_event_since_id: int = 0
+        self._vt_terminals_cache: list = []
+        self._vt_inflight: bool = False
+        self._vt_pubkey_b64: str = ""
+        self._vt_poll_timer = QtCore.QTimer(self)
+        self._vt_poll_timer.setInterval(5000)
+        try:
+            self._vt_poll_timer.timeout.connect(self._vt_tick)
+        except Exception:
+            pass
+        self._vt_set_detail_enabled(False)
+
+        # Wiring (handlers defined as methods on self; see _show_virtual_terminal et al.)
+        try:
+            self.vt_refresh_btn.clicked.connect(self._vt_refresh_all)
+            self.vt_unlock_platform_btn.clicked.connect(lambda: self._vt_purchase("platform_unlock"))
+            self.vt_extra_slot_btn.clicked.connect(lambda: self._vt_purchase("extra_slot"))
+            self.vt_request_btn.clicked.connect(self._vt_request_terminal)
+            self.vt_terminals_list.itemSelectionChanged.connect(self._vt_on_selection_changed)
+            self.vt_server_preset.currentIndexChanged.connect(self._vt_apply_server_preset)
+            self.vt_login_btn.clicked.connect(self._vt_submit_broker_login)
+            self.vt_attach_btn.clicked.connect(self._vt_attach_ea)
+            self.vt_detach_btn.clicked.connect(self._vt_detach_ea)
+            self.vt_restart_btn.clicked.connect(self._vt_restart)
+            self.vt_stop_btn.clicked.connect(self._vt_stop)
+            self.vt_forget_btn.clicked.connect(self._vt_forget)
+            self.vt_switch_btn.clicked.connect(self._vt_switch_account_type)
+        except Exception:
+            pass
+
+        self.content_stack.addWidget(self.virtual_terminal_page)
         # --- Settings Wizard (NEW) — stacked pages: platform -> account -> settings_form ---
         # Page 0: platform selection — large heading + full-width primary buttons
         platform_page = QtWidgets.QWidget()
@@ -12468,22 +12937,30 @@ class MainWindow(QtWidgets.QWidget):
         method_title.setObjectName("title")
         method_layout.addWidget(method_title)
 
-        self.sub_plan_hint = QtWidgets.QLabel("Choose monthly or yearly first. Payment options stay hidden until a plan is selected.")
+        self.sub_plan_hint = QtWidgets.QLabel("Choose a plan first. Payment options stay hidden until a plan is selected.")
         self.sub_plan_hint.setWordWrap(True)
         method_layout.addWidget(self.sub_plan_hint)
 
         sub_plan_row = QtWidgets.QWidget()
-        sub_plan_row_layout = QtWidgets.QHBoxLayout(sub_plan_row)
+        sub_plan_row_layout = QtWidgets.QGridLayout(sub_plan_row)
         sub_plan_row_layout.setContentsMargins(0, 0, 0, 0)
         sub_plan_row_layout.setSpacing(10)
+        self.sub_plan_day_btn = QtWidgets.QPushButton("Daily - loading...")
+        self.sub_plan_day_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sub_plan_day_btn.setCheckable(True)
+        self.sub_plan_week_btn = QtWidgets.QPushButton("Weekly - loading...")
+        self.sub_plan_week_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sub_plan_week_btn.setCheckable(True)
         self.sub_plan_month_btn = QtWidgets.QPushButton("Monthly - loading...")
         self.sub_plan_month_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.sub_plan_month_btn.setCheckable(True)
         self.sub_plan_year_btn = QtWidgets.QPushButton("Yearly - loading...")
         self.sub_plan_year_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.sub_plan_year_btn.setCheckable(True)
-        sub_plan_row_layout.addWidget(self.sub_plan_month_btn)
-        sub_plan_row_layout.addWidget(self.sub_plan_year_btn)
+        sub_plan_row_layout.addWidget(self.sub_plan_day_btn, 0, 0)
+        sub_plan_row_layout.addWidget(self.sub_plan_week_btn, 0, 1)
+        sub_plan_row_layout.addWidget(self.sub_plan_month_btn, 1, 0)
+        sub_plan_row_layout.addWidget(self.sub_plan_year_btn, 1, 1)
         method_layout.addWidget(sub_plan_row)
 
         self.sub_payment_heading = QtWidgets.QLabel("Payment Options")
@@ -12499,44 +12976,20 @@ class MainWindow(QtWidgets.QWidget):
         self.sub_payment_methods_hint.setWordWrap(True)
         self.sub_payment_methods_panel_layout.addWidget(self.sub_payment_methods_hint)
 
-        self.sub_bank_radio = QtWidgets.QRadioButton("🏦 Bank Transfer")
-        self.sub_card_radio = QtWidgets.QRadioButton("💳 Bank Card")
-        self.sub_crypto_radio = QtWidgets.QRadioButton("₿ Crypto Transfer")
+        self.sub_bank_radio = QtWidgets.QRadioButton("🏦 Banks Payment Method")
         self.sub_bank_radio.setCursor(QtCore.Qt.PointingHandCursor)
-        self.sub_card_radio.setCursor(QtCore.Qt.PointingHandCursor)
-        self.sub_crypto_radio.setCursor(QtCore.Qt.PointingHandCursor)
 
         self.sub_payment_methods_panel_layout.addWidget(self.sub_bank_radio)
-        self.sub_payment_methods_panel_layout.addWidget(self.sub_card_radio)
-        self.sub_payment_methods_panel_layout.addWidget(self.sub_crypto_radio)
         self.sub_payment_methods_panel.setVisible(False)
         method_layout.addWidget(self.sub_payment_methods_panel)
 
-        payment_details_frame = QtWidgets.QFrame()
-        payment_details_frame.setObjectName("card")
-        payment_details_layout = QtWidgets.QVBoxLayout(payment_details_frame)
-        payment_details_layout.setSpacing(8)
-        self.sub_payment_detail_title = QtWidgets.QLabel("Payment Details")
-        self.sub_payment_detail_title.setObjectName("title")
-        self.sub_payment_detail_body = QtWidgets.QLabel("Choose a plan, then select a payment method.")
-        self.sub_payment_detail_body.setWordWrap(True)
-        self.sub_payment_detail_fields = QtWidgets.QLabel("")
-        self.sub_payment_detail_fields.setWordWrap(True)
-        self.sub_payment_detail_link = QtWidgets.QLabel("")
-        self.sub_payment_detail_link.setWordWrap(True)
-        self.sub_payment_qr_label = QtWidgets.QLabel()
-        self.sub_payment_qr_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.sub_payment_qr_label.setMinimumHeight(170)
-        self.sub_payment_qr_label.hide()
-        payment_details_layout.addWidget(self.sub_payment_detail_title)
-        payment_details_layout.addWidget(self.sub_payment_detail_body)
-        payment_details_layout.addWidget(self.sub_payment_detail_fields)
-        payment_details_layout.addWidget(self.sub_payment_detail_link)
-        payment_details_layout.addWidget(self.sub_payment_qr_label)
+        self.sub_continue_payment_btn = QtWidgets.QPushButton("Continue with Payment")
+        self.sub_continue_payment_btn.setObjectName("primary")
+        self.sub_continue_payment_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sub_continue_payment_btn.setEnabled(False)
+        method_layout.addWidget(self.sub_continue_payment_btn)
 
-        method_layout.addWidget(payment_details_frame)
-
-        self.sub_checkout_status = QtWidgets.QLabel("Choose a plan, then select a payment method.")
+        self.sub_checkout_status = QtWidgets.QLabel("Choose a plan and payment method, then continue.")
         self.sub_checkout_status.setWordWrap(True)
         method_layout.addWidget(self.sub_checkout_status)
         method_layout.addStretch()
@@ -12558,7 +13011,7 @@ class MainWindow(QtWidgets.QWidget):
         self.sub_expiry_label = QtWidgets.QLabel("Expiry: —")
         self.sub_enforcement_label = QtWidgets.QLabel("Enforcement: —")
         self.sub_legacy_label = QtWidgets.QLabel("Update requirement: —")
-        self.sub_pricing_label = QtWidgets.QLabel("Pricing: $10 monthly / $100 yearly")
+        self.sub_pricing_label = QtWidgets.QLabel("Pricing: loading available plans")
         self.sub_status_label.setWordWrap(True)
         self.sub_plan_label.setWordWrap(True)
         self.sub_expiry_label.setWordWrap(True)
@@ -12577,7 +13030,7 @@ class MainWindow(QtWidgets.QWidget):
         self.sub_refresh_status_btn.setCursor(QtCore.Qt.PointingHandCursor)
         status_layout.addWidget(self.sub_refresh_status_btn)
 
-        self.sub_steps_label = QtWidgets.QLabel("Choose monthly or yearly to continue.")
+        self.sub_steps_label = QtWidgets.QLabel("Choose a plan to continue.")
         self.sub_steps_label.setWordWrap(True)
         status_layout.addWidget(self.sub_steps_label)
         status_layout.addStretch()
@@ -12599,8 +13052,6 @@ class MainWindow(QtWidgets.QWidget):
         self.subscription_method_group = QtWidgets.QButtonGroup(self)
         self.subscription_method_group.setExclusive(True)
         self.subscription_method_group.addButton(self.sub_bank_radio)
-        self.subscription_method_group.addButton(self.sub_card_radio)
-        self.subscription_method_group.addButton(self.sub_crypto_radio)
 
         self._subscription_last_payment_id = ""
         self._subscription_last_payment_session_id = ""
@@ -12611,6 +13062,9 @@ class MainWindow(QtWidgets.QWidget):
         self._subscription_status_request_inflight = False
         self._subscription_poll_deadline_ts = 0.0
         self._subscription_poll_success_notified = False
+        self._subscription_checkout_locked = False
+        self._sub_banner_dismissed = False
+        self._sub_banner_last_state: Optional[str] = None  # "expired" | "active" | None
         self._subscription_status_poll_timer = QtCore.QTimer(self)
         self._subscription_status_poll_timer.setInterval(5000)
         self._subscription_status_poll_timer.timeout.connect(self._poll_subscription_status)
@@ -12779,7 +13233,16 @@ class MainWindow(QtWidgets.QWidget):
         self.expert_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.expert_btn.setEnabled(False)
 
-        for btn in (self.profile_btn, self.expert_btn, self.settings_btn, self.trade_bunker_btn, self.subscription_btn):
+        # Virtual Terminal — sits between Expert and Settings (Phase 3 UI).
+        self.terminal_btn = QtWidgets.QToolButton()
+        if VT_MENU_COMING_SOON:
+            self.terminal_btn.setText(" 🖥️   Virtual Terminal   [COMING]")
+        else:
+            self.terminal_btn.setText(" 🖥️   Virtual Terminal")
+        self.terminal_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.terminal_btn.setEnabled(False)
+
+        for btn in (self.profile_btn, self.expert_btn, self.terminal_btn, self.settings_btn, self.trade_bunker_btn, self.subscription_btn):
             btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
             btn.setIconSize(QtCore.QSize(18, 18))
             btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
@@ -13420,16 +13883,24 @@ class MainWindow(QtWidgets.QWidget):
         # Sidebar wiring: Expert opens the original Expert flow; Settings
         # opens the Settings page (backup behaviour).
         self.expert_btn.clicked.connect(self._show_expert)
+        try:
+            if VT_MENU_COMING_SOON:
+                self.terminal_btn.clicked.connect(self._show_virtual_terminal_coming_soon)
+            else:
+                self.terminal_btn.clicked.connect(self._show_virtual_terminal)
+        except Exception:
+            pass
         self.settings_btn.clicked.connect(self._show_settings_wizard)
         self.trade_bunker_btn.clicked.connect(self._show_trade_bunker_wizard)
         self.subscription_btn.clicked.connect(self._show_subscription)
         self.subscription_method_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(0))
         self.subscription_status_btn.clicked.connect(lambda: self.subscription_stack.setCurrentIndex(1))
+        self.sub_plan_day_btn.clicked.connect(lambda checked: self._on_subscription_plan_toggled("day", checked))
+        self.sub_plan_week_btn.clicked.connect(lambda checked: self._on_subscription_plan_toggled("week", checked))
         self.sub_plan_month_btn.clicked.connect(lambda checked: self._on_subscription_plan_toggled("month", checked))
         self.sub_plan_year_btn.clicked.connect(lambda checked: self._on_subscription_plan_toggled("year", checked))
         self.sub_bank_radio.clicked.connect(self._on_subscription_payment_method_clicked)
-        self.sub_card_radio.clicked.connect(self._on_subscription_payment_method_clicked)
-        self.sub_crypto_radio.clicked.connect(self._on_subscription_payment_method_clicked)
+        self.sub_continue_payment_btn.clicked.connect(self._start_subscription_checkout)
         self.sub_refresh_status_btn.clicked.connect(self._refresh_subscription_status)
         self.platform_back.clicked.connect(self._show_message_log)
         self.mt5_button.clicked.connect(lambda: self._on_platform_selected('mt5'))
@@ -13997,6 +14468,13 @@ class MainWindow(QtWidgets.QWidget):
         self.main_stack.setCurrentIndex(1)
         self.loading_label.setVisible(True)
         self._groups_loaded = False
+        # Reset subscription banner state on each new login session.
+        self._sub_banner_dismissed = False
+        self._sub_banner_last_state = None
+        try:
+            self.sub_banner.hide()
+        except Exception:
+            pass
         # Telegram group loading should NOT depend on backend connectivity.
         # `_is_online()` is driven by the app's network state manager and may
         # report offline even when Telegram is reachable, which blocks groups.
@@ -14012,6 +14490,10 @@ class MainWindow(QtWidgets.QWidget):
         self.trade_bunker_btn.setEnabled(True)
         self.subscription_btn.setEnabled(True)
         self.expert_btn.setEnabled(True)
+        try:
+            self.terminal_btn.setEnabled(True)
+        except Exception:
+            pass
         self._show_message_log()
         try:
             # Telegram-like: show empty state until the user selects a chat.
@@ -14029,6 +14511,10 @@ class MainWindow(QtWidgets.QWidget):
         # CRITICAL: Conditional startup - do NOT start polling until
         # user has been authenticated and configuration is verified
         # This is handled in on_user_ready after _fetch_user_app_state
+        try:
+            QtCore.QTimer.singleShot(900, lambda: self._refresh_subscription_status(quiet=True))
+        except Exception:
+            pass
 
     def _has_backend_registration(self, *, platform: str, account_type: str) -> bool:
         """Return True if we already have what we need to use the backend.
@@ -14150,6 +14636,10 @@ class MainWindow(QtWidgets.QWidget):
             pass
         try:
             self._poll_backend_state_all_platforms()
+        except Exception:
+            pass
+        try:
+            QtCore.QTimer.singleShot(1200, lambda: self._refresh_subscription_status(quiet=True))
         except Exception:
             pass
 
@@ -15442,13 +15932,14 @@ class MainWindow(QtWidgets.QWidget):
         # Reset EA/settings state.
         try:
             self.ea_states = {
-                "mt4": {"prop": {"ea_active": False, "known": False}, "normal": {"ea_active": False, "known": False}},
-                "mt5": {"prop": {"ea_active": False, "known": False}, "normal": {"ea_active": False, "known": False}},
+                "mt4": {"prop": {"ea_active": False, "ea_authorized": False, "known": False, "last_seen_at": None}, "normal": {"ea_active": False, "ea_authorized": False, "known": False, "last_seen_at": None}},
+                "mt5": {"prop": {"ea_active": False, "ea_authorized": False, "known": False, "last_seen_at": None}, "normal": {"ea_active": False, "ea_authorized": False, "known": False, "last_seen_at": None}},
             }
         except Exception:
             pass
         try:
             self.ea_active = False
+            self.ea_authorized = False
             self._ea_active_account = None
         except Exception:
             pass
@@ -18548,7 +19039,7 @@ class MainWindow(QtWidgets.QWidget):
         ea_active = bool(ctx_state.get("ea_active", False))
 
         if not ea_active:
-            self._show_toast(f"❌ Please login your EA first. Go to Expert → {self.platform.upper()} and connect your EA.")
+            self._show_toast(self._ea_offline_toast_text(platform))
             return
         if not getattr(self, "flamebot_id", None):
             self._show_toast("❌ FlameBot ID missing. Please register/login first.")
@@ -18672,7 +19163,7 @@ class MainWindow(QtWidgets.QWidget):
         Checked + empty lot = IGNORED (not saved)
         """
         if not self.ea_active:
-            self._show_toast(f"❌ Please login your EA first. Go to Expert → {self.platform.upper()} and connect your EA.")
+            self._show_toast(self._ea_offline_toast_text())
             return
         
         auth_params = self._backend_auth_params()
@@ -19306,7 +19797,7 @@ class MainWindow(QtWidgets.QWidget):
         ea_active = bool(ctx_state.get("ea_active", False))
 
         if not ea_active:
-            self._show_toast(f"❌ Please login your EA first. Go to Expert → {self.platform.upper()} and connect your EA.")
+            self._show_toast(self._ea_offline_toast_text(platform))
             return
         if not getattr(self, "flamebot_id", None):
             self._show_toast("❌ FlameBot ID missing. Please register/login first.")
@@ -20072,22 +20563,28 @@ class MainWindow(QtWidgets.QWidget):
                     if at not in {"prop", "normal"}:
                         continue
                     st = self._get_ea_context_state(platform, at)
-                    st["ea_active"] = bool(it.get("online", False))
+                    online = bool(it.get("online", False))
+                    revoked = bool(it.get("revoked", False))
+                    tid_resp = str(it.get("terminal_id") or "").strip()
+                    st["ea_active"] = online
+                    # Authorized iff DB row exists, not revoked, and bound to a terminal_id.
+                    st["ea_authorized"] = (not revoked) and bool(tid_resp)
                     st["known"] = True
+                    st["last_seen_at"] = it.get("last_seen_at")
                     if at == (self._normalize_account_type(acct) or "prop"):
-                        tid = str(it.get("terminal_id") or "").strip()
-                        if tid:
+                        if tid_resp:
                             store = cast(Optional[Dict[str, Optional[str]]], getattr(self, "_terminal_id_by_platform", None))
                             if not isinstance(store, dict):
                                 self._terminal_id_by_platform = {"mt4": cast(Optional[str], None), "mt5": cast(Optional[str], None)}
                                 store = self._terminal_id_by_platform
-                            store[platform] = tid
+                            store[platform] = tid_resp
                 except Exception:
                     continue
 
             if platform == (getattr(self, "platform", None) or "mt5").lower():
                 try:
                     self.ea_active = self._get_platform_ea_active(platform)
+                    self.ea_authorized = self._get_platform_ea_authorized(platform)
                     self._ea_active_account = self._get_platform_active_account(platform)
                 except Exception:
                     pass
@@ -20170,16 +20667,59 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
-        lot_resp = self._get_backend_json("get_lot_settings", auth_params)
-        sym_resp = self._get_backend_json("get_symbol_settings", auth_params)
-        psl_resp = self._get_backend_json("get_psl_settings", auth_params)
+        # Never block the UI thread during hydration.
+        try:
+            self._platform_hydration_seq = int(getattr(self, "_platform_hydration_seq", 0) or 0) + 1
+            seq = int(self._platform_hydration_seq)
+        except Exception:
+            seq = int(time.time() * 1000)
+        try:
+            if not isinstance(getattr(self, "_platform_hydration_expected_by_key", None), dict):
+                self._platform_hydration_expected_by_key = {}
+            self._platform_hydration_expected_by_key[ukey] = int(seq)
+        except Exception:
+            pass
 
-        self._fetch_lot_settings(auth_params, lot_resp)
-        self._fetch_symbol_settings(auth_params, sym_resp)
-        self._fetch_psl_settings(auth_params, psl_resp)
+        task = _BackendPollTask(
+            int(seq),
+            self.backend_url,
+            dict(auth_params or {}),
+            resources=["get_lot_settings", "get_symbol_settings", "get_psl_settings"],
+        )
 
-        self._platform_settings_hydrated[ukey] = True
-        self._snapshot_platform_ui_state(platform)
+        def _on_hydration_finished(done_seq: int, _ap: dict, responses: dict) -> None:
+            try:
+                expected = int((getattr(self, "_platform_hydration_expected_by_key", {}) or {}).get(ukey, 0) or 0)
+            except Exception:
+                expected = 0
+            if int(done_seq or 0) != expected:
+                return
+            try:
+                self._fetch_lot_settings(auth_params, (responses or {}).get("get_lot_settings"))
+                self._fetch_symbol_settings(auth_params, (responses or {}).get("get_symbol_settings"))
+                self._fetch_psl_settings(auth_params, (responses or {}).get("get_psl_settings"))
+            except Exception:
+                pass
+            try:
+                self._platform_settings_hydrated[ukey] = True
+            except Exception:
+                pass
+            try:
+                self._snapshot_platform_ui_state(platform)
+            except Exception:
+                pass
+
+        def _on_hydration_error(done_seq: int, _ap: dict, _message: str) -> None:
+            try:
+                expected = int((getattr(self, "_platform_hydration_expected_by_key", {}) or {}).get(ukey, 0) or 0)
+            except Exception:
+                expected = 0
+            if int(done_seq or 0) != expected:
+                return
+
+        task.signals.finished.connect(_on_hydration_finished)
+        task.signals.error.connect(_on_hydration_error)
+        self._backend_pool.start(task)
 
     def _mask_license_key(self, license_key: str) -> str:
         if not license_key:
@@ -21838,14 +22378,20 @@ class MainWindow(QtWidgets.QWidget):
                     if at not in {"prop", "normal"}:
                         continue
                     st = self._get_ea_context_state(platform, at)
-                    st["ea_active"] = bool(it.get("online", False))
+                    online = bool(it.get("online", False))
+                    revoked = bool(it.get("revoked", False))
+                    tid_resp = str(it.get("terminal_id") or "").strip()
+                    st["ea_active"] = online
+                    st["ea_authorized"] = (not revoked) and bool(tid_resp)
                     st["known"] = True
+                    st["last_seen_at"] = it.get("last_seen_at")
                 except Exception:
                     continue
 
             if platform == (getattr(self, "platform", None) or "mt5").lower():
                 try:
                     self.ea_active = self._get_platform_ea_active(platform)
+                    self.ea_authorized = self._get_platform_ea_authorized(platform)
                     self._ea_active_account = self._get_platform_active_account(platform)
                 except Exception:
                     pass
@@ -21870,7 +22416,18 @@ class MainWindow(QtWidgets.QWidget):
         if not self._backend_ui_hydration_allowed():
             return
         if response is None:
-            response = self._get_backend_json("get_lot_settings", auth_params)
+            # Do not perform synchronous network I/O on the UI thread.
+            def _done(resp: Optional[dict]) -> None:
+                try:
+                    self._fetch_lot_settings(auth_params, resp if isinstance(resp, dict) else {"status": "NET_ERROR", "message": "No response"})
+                except Exception:
+                    pass
+
+            try:
+                self._backend_post_async("/get_lot_settings", dict(auth_params or {}), on_done=_done)
+            except Exception:
+                pass
+            return
         if not response or response.get("status") != "OK":
             # If backend returned an error but included authoritative EA
             # indicators, capture them to avoid flipping UI state.
@@ -22071,7 +22628,18 @@ class MainWindow(QtWidgets.QWidget):
         if not self._backend_ui_hydration_allowed():
             return
         if response is None:
-            response = self._get_backend_json("get_symbol_settings", auth_params)
+            # Do not perform synchronous network I/O on the UI thread.
+            def _done(resp: Optional[dict]) -> None:
+                try:
+                    self._fetch_symbol_settings(auth_params, resp if isinstance(resp, dict) else {"status": "NET_ERROR", "message": "No response"})
+                except Exception:
+                    pass
+
+            try:
+                self._backend_post_async("/get_symbol_settings", dict(auth_params or {}), on_done=_done)
+            except Exception:
+                pass
+            return
         if not response or response.get("status") != "OK":
             if response and "ea_active" in response:
                 try:
@@ -22140,7 +22708,18 @@ class MainWindow(QtWidgets.QWidget):
         if not self._backend_ui_hydration_allowed():
             return
         if response is None:
-            response = self._get_backend_json("get_psl_settings", auth_params)
+            # Do not perform synchronous network I/O on the UI thread.
+            def _done(resp: Optional[dict]) -> None:
+                try:
+                    self._fetch_psl_settings(auth_params, resp if isinstance(resp, dict) else {"status": "NET_ERROR", "message": "No response"})
+                except Exception:
+                    pass
+
+            try:
+                self._backend_post_async("/get_psl_settings", dict(auth_params or {}), on_done=_done)
+            except Exception:
+                pass
+            return
         if not response or response.get("status") != "OK":
             if response and "ea_active" in response:
                 try:
@@ -24898,6 +25477,563 @@ class MainWindow(QtWidgets.QWidget):
         # REMOVED: Do NOT trigger polling on UI navigation
         # Polling is controlled solely by backend configuration state
 
+    # ------------------------------------------------------------------
+    # Virtual Terminal (Phase 3 UI)
+    # ------------------------------------------------------------------
+    def _show_virtual_terminal_coming_soon(self) -> None:
+        try:
+            self._show_toast("Virtual Terminal batch rollout is coming soon.")
+        except Exception:
+            pass
+
+    def _show_virtual_terminal(self) -> None:
+        self._toggle_drawer(False)
+        try:
+            self.content_stack.setCurrentWidget(self.virtual_terminal_page)
+        except Exception:
+            return
+        # Kick off entitlement + terminal list refresh; start the poll loop.
+        self._vt_refresh_all()
+        try:
+            if not self._vt_poll_timer.isActive():
+                self._vt_poll_timer.start()
+        except Exception:
+            pass
+
+    def _vt_apply_server_preset(self, *_args) -> None:
+        try:
+            preset = str(self.vt_server_preset.currentData() or "").strip()
+        except Exception:
+            preset = ""
+        if not preset:
+            return
+        try:
+            self.vt_broker_server.setText(preset)
+        except Exception:
+            pass
+
+    def _vt_set_detail_enabled(self, enabled: bool) -> None:
+        # Keep broker fields editable so users can pre-fill details even while
+        # selection/polling is changing; only action widgets are selection-gated.
+        for w in (
+            getattr(self, "vt_server_preset", None),
+            getattr(self, "vt_broker_server", None),
+            getattr(self, "vt_broker_login", None),
+            getattr(self, "vt_broker_password", None),
+            getattr(self, "vt_login_btn", None),
+        ):
+            try:
+                if w is not None:
+                    w.setEnabled(True)
+                    if hasattr(w, "setReadOnly"):
+                        w.setReadOnly(False)
+            except Exception:
+                pass
+
+        for w in (
+            getattr(self, "vt_attach_btn", None),
+            getattr(self, "vt_detach_btn", None),
+            getattr(self, "vt_restart_btn", None),
+            getattr(self, "vt_stop_btn", None),
+            getattr(self, "vt_forget_btn", None),
+            getattr(self, "vt_switch_account", None),
+            getattr(self, "vt_switch_btn", None),
+        ):
+            try:
+                if w is not None:
+                    w.setEnabled(bool(enabled))
+            except Exception:
+                pass
+
+    def _vt_tick(self) -> None:
+        # Background refresh while the page is visible.
+        try:
+            visible = (self.content_stack.currentWidget() is self.virtual_terminal_page)
+        except Exception:
+            visible = False
+        if not visible:
+            try:
+                self._vt_poll_timer.stop()
+            except Exception:
+                pass
+            return
+        try:
+            if any(
+                bool(w and w.hasFocus())
+                for w in (
+                    getattr(self, "vt_server_preset", None),
+                    getattr(self, "vt_broker_server", None),
+                    getattr(self, "vt_broker_login", None),
+                    getattr(self, "vt_broker_password", None),
+                )
+            ):
+                return
+        except Exception:
+            pass
+        self._vt_refresh_terminals()
+        if self._vt_selected_terminal_id:
+            self._vt_poll_events()
+
+    def _vt_refresh_all(self) -> None:
+        self._vt_refresh_entitlements()
+        self._vt_refresh_terminals()
+
+    def _vt_refresh_entitlements(self) -> None:
+        auth = self._backend_auth_params()
+        if not auth:
+            try:
+                self.vt_entitlement_label.setText("Entitlements: sign in and authorize an EA first.")
+            except Exception:
+                pass
+            return
+
+        def _on_done(resp: Optional[dict]) -> None:
+            if not isinstance(resp, dict):
+                return
+            if resp.get("status") != "OK":
+                msg = str(resp.get("message") or resp.get("status") or "Unavailable")
+                try:
+                    self.vt_entitlement_label.setText(f"Entitlements: {msg}")
+                except Exception:
+                    pass
+                return
+            ent = resp.get("entitlement") or {}
+            unlocked = ent.get("platforms_unlocked") or []
+            extra = ent.get("extra_slots") or {}
+            try:
+                txt = (
+                    f"Free platform: {ent.get('free_platform') or '—'} · "
+                    f"Unlocked: {', '.join(unlocked) if unlocked else 'none'} · "
+                    f"Extra slots: MT4={int(extra.get('mt4', 0))}, MT5={int(extra.get('mt5', 0))}"
+                )
+                self.vt_entitlement_label.setText(txt)
+            except Exception:
+                pass
+
+        self._backend_post_async("/vps/entitlements", dict(auth), on_done=_on_done, timeout=15.0)
+
+    def _vt_refresh_terminals(self) -> None:
+        auth = self._backend_auth_params()
+        if not auth:
+            return
+        if self._vt_inflight:
+            return
+        self._vt_inflight = True
+
+        def _on_done(resp: Optional[dict]) -> None:
+            self._vt_inflight = False
+            if not isinstance(resp, dict) or resp.get("status") != "OK":
+                return
+            terms = list(resp.get("terminals") or [])
+            self._vt_terminals_cache = terms
+            try:
+                self._vt_render_terminals(terms)
+            except Exception:
+                pass
+
+        self._backend_post_async("/vps/terminal/list", dict(auth), on_done=_on_done, timeout=15.0)
+
+    def _vt_render_terminals(self, terms: list) -> None:
+        try:
+            prev = self._vt_selected_terminal_id
+            if not prev:
+                try:
+                    cur = self.vt_terminals_list.currentItem()
+                    if cur is not None:
+                        prev = str(cur.data(QtCore.Qt.UserRole) or "").strip() or None
+                except Exception:
+                    pass
+            self.vt_terminals_list.blockSignals(True)
+            self.vt_terminals_list.clear()
+            row_to_select = -1
+            for i, t in enumerate(terms):
+                tid = str(t.get("id") or t.get("terminal_id") or "").strip()
+                plat = (t.get("platform") or "").upper()
+                acct = (t.get("account_type") or "").title()
+                status = t.get("status") or "—"
+                ea = "EA✓" if t.get("ea_attached") else "EA—"
+                label = f"{plat}  {acct}  ·  {status}  ·  {ea}"
+                item = QtWidgets.QListWidgetItem(label)
+                item.setData(QtCore.Qt.UserRole, tid)
+                self.vt_terminals_list.addItem(item)
+                if tid and tid == prev:
+                    row_to_select = i
+            if row_to_select < 0 and self.vt_terminals_list.count() > 0:
+                # UX: auto-select the first terminal so actions/forms are immediately usable.
+                row_to_select = 0
+            self.vt_terminals_list.blockSignals(False)
+            if row_to_select >= 0:
+                self.vt_terminals_list.setCurrentRow(row_to_select)
+                try:
+                    cur = self.vt_terminals_list.item(row_to_select)
+                    if cur is not None:
+                        self._vt_selected_terminal_id = str(cur.data(QtCore.Qt.UserRole) or "").strip() or None
+                except Exception:
+                    pass
+                self._vt_update_detail()
+            else:
+                self._vt_selected_terminal_id = None
+                self._vt_set_detail_enabled(False)
+        finally:
+            try:
+                self.vt_terminals_list.blockSignals(False)
+            except Exception:
+                pass
+
+    def _vt_on_selection_changed(self) -> None:
+        try:
+            item = self.vt_terminals_list.currentItem()
+        except Exception:
+            item = None
+        if item is None:
+            self._vt_selected_terminal_id = None
+            self._vt_set_detail_enabled(False)
+            try:
+                self.vt_detail_title.setText("Select a terminal")
+                self.vt_detail_status.setText("—")
+                self.vt_event_log.clear()
+            except Exception:
+                pass
+            return
+        tid = str(item.data(QtCore.Qt.UserRole) or "").strip()
+        self._vt_selected_terminal_id = tid or None
+        self._vt_event_since_id = 0
+        try:
+            self.vt_event_log.clear()
+        except Exception:
+            pass
+        self._vt_update_detail()
+        if tid:
+            self._vt_poll_events()
+
+    def _vt_current_terminal(self) -> Optional[dict]:
+        tid = self._vt_selected_terminal_id
+        if not tid:
+            return None
+        for t in self._vt_terminals_cache or []:
+            if str(t.get("id") or t.get("terminal_id") or "") == tid:
+                return t
+        return None
+
+    def _vt_update_detail(self) -> None:
+        t = self._vt_current_terminal()
+        if t is None:
+            self._vt_set_detail_enabled(False)
+            return
+        try:
+            self.vt_detail_title.setText(
+                f"{(t.get('platform') or '').upper()} · {(t.get('account_type') or '').title()}"
+            )
+            self.vt_detail_status.setText(
+                f"Status: {t.get('status') or '—'}    EA: {'attached' if t.get('ea_attached') else 'detached'}"
+            )
+            cur_acct = str(t.get("account_type") or "normal").lower()
+            idx = self.vt_switch_account.findData(cur_acct)
+            if idx >= 0:
+                self.vt_switch_account.setCurrentIndex(idx)
+        except Exception:
+            pass
+        self._vt_set_detail_enabled(True)
+
+    def _vt_poll_events(self) -> None:
+        tid = self._vt_selected_terminal_id
+        if not tid:
+            return
+        auth = self._backend_auth_params()
+        if not auth:
+            return
+        payload = dict(auth)
+        payload["terminal_id"] = tid
+        payload["since"] = int(self._vt_event_since_id or 0)
+        payload["limit"] = 100
+
+        def _on_done(resp: Optional[dict]) -> None:
+            if not isinstance(resp, dict) or resp.get("status") != "OK":
+                return
+            events = list(resp.get("events") or [])
+            if not events:
+                return
+            try:
+                cursor = self.vt_event_log.textCursor()
+                cursor.movePosition(QtGui.QTextCursor.End)
+                self.vt_event_log.setTextCursor(cursor)
+                for ev in events:
+                    sev = str(ev.get("severity") or "info").upper()
+                    ts = str(ev.get("created_at") or "")[:19].replace("T", " ")
+                    line = f"[{ts}] {sev:5s} {ev.get('event_type', '')}: {ev.get('message', '')}"
+                    self.vt_event_log.appendPlainText(line)
+                self._vt_event_since_id = int(resp.get("next_since") or self._vt_event_since_id)
+            except Exception:
+                pass
+
+        self._backend_post_async("/vps/terminal/events", payload, on_done=_on_done, timeout=15.0)
+
+    def _vt_purchase(self, sku: str) -> None:
+        auth = self._backend_auth_params()
+        if not auth:
+            return
+        target = (auth.get("platform") or "mt5").lower()
+        payload = dict(auth)
+        payload["sku"] = sku
+        payload["target_platform"] = target
+
+        def _on_done(resp: Optional[dict]) -> None:
+            try:
+                if isinstance(resp, dict):
+                    self._show_toast(str(resp.get("message") or resp.get("status") or "OK"))
+            except Exception:
+                pass
+            self._vt_refresh_entitlements()
+
+        self._backend_post_async("/vps/entitlements/purchase", payload, on_done=_on_done, timeout=20.0)
+
+    def _vt_request_terminal(self) -> None:
+        auth = self._backend_auth_params()
+        if not auth:
+            try:
+                self._show_toast("Authorize your EA in Expert first.")
+            except Exception:
+                pass
+            return
+        payload = dict(auth)
+        payload["platform"] = self.vt_new_platform.currentData() or auth.get("platform") or "mt5"
+        payload["account_type"] = self.vt_new_account.currentData() or "normal"
+
+        def _on_done(resp: Optional[dict]) -> None:
+            if isinstance(resp, dict):
+                msg = resp.get("message") or resp.get("status") or "OK"
+                try:
+                    self._show_toast(str(msg))
+                except Exception:
+                    pass
+            self._vt_refresh_terminals()
+
+        self._backend_post_async("/vps/terminal/request", payload, on_done=_on_done, timeout=20.0)
+
+    def _vt_seal_broker_payload(self, server: str, login: str, password: str) -> Optional[str]:
+        """Produce a libsodium sealed-box ciphertext for /vps/terminal/login.
+
+        Uses the orchestrator's published public key (cached on
+        ``self._vt_pubkey_b64``). If PyNaCl isn't available or the key isn't
+        cached yet, returns ``None`` — the caller is expected to first run
+        ``_vt_ensure_pubkey`` and retry.
+        """
+        try:
+            import base64 as _b64
+            import json as _json
+            from nacl.public import PublicKey as _NaclPublicKey, SealedBox as _NaclSealedBox  # type: ignore
+        except Exception:
+            return None
+        pk_b64 = str(getattr(self, "_vt_pubkey_b64", "") or "").strip()
+        if not pk_b64:
+            return None
+        try:
+            pk_bytes = _b64.b64decode(pk_b64, validate=True)
+            box = _NaclSealedBox(_NaclPublicKey(pk_bytes))
+            blob = _json.dumps({
+                "server": str(server or ""),
+                "login": str(login or ""),
+                "password": str(password or ""),
+            }, ensure_ascii=False).encode("utf-8")
+            ct = box.encrypt(blob)
+            return _b64.b64encode(ct).decode("ascii")
+        except Exception:
+            return None
+
+    def _vt_ensure_pubkey(self, on_ready) -> None:
+        """Fetch + cache the orchestrator's libsodium public key, then run callback.
+
+        ``on_ready`` is invoked on the GUI thread with no arguments after the
+        key is cached (or with an empty cache if the fetch failed — the caller
+        decides how to handle that).
+        """
+        if str(getattr(self, "_vt_pubkey_b64", "") or "").strip():
+            try:
+                on_ready()
+            except Exception:
+                pass
+            return
+        auth = self._backend_auth_params()
+        if not auth:
+            try:
+                on_ready()
+            except Exception:
+                pass
+            return
+
+        def _on_done(resp: Optional[dict]) -> None:
+            try:
+                if isinstance(resp, dict) and resp.get("status") == "OK":
+                    pk = str(resp.get("public_key_b64") or "").strip()
+                    if pk:
+                        self._vt_pubkey_b64 = pk
+            except Exception:
+                pass
+            try:
+                on_ready()
+            except Exception:
+                pass
+
+        self._backend_post_async("/vps/orchestrator/pubkey", dict(auth), on_done=_on_done, timeout=10.0)
+
+    def _vt_submit_broker_login(self) -> None:
+        tid = str(self._vt_selected_terminal_id or "").strip()
+        if not tid:
+            try:
+                item = self.vt_terminals_list.currentItem()
+                if item is not None:
+                    tid = str(item.data(QtCore.Qt.UserRole) or "").strip()
+                    if tid:
+                        self._vt_selected_terminal_id = tid
+            except Exception:
+                pass
+        if not tid:
+            # Extra fallback: when there is only one terminal in cache, use it.
+            try:
+                if len(self._vt_terminals_cache or []) == 1:
+                    only = (self._vt_terminals_cache or [])[0] or {}
+                    tid = str(only.get("id") or only.get("terminal_id") or "").strip()
+                    if tid:
+                        self._vt_selected_terminal_id = tid
+            except Exception:
+                pass
+        if not tid:
+            try:
+                self._show_toast("Select a terminal first.")
+            except Exception:
+                pass
+            return
+        auth = self._backend_auth_params()
+        if not auth:
+            try:
+                self._show_toast("Authorize your account first.")
+            except Exception:
+                pass
+            return
+
+        # Snapshot inputs *before* the async pubkey fetch, so a slow round-trip
+        # doesn't lose the password if the user navigates away.
+        server = self.vt_broker_server.text()
+        login = self.vt_broker_login.text()
+        password = self.vt_broker_password.text()
+        if not str(server or "").strip() or not str(login or "").strip() or not str(password or "").strip():
+            try:
+                self._show_toast("Fill server, login and password.")
+            except Exception:
+                pass
+            return
+
+        def _send() -> None:
+            if not str(getattr(self, "_vt_pubkey_b64", "") or "").strip():
+                try:
+                    self._show_toast("VPS public key missing. Tap Refresh and retry.")
+                except Exception:
+                    pass
+                return
+            try:
+                from nacl.public import PublicKey as _Pk, SealedBox as _Sb  # type: ignore  # noqa: F401
+            except Exception:
+                try:
+                    self._show_toast("Encryption module missing. Install PyNaCl (pip install pynacl).")
+                except Exception:
+                    pass
+                return
+
+            sealed = self._vt_seal_broker_payload(server, login, password)
+            if not sealed:
+                try:
+                    self._show_toast("Encryption failed. Check PyNaCl and VPS public key, then retry.")
+                except Exception:
+                    pass
+                return
+            payload = dict(auth)
+            payload["terminal_id"] = tid
+            payload["sealed_payload"] = sealed
+            try:
+                self.vt_broker_password.clear()
+            except Exception:
+                pass
+
+            def _on_done(resp: Optional[dict]) -> None:
+                if isinstance(resp, dict):
+                    try:
+                        self._show_toast(str(resp.get("message") or resp.get("status") or "Submitted"))
+                    except Exception:
+                        pass
+                self._vt_refresh_terminals()
+
+            self._backend_post_async("/vps/terminal/login", payload, on_done=_on_done, timeout=20.0)
+
+        self._vt_ensure_pubkey(_send)
+
+    def _vt_simple_terminal_action(self, path: str, *, refresh: bool = True, confirm: Optional[str] = None) -> None:
+        tid = self._vt_selected_terminal_id
+        if not tid:
+            return
+        if confirm:
+            try:
+                btn = QtWidgets.QMessageBox.question(self, "Virtual Terminal", confirm)
+                if btn != QtWidgets.QMessageBox.Yes:
+                    return
+            except Exception:
+                pass
+        auth = self._backend_auth_params()
+        if not auth:
+            return
+        payload = dict(auth)
+        payload["terminal_id"] = tid
+
+        def _on_done(resp: Optional[dict]) -> None:
+            if isinstance(resp, dict):
+                try:
+                    self._show_toast(str(resp.get("message") or resp.get("status") or "OK"))
+                except Exception:
+                    pass
+            if refresh:
+                self._vt_refresh_terminals()
+
+        self._backend_post_async(path, payload, on_done=_on_done, timeout=20.0)
+
+    def _vt_attach_ea(self) -> None:
+        self._vt_simple_terminal_action("/vps/terminal/attach_ea")
+
+    def _vt_detach_ea(self) -> None:
+        self._vt_simple_terminal_action("/vps/terminal/detach_ea")
+
+    def _vt_restart(self) -> None:
+        self._vt_simple_terminal_action("/vps/terminal/restart")
+
+    def _vt_stop(self) -> None:
+        self._vt_simple_terminal_action("/vps/terminal/stop",
+                                       confirm="Stop this terminal? Open trades will be left as-is.")
+
+    def _vt_forget(self) -> None:
+        self._vt_simple_terminal_action(
+            "/vps/terminal/forget",
+            confirm="Forget this terminal? Broker credentials will be wiped and the slot freed.",
+        )
+
+    def _vt_switch_account_type(self) -> None:
+        tid = self._vt_selected_terminal_id
+        if not tid:
+            return
+        auth = self._backend_auth_params()
+        if not auth:
+            return
+        payload = dict(auth)
+        payload["terminal_id"] = tid
+        payload["account_type"] = self.vt_switch_account.currentData() or "normal"
+
+        def _on_done(resp: Optional[dict]) -> None:
+            if isinstance(resp, dict):
+                try:
+                    self._show_toast(str(resp.get("message") or resp.get("status") or "OK"))
+                except Exception:
+                    pass
+            self._vt_refresh_terminals()
+
+        self._backend_post_async("/vps/terminal/switch_account_type", payload, on_done=_on_done, timeout=20.0)
+
     def _show_subscription(self) -> None:
         self._toggle_drawer(False)
         self.content_stack.setCurrentWidget(self.subscription_page)
@@ -24912,29 +26048,36 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
     def _subscription_selected_provider(self) -> Optional[Tuple[str, str, str]]:
-        if bool(getattr(self, "sub_crypto_radio", None) and self.sub_crypto_radio.isChecked()):
-            return "nowpayments", "crypto", "crypto"
-        if bool(getattr(self, "sub_card_radio", None) and self.sub_card_radio.isChecked()):
-            return "flutterwave", "card", "card"
         if bool(getattr(self, "sub_bank_radio", None) and self.sub_bank_radio.isChecked()):
             return "flutterwave", "bank_transfer", "bank_transfer"
         return None
 
+    def _subscription_plan_buttons(self) -> List[Tuple[str, QtWidgets.QPushButton, str, Tuple[str, ...]]]:
+        return [
+            ("day", self.sub_plan_day_btn, "Daily", ("daily", "day")),
+            ("week", self.sub_plan_week_btn, "Weekly", ("weekly", "week")),
+            ("month", self.sub_plan_month_btn, "Monthly", ("monthly", "month")),
+            ("year", self.sub_plan_year_btn, "Yearly", ("yearly", "year", "annual")),
+        ]
+
     def _subscription_plan_interval(self) -> str:
-        if bool(getattr(self, "sub_plan_year_btn", None) and self.sub_plan_year_btn.isChecked()):
-            return "year"
-        if bool(getattr(self, "sub_plan_month_btn", None) and self.sub_plan_month_btn.isChecked()):
-            return "month"
+        for interval, button, _fallback_label, _aliases in self._subscription_plan_buttons():
+            if bool(getattr(button, "isChecked", lambda: False)()):
+                return interval
         return ""
 
     def _subscription_plan_code(self) -> str:
         """Return the currently selected plan's plan_code (preferred over interval)."""
         # Each plan button stores the plan_code in its property if loaded dynamically.
-        for btn in (self.sub_plan_month_btn, self.sub_plan_year_btn):
+        for _interval, btn, _fallback_label, _aliases in self._subscription_plan_buttons():
             if bool(getattr(btn, "isChecked", lambda: False)()) and bool(getattr(btn, "_plan_code", "")):
                 return str(btn._plan_code)  # type: ignore[attr-defined]
         # Fallback: map legacy interval to default plan codes.
         interval = self._subscription_plan_interval()
+        if interval == "day":
+            return "daily"
+        if interval == "week":
+            return "weekly"
         if interval == "year":
             return "yearly"
         if interval == "month":
@@ -24945,19 +26088,19 @@ class MainWindow(QtWidgets.QWidget):
         """Update plan button labels dynamically from server-provided plans list."""
         if not isinstance(plans, list) or not plans:
             return
-        month_plan = next((p for p in plans if p.get("plan_code") in {"monthly", "month"}), None)
-        year_plan = next((p for p in plans if p.get("plan_code") in {"yearly", "year", "annual"}), None)
         try:
-            if month_plan:
-                price = int(month_plan.get("price_usd_cents") or 0)
-                label = f"{month_plan.get('display_name', 'Monthly')} - ${price / 100:.2f}"
-                self.sub_plan_month_btn.setText(label)
-                self.sub_plan_month_btn._plan_code = str(month_plan.get("plan_code") or "monthly")  # type: ignore[attr-defined]
-            if year_plan:
-                price = int(year_plan.get("price_usd_cents") or 0)
-                label = f"{year_plan.get('display_name', 'Yearly')} - ${price / 100:.2f}"
-                self.sub_plan_year_btn.setText(label)
-                self.sub_plan_year_btn._plan_code = str(year_plan.get("plan_code") or "yearly")  # type: ignore[attr-defined]
+            for _interval, button, fallback_label, aliases in self._subscription_plan_buttons():
+                plan = next((p for p in plans if p.get("plan_code") in aliases), None)
+                if plan:
+                    price = int(plan.get("price_usd_cents") or 0)
+                    label = f"{plan.get('display_name', fallback_label)} - ${price / 100:.2f}"
+                    button.setText(label)
+                    button._plan_code = str(plan.get("plan_code") or aliases[0])  # type: ignore[attr-defined]
+                    button.setEnabled(bool(plan.get("is_active", True)))
+                else:
+                    button.setText(f"{fallback_label} - unavailable")
+                    button._plan_code = aliases[0]  # type: ignore[attr-defined]
+                    button.setEnabled(False)
         except Exception:
             pass
 
@@ -24975,83 +26118,111 @@ class MainWindow(QtWidgets.QWidget):
         return device_id
 
     def _subscription_identity_payload(self) -> Optional[dict]:
-        # Subscription APIs should tolerate account-tab drift by using any valid
-        # license available for the current platform (fallback to selected account).
+        candidates = self._subscription_identity_payload_candidates()
+        if candidates:
+            return dict(candidates[0])
+        return None
+
+    def _subscription_identity_payload_candidates(self) -> List[dict]:
+        # Build an ordered list of potential identities so checkout/status can
+        # recover automatically from platform/account-tab drift.
         platform_key = (getattr(self, "platform", None) or "mt5").lower()
         if platform_key not in {"mt4", "mt5"}:
             platform_key = "mt5"
-
-        auth = self._resolve_backend_auth_for_platform(platform_key) or self._backend_auth_params()
-        if not auth:
-            return None
-
-        flamebot_id = str(auth.get("user_id") or "").strip() or str((getattr(self, "flamebot_ids", {}) or {}).get(platform_key, "") or "").strip()
-        license_key = str(auth.get("license_key") or "").strip()
-        if not license_key:
-            try:
-                lic_map = (getattr(self, "licenses_by_platform", {}) or {}).get(platform_key, {}) or {}
-                selected = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop") or "prop"
-                license_key = str(lic_map.get(selected) or "").strip()
-                if not license_key:
-                    for acct in ("prop", "normal"):
-                        candidate = str(lic_map.get(acct) or "").strip()
-                        if candidate:
-                            license_key = candidate
-                            break
-            except Exception:
-                license_key = ""
-
-        if not flamebot_id or not license_key:
-            return None
 
         try:
             settings_app_version = self.settings.get("app_version") if isinstance(self.settings, dict) else None
         except Exception:
             settings_app_version = None
         app_version = _resolve_client_app_version(settings_app_version)
+        device_id = self._subscription_device_id()
 
-        payload = {
-            "user_id": flamebot_id,
-            "flamebot_id": flamebot_id,
-            "license_key": license_key,
-            "platform": platform_key,
-            "account_type": self._normalize_account_type(auth.get("account_type") or getattr(self, "current_account_type", None) or "prop") or "prop",
-            "app_version": app_version,
-            "device_id": self._subscription_device_id(),
-        }
-        terminal_id = str(auth.get("terminal_id") or "").strip()
-        if terminal_id:
-            payload["terminal_id"] = terminal_id
-        return payload
+        candidate_auth: List[dict] = []
+        for p in (platform_key, "mt5", "mt4"):
+            auth = self._resolve_backend_auth_for_platform(p)
+            if isinstance(auth, dict):
+                candidate_auth.append(auth)
+        fallback_auth = self._backend_auth_params()
+        if isinstance(fallback_auth, dict):
+            candidate_auth.append(fallback_auth)
+
+        payloads: List[dict] = []
+        seen: set[Tuple[str, str, str]] = set()
+        for auth in candidate_auth:
+            p = str(auth.get("platform") or platform_key).strip().lower()
+            if p not in {"mt4", "mt5"}:
+                p = platform_key
+
+            flamebot_id = str(auth.get("user_id") or "").strip() or str((getattr(self, "flamebot_ids", {}) or {}).get(p, "") or "").strip()
+            license_key = str(auth.get("license_key") or "").strip()
+            if not license_key:
+                try:
+                    lic_map = (getattr(self, "licenses_by_platform", {}) or {}).get(p, {}) or {}
+                    selected = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop") or "prop"
+                    license_key = str(lic_map.get(selected) or "").strip()
+                    if not license_key:
+                        for acct in ("prop", "normal"):
+                            candidate = str(lic_map.get(acct) or "").strip()
+                            if candidate:
+                                license_key = candidate
+                                break
+                except Exception:
+                    license_key = ""
+
+            if not flamebot_id or not license_key:
+                continue
+
+            dedupe_key = (flamebot_id, license_key, p)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            payload = {
+                "user_id": flamebot_id,
+                "flamebot_id": flamebot_id,
+                "license_key": license_key,
+                "platform": p,
+                "account_type": self._normalize_account_type(auth.get("account_type") or getattr(self, "current_account_type", None) or "prop") or "prop",
+                "app_version": app_version,
+                "device_id": device_id,
+            }
+            terminal_id = str(auth.get("terminal_id") or "").strip()
+            if terminal_id:
+                payload["terminal_id"] = terminal_id
+            payloads.append(payload)
+
+        return payloads
 
     def _subscription_clear_method_selection(self) -> None:
         try:
             self.subscription_method_group.setExclusive(False)
-            for btn in (self.sub_bank_radio, self.sub_card_radio, self.sub_crypto_radio):
+            for btn in (self.sub_bank_radio,):
                 btn.setChecked(False)
         finally:
             self.subscription_method_group.setExclusive(True)
 
     def _subscription_set_method_buttons_enabled(self, enabled: bool) -> None:
-        for btn in (self.sub_bank_radio, self.sub_card_radio, self.sub_crypto_radio):
+        for btn in (self.sub_bank_radio,):
             btn.setEnabled(bool(enabled))
 
+    def _update_subscription_continue_button_state(self) -> None:
+        has_plan = bool(self._subscription_plan_code())
+        has_method = self._subscription_selected_provider() is not None
+        ready = bool(has_plan and has_method and not bool(getattr(self, "_subscription_checkout_locked", False)))
+        try:
+            self.sub_continue_payment_btn.setEnabled(ready)
+            self.sub_continue_payment_btn.setVisible(bool(has_plan))
+        except Exception:
+            pass
+
     def _subscription_reset_payment_details(self, message: str) -> None:
-        self.sub_payment_detail_title.setText("Payment Details")
-        self.sub_payment_detail_body.setText(str(message or ""))
-        self.sub_payment_detail_fields.setText("")
-        self.sub_payment_detail_fields.show()
-        self.sub_payment_detail_link.setText("")
-        self.sub_payment_detail_link.show()
-        self.sub_payment_qr_label.clear()
-        self.sub_payment_qr_label.hide()
         self.sub_checkout_status.setText(str(message or ""))
 
     def _on_subscription_plan_toggled(self, interval: str, checked: bool) -> None:
-        if interval == "month" and checked:
-            self.sub_plan_year_btn.setChecked(False)
-        elif interval == "year" and checked:
-            self.sub_plan_month_btn.setChecked(False)
+        if checked:
+            for other_interval, button, _fallback_label, _aliases in self._subscription_plan_buttons():
+                if other_interval != interval:
+                    button.setChecked(False)
 
         selected_plan = self._subscription_plan_interval()
         has_plan = bool(selected_plan)
@@ -25059,31 +26230,35 @@ class MainWindow(QtWidgets.QWidget):
         self._subscription_stop_status_polling()
         self._subscription_last_payment_id = ""
         self._subscription_last_payment_session_id = ""
+        self._subscription_checkout_locked = False
         self._subscription_clear_method_selection()
         self.sub_payment_heading.setVisible(has_plan)
         self.sub_payment_methods_panel.setVisible(has_plan)
 
         if has_plan:
-            self.sub_payment_methods_hint.setText("Select how you want to pay. FlameBot will confirm your payment automatically.")
-            self.sub_steps_label.setText("Select a payment option to view payment steps.")
-            self._subscription_reset_payment_details("Select a payment method to create a payment session.")
+            self.sub_payment_methods_hint.setText("Select Bank Transfer. FlameBot will confirm your payment automatically.")
+            self.sub_steps_label.setText("Select a payment option, then click Continue with Payment.")
+            self._subscription_reset_payment_details("Select a payment method, then click Continue with Payment.")
+            self._update_subscription_continue_button_state()
             return
 
         self.sub_payment_methods_hint.setText("Select a plan first.")
-        self.sub_steps_label.setText("Choose monthly or yearly to continue.")
+        self.sub_steps_label.setText("Choose a plan to continue.")
         self._subscription_reset_payment_details("Choose a plan, then select a payment method.")
+        self._update_subscription_continue_button_state()
 
     def _on_subscription_payment_method_clicked(self) -> None:
         if not self._subscription_plan_code():
             self._subscription_clear_method_selection()
             self._subscription_reset_payment_details("Choose a plan, then select a payment method.")
-            self._show_toast("Choose monthly or yearly first.")
+            self._show_toast("Choose a plan first.")
+            self._update_subscription_continue_button_state()
             return
-        self._start_subscription_checkout()
+        self._subscription_reset_payment_details("Click Continue with Payment to generate your secure checkout link.")
+        self._update_subscription_continue_button_state()
 
     def _subscription_render_payment_display(self, display: Optional[dict], payment: Optional[dict] = None) -> None:
         if not isinstance(display, dict):
-            self._subscription_reset_payment_details("Payment session created. Follow the payment steps below.")
             return
 
         title = str(display.get("title") or "Payment Details").strip() or "Payment Details"
@@ -25116,30 +26291,12 @@ class MainWindow(QtWidgets.QWidget):
 
         checkout_url = str(display.get("checkout_url") or (payment or {}).get("checkout_url") or "").strip()
 
-        self.sub_payment_detail_title.setText(title)
-        self.sub_payment_detail_body.setText(message)
-        self.sub_payment_detail_fields.setText("\n".join(lines))
-        self.sub_payment_detail_link.setText(f"Secure payment page: {checkout_url}" if checkout_url else "")
-
-        qr_data_url = str(display.get("qr_code_data_url") or "").strip()
-        if qr_data_url.startswith("data:image/png;base64,"):
-            try:
-                raw = base64.b64decode(qr_data_url.split(",", 1)[1])
-                pixmap = QtGui.QPixmap()
-                if pixmap.loadFromData(raw, "PNG"):
-                    self.sub_payment_qr_label.setPixmap(
-                        pixmap.scaled(180, 180, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-                    )
-                    self.sub_payment_qr_label.show()
-                else:
-                    self.sub_payment_qr_label.clear()
-                    self.sub_payment_qr_label.hide()
-            except Exception:
-                self.sub_payment_qr_label.clear()
-                self.sub_payment_qr_label.hide()
-        else:
-            self.sub_payment_qr_label.clear()
-            self.sub_payment_qr_label.hide()
+        summary_bits = [title, message]
+        if lines:
+            summary_bits.append(" | ".join(lines))
+        if checkout_url:
+            summary_bits.append(f"Secure payment page: {checkout_url}")
+        self.sub_checkout_status.setText("\n".join([b for b in summary_bits if b]))
 
     def _subscription_parse_deadline_ts(self, raw_value: str) -> float:
         text = str(raw_value or "").strip()
@@ -25176,9 +26333,58 @@ class MainWindow(QtWidgets.QWidget):
         deadline_ts = float(getattr(self, "_subscription_poll_deadline_ts", 0.0) or 0.0)
         if deadline_ts > 0.0 and time.time() >= deadline_ts:
             self._subscription_stop_status_polling()
+            self._subscription_checkout_locked = False
+            self._update_subscription_continue_button_state()
             self.sub_checkout_status.setText("Payment session expired before confirmation. Select a plan and payment method to try again.")
             return
         self._refresh_subscription_status(quiet=True, from_poll=True)
+
+    # ── Subscription status banner ─────────────────────────────────────────
+    def _update_subscription_banner(self, status_text: str, allowed: bool, reason: str) -> None:
+        """Show/update the persistent subscription status banner based on current status."""
+        new_state: Optional[str] = None
+        if allowed:
+            st = status_text.lower()
+            if st in {"active", "trialing"} or reason in {"subscription_active", "trial_active"}:
+                new_state = "active"
+            else:
+                new_state = None  # allowed but no special state — hide banner
+        else:
+            new_state = "expired"
+
+        # Re-show if state has changed (clears a prior dismissal).
+        if new_state != self._sub_banner_last_state:
+            self._sub_banner_dismissed = False
+            self._sub_banner_last_state = new_state
+
+        if new_state is None or self._sub_banner_dismissed:
+            self.sub_banner.hide()
+            return
+
+        if new_state == "expired":
+            self.sub_banner_label.setText("⚠  Your subscription has ended. Signals are paused.")
+            self.sub_banner.setStyleSheet(
+                "QWidget#sub_banner { background: #5c1a1a; border-radius: 4px; min-height: 24px; max-height: 30px; }"
+                "QLabel#sub_banner_label { color: #ffcccc; font-size: 12px; }"
+                "QPushButton#sub_banner_dismiss { color: #ffffff; font-size: 11px; font-weight: 700; border: 1px solid rgba(255,255,255,0.35); border-radius: 8px; background: rgba(0,0,0,0.15); padding: 0; }"
+                "QPushButton#sub_banner_dismiss:hover { background: rgba(0,0,0,0.3); }"
+            )
+        else:  # active / just subscribed
+            self.sub_banner_label.setText("✅  You are now subscribed. Signals are active.")
+            self.sub_banner.setStyleSheet(
+                "QWidget#sub_banner { background: #1a3d1a; border-radius: 4px; min-height: 24px; max-height: 30px; }"
+                "QLabel#sub_banner_label { color: #ccffcc; font-size: 12px; }"
+                "QPushButton#sub_banner_dismiss { color: #ffffff; font-size: 11px; font-weight: 700; border: 1px solid rgba(255,255,255,0.35); border-radius: 8px; background: rgba(0,0,0,0.15); padding: 0; }"
+                "QPushButton#sub_banner_dismiss:hover { background: rgba(0,0,0,0.3); }"
+            )
+
+        self.sub_banner.show()
+
+    def _dismiss_subscription_banner(self) -> None:
+        """Hide the subscription status banner until the subscription state changes."""
+        self._sub_banner_dismissed = True
+        self.sub_banner.hide()
+    # ──────────────────────────────────────────────────────────────────────
 
     def _render_checkout_steps(self, guide: Optional[dict]) -> None:
         if not isinstance(guide, dict):
@@ -25253,27 +26459,32 @@ class MainWindow(QtWidgets.QWidget):
             self.sub_legacy_label.setText(
                 f"Update requirement: min version {str(settings.get('min_supported_app_version') or 'n/a')}"
             )
-            monthly_raw = pricing.get("monthly_usd_cents")
-            yearly_raw = pricing.get("yearly_usd_cents")
-            if monthly_raw is not None and yearly_raw is not None:
-                monthly = int(monthly_raw)
-                yearly = int(yearly_raw)
-                self.sub_pricing_label.setText(
-                    f"Pricing: ${monthly / 100:.2f} monthly / ${yearly / 100:.2f} yearly"
-                )
+            pricing_parts = []
+            for key, label in (("daily_usd_cents", "daily"), ("weekly_usd_cents", "weekly"), ("monthly_usd_cents", "monthly"), ("yearly_usd_cents", "yearly")):
+                raw_value = pricing.get(key)
+                if raw_value is None:
+                    continue
+                pricing_parts.append(f"${int(raw_value) / 100:.2f} {label}")
+            if pricing_parts:
+                self.sub_pricing_label.setText(f"Pricing: {' / '.join(pricing_parts)}")
             else:
                 self.sub_pricing_label.setText("Pricing: unavailable")
             # Update plan button labels dynamically from DB-sourced plans list.
             plans_list = pricing.get("plans") if isinstance(pricing.get("plans"), list) else []
             if plans_list:
                 self._subscription_update_plan_buttons(plans_list)
-            elif monthly_raw is not None and yearly_raw is not None:
-                monthly = int(monthly_raw)
-                yearly = int(yearly_raw)
-                self.sub_plan_month_btn.setText(f"Monthly - ${monthly / 100:.2f}")
-                self.sub_plan_year_btn.setText(f"Yearly - ${yearly / 100:.2f}")
-                self.sub_plan_month_btn._plan_code = "monthly"  # type: ignore[attr-defined]
-                self.sub_plan_year_btn._plan_code = "yearly"  # type: ignore[attr-defined]
+            else:
+                for _interval, button, fallback_label, aliases in self._subscription_plan_buttons():
+                    pricing_key = f"{aliases[0]}_usd_cents"
+                    raw_value = pricing.get(pricing_key)
+                    if raw_value is not None:
+                        button.setText(f"{fallback_label} - ${int(raw_value) / 100:.2f}")
+                        button._plan_code = aliases[0]  # type: ignore[attr-defined]
+                        button.setEnabled(True)
+                    else:
+                        button.setText(f"{fallback_label} - unavailable")
+                        button._plan_code = aliases[0]  # type: ignore[attr-defined]
+                        button.setEnabled(False)
 
             if requires_primary_email and not from_poll:
                 self.sub_checkout_status.setText("Before payment, enter your email address for receipts and subscription notifications.")
@@ -25297,6 +26508,12 @@ class MainWindow(QtWidgets.QWidget):
                     if not bool(getattr(self, "_subscription_poll_success_notified", False)):
                         self._subscription_poll_success_notified = True
                         self._show_toast("Payment confirmed. Subscription activated.")
+
+            # Update persistent subscription banner.
+            try:
+                self._update_subscription_banner(status_text, allowed, reason)
+            except Exception:
+                pass
 
         if not self._backend_post_async("/app/subscription/status", payload, on_done=_done, timeout=20.0):
             self._subscription_status_request_inflight = False
@@ -25532,8 +26749,8 @@ class MainWindow(QtWidgets.QWidget):
         self._backend_post_async("/app/profile/contact-email/status", payload, on_done=_done, timeout=20.0)
 
     def _start_subscription_checkout(self) -> None:
-        payload = self._subscription_identity_payload()
-        if not payload:
+        identity_candidates = self._subscription_identity_payload_candidates()
+        if not identity_candidates:
             self._show_toast("Missing backend identity. Complete login first.")
             return
 
@@ -25542,42 +26759,101 @@ class MainWindow(QtWidgets.QWidget):
             self._show_toast("Select a payment method first.")
             return
 
+        if bool(getattr(self, "_subscription_checkout_locked", False)):
+            self.sub_checkout_status.setText("An active payment session is already open. Complete it or wait for expiry before trying again.")
+            return
+
         plan_code = self._subscription_plan_code()
         if not plan_code:
             self._show_toast("Choose a plan first.")
             return
 
         provider, payment_method, guide_key = selected
-        payload.update(
-            {
-                "provider": provider,
-                "payment_method": payment_method,
-                "plan_code": plan_code,
-                "plan_interval": self._subscription_plan_interval(),  # backwards compat
-            }
-        )
 
-        def _run_checkout(checkout_payload: dict) -> None:
+        def _build_checkout_payload(base_identity: dict) -> dict:
+            checkout_payload = dict(base_identity or {})
+            checkout_payload.update(
+                {
+                    "provider": provider,
+                    "payment_method": payment_method,
+                    "plan_code": plan_code,
+                    "plan_interval": self._subscription_plan_interval(),  # backwards compat
+                }
+            )
+            return checkout_payload
+
+        def _is_license_forbidden_error(resp: Optional[dict]) -> bool:
+            if not isinstance(resp, dict):
+                return False
+            status = str(resp.get("status") or "").strip().upper()
+            msg = str(resp.get("message") or "").strip().lower()
+            return (
+                (status == "INVALID" and "invalid license" in msg)
+                or (status == "HTTP_ERROR" and ("403" in msg or "forbidden" in msg))
+            )
+
+        def _run_checkout(checkout_payload: dict, identity_index: int) -> None:
             self._subscription_stop_status_polling()
             self._subscription_last_payment_id = ""
             self._subscription_last_payment_session_id = ""
             self._subscription_set_method_buttons_enabled(False)
-            self.sub_checkout_status.setText("Preparing payment session...")
-            self.sub_payment_detail_body.setText("Preparing payment session...")
+            self._update_subscription_continue_button_state()
+            self.sub_checkout_status.setText("Processing your request, please wait.")
 
             def _done(resp: Optional[dict]) -> None:
                 self._subscription_set_method_buttons_enabled(True)
                 if not isinstance(resp, dict):
                     self.sub_checkout_status.setText("Checkout failed: invalid response.")
+                    self._subscription_checkout_locked = False
+                    self._update_subscription_continue_button_state()
                     self._show_toast("Checkout failed.")
                     return
                 response_status = str(resp.get("status") or "").upper()
                 if response_status != "OK":
+                    if _is_license_forbidden_error(resp) and identity_index + 1 < len(identity_candidates):
+                        next_payload = _build_checkout_payload(identity_candidates[identity_index + 1])
+                        _run_checkout(next_payload, identity_index + 1)
+                        return
+
+                    code = str(resp.get("code") or "").upper()
                     msg = str(resp.get("message") or "Checkout failed").strip()
-                    self.sub_checkout_status.setText(f"Checkout failed: {msg}")
-                    if response_status == "EMAIL_REQUIRED":
+
+                    if code == "ACTIVE_SUBSCRIPTION_BLOCKED":
+                        days_until = int(resp.get("days_until_renewal_window") or 0)
+                        renewal_days = int(resp.get("renewal_window_days") or 5)
+                        if days_until > 0:
+                            msg = (
+                                f"Your subscription is still active. Renewal opens in {days_until} day(s) "
+                                f"(within {renewal_days} days of expiry)."
+                            )
+                        else:
+                            msg = "Your subscription is active and within the renewal window. You may renew now."
+                    elif code == "PENDING_PAYMENT_EXISTS":
+                        pending = resp.get("payment") if isinstance(resp.get("payment"), dict) else {}
+                        prov_name = str(pending.get("provider") or "").strip().capitalize()
+                        expires_raw = str(pending.get("expires_at") or "").strip()
+                        expires_display = expires_raw[:16].replace("T", " ") + " UTC" if expires_raw else ""
+                        parts = ["You already have an open payment session."]
+                        if prov_name:
+                            parts.append(f"Provider: {prov_name}.")
+                        if expires_display:
+                            parts.append(f"Expires: {expires_display}.")
+                        parts.append("Complete it or cancel it before starting a new one.")
+                        msg = " ".join(parts)
+                    elif code == "AMOUNT_MISMATCH_REFUND_QUEUED":
+                        msg = (
+                            "A payment amount mismatch was detected. A full refund has been requested "
+                            "and no subscription was activated. Contact support if the refund does not arrive."
+                        )
+                    elif code == "SESSION_CANCELED":
+                        msg = "Your payment session was canceled. Select a plan and payment method to try again."
+                    elif response_status == "EMAIL_REQUIRED" or code == "EMAIL_REQUIRED":
                         self._subscription_requires_primary_email = True
-                    self._show_toast(msg)
+
+                    self.sub_checkout_status.setText(msg)
+                    self._subscription_checkout_locked = False
+                    self._update_subscription_continue_button_state()
+                    self._show_toast(msg[:80] if len(msg) > 80 else msg)
                     return
 
                 payment = resp.get("payment") if isinstance(resp.get("payment"), dict) else {}
@@ -25585,13 +26861,11 @@ class MainWindow(QtWidgets.QWidget):
                 self._subscription_last_payment_session_id = str(payment.get("payment_session_id") or "").strip()
                 checkout_url = str(payment.get("checkout_url") or "").strip()
                 expires_at = str(payment.get("expires_at") or "").strip()
-                self.sub_checkout_status.setText("Payment session ready. Complete payment and wait for automatic confirmation.")
+                self.sub_checkout_status.setText("Payment session ready. Redirecting to secure checkout...")
 
                 guide = resp.get("guide") if isinstance(resp.get("guide"), dict) else None
                 if guide is None:
                     fallback_guides = {
-                        "crypto": {"title": "Crypto checkout", "steps": ["Send the exact amount to the displayed wallet address."]},
-                        "card": {"title": "Card checkout", "steps": ["Open the secure checkout page and complete card verification."]},
                         "bank_transfer": {"title": "Bank transfer checkout", "steps": ["Open the secure checkout page and complete the transfer."]},
                     }
                     guide = fallback_guides.get(guide_key)
@@ -25609,53 +26883,70 @@ class MainWindow(QtWidgets.QWidget):
                     interval_sec=int(payment.get("poll_interval_sec") or 5),
                 )
 
+                self.sub_checkout_status.setText("Processing your request, please wait. Opening secure checkout in your browser...")
                 try:
                     webbrowser.open(checkout_url, new=1, autoraise=True)
+                    self._subscription_checkout_locked = True
+                    self._update_subscription_continue_button_state()
+                    self.sub_checkout_status.setText("Secure checkout opened. Complete payment and wait for automatic confirmation.")
                 except Exception:
-                    pass
+                    self._subscription_checkout_locked = False
+                    self._update_subscription_continue_button_state()
+                    self.sub_checkout_status.setText("Unable to open browser automatically. Use the secure payment link shown above.")
                 self._show_toast("Secure payment page opened in your browser.")
 
             if not self._backend_post_async("/app/subscription/checkout", checkout_payload, on_done=_done, timeout=25.0):
                 self._subscription_set_method_buttons_enabled(True)
+                self._subscription_checkout_locked = False
+                self._update_subscription_continue_button_state()
                 self.sub_checkout_status.setText("Unable to contact backend.")
                 self._show_toast("Unable to contact backend.")
 
-        status_payload = self._subscription_identity_payload()
-        if not status_payload:
-            self._show_toast("Missing backend identity. Complete login first.")
-            return
-
         self.sub_checkout_status.setText("Checking contact email status...")
 
-        def _after_status(resp: Optional[dict]) -> None:
-            if not isinstance(resp, dict) or str(resp.get("status") or "").upper() != "OK":
+        def _check_contact_status(identity_index: int) -> None:
+            status_payload = dict(identity_candidates[identity_index])
+
+            def _after_status(resp: Optional[dict]) -> None:
+                if _is_license_forbidden_error(resp) and identity_index + 1 < len(identity_candidates):
+                    _check_contact_status(identity_index + 1)
+                    return
+
+                if not isinstance(resp, dict) or str(resp.get("status") or "").upper() != "OK":
+                    backend_msg = str((resp or {}).get("message") or "Unable to verify contact email. Please retry.").strip()
+                    self.sub_checkout_status.setText(backend_msg)
+                    self._show_toast(backend_msg[:80] if len(backend_msg) > 80 else backend_msg)
+                    return
+
+                contact = resp.get("contact") if isinstance(resp.get("contact"), dict) else {}
+                primary_email = str(contact.get("primary_email") or "").strip().lower()
+                stored_first_name = str(contact.get("first_name") or "").strip()
+                requires_primary_email = bool(contact.get("requires_primary_email", not bool(primary_email)))
+                requires_first_name = bool(contact.get("requires_first_name", not bool(stored_first_name)))
+
+                self._subscription_primary_contact_email = primary_email
+                self._subscription_requires_primary_email = requires_primary_email
+                self._subscription_contact_first_name = stored_first_name
+
+                if requires_primary_email or requires_first_name:
+                    self.sub_checkout_status.setText("Add your contact info first to continue with payment.")
+                    self._subscription_checkout_locked = False
+                    self._update_subscription_continue_button_state()
+                    self._ensure_profile_contact_email_prompt(force=True)
+                    return
+
+                checkout_payload = _build_checkout_payload(status_payload)
+                checkout_payload["contact_email"] = primary_email
+                _run_checkout(checkout_payload, identity_index)
+
+            if not self._backend_post_async("/app/profile/contact-email/status", status_payload, on_done=_after_status, timeout=20.0):
+                self._subscription_checkout_locked = False
+                self._update_subscription_continue_button_state()
                 self.sub_checkout_status.setText("Unable to verify contact email. Please retry.")
-                self._show_toast("Unable to verify contact email.")
+                self._show_toast("Unable to contact backend.")
                 return
 
-            contact = resp.get("contact") if isinstance(resp.get("contact"), dict) else {}
-            primary_email = str(contact.get("primary_email") or "").strip().lower()
-            stored_first_name = str(contact.get("first_name") or "").strip()
-            requires_primary_email = bool(contact.get("requires_primary_email", not bool(primary_email)))
-            requires_first_name = bool(contact.get("requires_first_name", not bool(stored_first_name)))
-
-            self._subscription_primary_contact_email = primary_email
-            self._subscription_requires_primary_email = requires_primary_email
-            self._subscription_contact_first_name = stored_first_name
-
-            if requires_primary_email or requires_first_name:
-                self.sub_checkout_status.setText("Add your contact info first to continue with payment.")
-                self._ensure_profile_contact_email_prompt(force=True)
-                return
-
-            checkout_payload = dict(payload)
-            checkout_payload["contact_email"] = primary_email
-            _run_checkout(checkout_payload)
-
-        if not self._backend_post_async("/app/profile/contact-email/status", status_payload, on_done=_after_status, timeout=20.0):
-            self.sub_checkout_status.setText("Unable to verify contact email. Please retry.")
-            self._show_toast("Unable to contact backend.")
-            return
+        _check_contact_status(0)
 
         # Payments are hosted-only. The app never renders card/bank forms or collects payment details.
 
@@ -25768,10 +27059,12 @@ class MainWindow(QtWidgets.QWidget):
             account_type = (getattr(self, "current_account_type", None) or "prop").lower()
 
             # Only allow logout for the currently-selected context *if* the EA
-            # is actually logged in for that context.
+            # is authorized (DB seat is bound). Heartbeat presence (ea_active)
+            # is intentionally NOT required: a user must be able to release
+            # the seat even when the terminal lost internet.
             try:
                 ctx_state = self._get_ea_context_state(platform, account_type)
-                if not bool(ctx_state.get("known", False)) or (ctx_state.get("ea_active") is not True):
+                if not bool(ctx_state.get("known", False)) or (ctx_state.get("ea_authorized") is not True):
                     # Should be unreachable if the button is disabled, but keep safe.
                     self._update_logout_ea_button_state()
                     return
@@ -26031,7 +27324,9 @@ class MainWindow(QtWidgets.QWidget):
                 pass
 
     def _update_logout_ea_button_state(self) -> None:
-        """Enable 'Log out EA' only when EA is active for selected context."""
+        """Enable 'Log out EA' whenever the EA is authorized for the selected
+        context (DB binding present), regardless of current heartbeat presence.
+        This lets the user release the seat even after a network drop."""
         try:
             btn = getattr(self, "clear_cached_btn", None)
             if btn is None:
@@ -26039,7 +27334,7 @@ class MainWindow(QtWidgets.QWidget):
             platform = (getattr(self, "platform", None) or "mt5").lower()
             account_type = (getattr(self, "current_account_type", None) or "prop").lower()
             ctx_state = self._get_ea_context_state(platform, account_type)
-            enabled = bool(ctx_state.get("known", False)) and (ctx_state.get("ea_active") is True)
+            enabled = bool(ctx_state.get("known", False)) and (ctx_state.get("ea_authorized") is True)
             btn.setEnabled(enabled)
         except Exception:
             pass
@@ -26087,23 +27382,25 @@ class MainWindow(QtWidgets.QWidget):
             return text
         return None
 
-    def _ensure_platform_ea_state(self, platform: Optional[str] = None) -> Dict[str, Dict[str, Optional[bool]]]:
+    def _ensure_platform_ea_state(self, platform: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         platform_key = (platform or getattr(self, "platform", None) or "mt5").lower()
         if platform_key not in {"mt4", "mt5"}:
             platform_key = "mt5"
         platform_state = self.ea_states.setdefault(platform_key, {})
         for acct in ("prop", "normal"):
             if acct not in platform_state or not isinstance(platform_state.get(acct), dict):
-                platform_state[acct] = {"ea_active": None, "known": False}
+                platform_state[acct] = {"ea_active": None, "ea_authorized": False, "known": False, "last_seen_at": None}
             else:
                 platform_state[acct].setdefault("ea_active", None)
+                platform_state[acct].setdefault("ea_authorized", False)
                 platform_state[acct].setdefault("known", False)
+                platform_state[acct].setdefault("last_seen_at", None)
         return platform_state
 
-    def _get_ea_context_state(self, platform: Optional[str] = None, account_type: Optional[str] = None) -> Dict[str, Optional[bool]]:
+    def _get_ea_context_state(self, platform: Optional[str] = None, account_type: Optional[str] = None) -> Dict[str, Any]:
         platform_state = self._ensure_platform_ea_state(platform)
         acct = self._normalize_account_type(account_type) or "prop"
-        return platform_state.setdefault(acct, {"ea_active": None, "known": False})
+        return platform_state.setdefault(acct, {"ea_active": None, "ea_authorized": False, "known": False, "last_seen_at": None})
 
     def _get_platform_active_account(self, platform: Optional[str] = None) -> Optional[str]:
         platform_state = self._ensure_platform_ea_state(platform)
@@ -26116,6 +27413,67 @@ class MainWindow(QtWidgets.QWidget):
     def _get_platform_ea_active(self, platform: Optional[str] = None) -> bool:
         platform_state = self._ensure_platform_ea_state(platform)
         return bool(platform_state.get("prop", {}).get("ea_active")) or bool(platform_state.get("normal", {}).get("ea_active"))
+
+    def _get_platform_ea_authorized(self, platform: Optional[str] = None) -> bool:
+        """True iff at least one account on this platform has a live DB authorization
+        (regardless of whether the EA's heartbeat is currently fresh)."""
+        platform_state = self._ensure_platform_ea_state(platform)
+        return bool(platform_state.get("prop", {}).get("ea_authorized")) or bool(platform_state.get("normal", {}).get("ea_authorized"))
+
+    def _format_offline_age(self, last_seen_iso: Optional[str]) -> str:
+        """Render 'last seen Ns ago' / 'Nm ago' / 'Nh ago'. Empty string if unknown."""
+        if not last_seen_iso:
+            return ""
+        try:
+            ts = str(last_seen_iso).strip()
+            if ts.endswith("Z"):
+                ts = ts[:-1] + "+00:00"
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - dt
+            secs = int(max(0, delta.total_seconds()))
+            if secs < 60:
+                return f"{secs}s ago"
+            mins = secs // 60
+            if mins < 60:
+                return f"{mins}m ago"
+            hours = mins // 60
+            if hours < 24:
+                return f"{hours}h ago"
+            days = hours // 24
+            return f"{days}d ago"
+        except Exception:
+            return ""
+
+    def _ea_lock_banner_text(self, platform: Optional[str] = None) -> str:
+        """Build the locked-settings banner text. Distinguishes 'never logged in /
+        seat revoked' from 'authorized but EA temporarily offline'."""
+        plat = (platform or getattr(self, "platform", None) or "mt5").lower()
+        selected = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop") or "prop"
+        ctx = self._get_ea_context_state(plat, selected)
+        authorized = ctx.get("ea_authorized") is True
+        if not authorized:
+            return f"❌ Please login your EA first. Go to Expert → {plat.upper()} and connect your EA."
+        # Authorized but offline: softer copy with last-seen age.
+        age = self._format_offline_age(ctx.get("last_seen_at"))
+        if age:
+            return f"⚠ EA offline — last seen {age}. Reconnect to apply changes."
+        return "⚠ EA offline — reconnect to apply changes."
+
+    def _ea_offline_toast_text(self, platform: Optional[str] = None) -> str:
+        """Toast variant of the banner (used when an action is blocked due to
+        EA presence). 'Please login' if not authorized; 'EA offline' otherwise."""
+        plat = (platform or getattr(self, "platform", None) or "mt5").lower()
+        selected = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop") or "prop"
+        ctx = self._get_ea_context_state(plat, selected)
+        authorized = ctx.get("ea_authorized") is True
+        if not authorized:
+            return f"❌ Please login your EA first. Go to Expert → {plat.upper()} and connect your EA."
+        age = self._format_offline_age(ctx.get("last_seen_at"))
+        if age:
+            return f"⚠ EA offline (last seen {age}) — please reconnect, then try again."
+        return "⚠ EA offline — please reconnect, then try again."
 
     def _apply_platform_ea_state_from_response(self, auth_params: dict, response: Optional[dict]) -> None:
             """Update per-platform EA state from any backend response.
@@ -26147,6 +27505,10 @@ class MainWindow(QtWidgets.QWidget):
             target_acct = self._normalize_account_type(auth_params.get("account_type"))
 
             platform_state = self._ensure_platform_ea_state(platform)
+            # If the backend explicitly says LOGGED_OUT, that means the DB binding
+            # is no longer ours (revoked or terminal mismatch). Drop authorization.
+            status_str = str((response.get("status") or "")).upper()
+            is_logged_out = status_str == "LOGGED_OUT"
             if ea_active_value is not None:
                 ea_active = bool(ea_active_value)
                 if not ea_active:
@@ -26154,17 +27516,23 @@ class MainWindow(QtWidgets.QWidget):
                     if target_acct in {"prop", "normal"}:
                         platform_state[target_acct]["ea_active"] = False
                         platform_state[target_acct]["known"] = True
+                        if is_logged_out:
+                            platform_state[target_acct]["ea_authorized"] = False
                 else:
                     acct_to_set = active or target_acct
                     if acct_to_set in {"prop", "normal"}:
                         platform_state[acct_to_set]["ea_active"] = True
+                        # Active implies authorized.
+                        platform_state[acct_to_set]["ea_authorized"] = True
                         platform_state[acct_to_set]["known"] = True
             elif active:
                 platform_state[active]["ea_active"] = True
+                platform_state[active]["ea_authorized"] = True
                 platform_state[active]["known"] = True
 
             if platform == current_platform:
                 self.ea_active = self._get_platform_ea_active(platform)
+                self.ea_authorized = self._get_platform_ea_authorized(platform)
                 self._ea_active_account = self._get_platform_active_account(platform)
 
             # Capture terminal binding info when backend provides it.
@@ -26249,9 +27617,7 @@ class MainWindow(QtWidgets.QWidget):
         try:
             self.settings_lock_banner.setVisible(locked)
             if locked:
-                self.settings_lock_banner.setText(
-                    f"❌ Please login your EA first. Go to Expert → {self.platform.upper()} and connect your EA."
-                )
+                self.settings_lock_banner.setText(self._ea_lock_banner_text(platform))
         except Exception:
             pass
 

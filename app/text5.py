@@ -12948,20 +12948,28 @@ class MainWindow(QtWidgets.QWidget):
         self.sub_plan_day_btn = QtWidgets.QPushButton("Daily - loading...")
         self.sub_plan_day_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.sub_plan_day_btn.setCheckable(True)
+        self.sub_plan_day_btn._plan_label_base = "Daily - loading..."  # type: ignore[attr-defined]
         self.sub_plan_week_btn = QtWidgets.QPushButton("Weekly - loading...")
         self.sub_plan_week_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.sub_plan_week_btn.setCheckable(True)
+        self.sub_plan_week_btn._plan_label_base = "Weekly - loading..."  # type: ignore[attr-defined]
         self.sub_plan_month_btn = QtWidgets.QPushButton("Monthly - loading...")
         self.sub_plan_month_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.sub_plan_month_btn.setCheckable(True)
+        self.sub_plan_month_btn._plan_label_base = "Monthly - loading..."  # type: ignore[attr-defined]
         self.sub_plan_year_btn = QtWidgets.QPushButton("Yearly - loading...")
         self.sub_plan_year_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.sub_plan_year_btn.setCheckable(True)
+        self.sub_plan_year_btn._plan_label_base = "Yearly - loading..."  # type: ignore[attr-defined]
         sub_plan_row_layout.addWidget(self.sub_plan_day_btn, 0, 0)
         sub_plan_row_layout.addWidget(self.sub_plan_week_btn, 0, 1)
         sub_plan_row_layout.addWidget(self.sub_plan_month_btn, 1, 0)
         sub_plan_row_layout.addWidget(self.sub_plan_year_btn, 1, 1)
         method_layout.addWidget(sub_plan_row)
+
+        self.sub_plan_selected_label = QtWidgets.QLabel("Selected plan: ○ None")
+        self.sub_plan_selected_label.setWordWrap(True)
+        method_layout.addWidget(self.sub_plan_selected_label)
 
         self.sub_payment_heading = QtWidgets.QLabel("Payment Options")
         self.sub_payment_heading.setObjectName("title")
@@ -12976,7 +12984,7 @@ class MainWindow(QtWidgets.QWidget):
         self.sub_payment_methods_hint.setWordWrap(True)
         self.sub_payment_methods_panel_layout.addWidget(self.sub_payment_methods_hint)
 
-        self.sub_bank_radio = QtWidgets.QRadioButton("🏦 Banks Payment Method")
+        self.sub_bank_radio = QtWidgets.QRadioButton("🏦 Bank Payment (Card, Transfer, and more)")
         self.sub_bank_radio.setCursor(QtCore.Qt.PointingHandCursor)
 
         self.sub_payment_methods_panel_layout.addWidget(self.sub_bank_radio)
@@ -13052,6 +13060,7 @@ class MainWindow(QtWidgets.QWidget):
         self.subscription_method_group = QtWidgets.QButtonGroup(self)
         self.subscription_method_group.setExclusive(True)
         self.subscription_method_group.addButton(self.sub_bank_radio)
+        self._subscription_refresh_plan_selection_ui()
 
         self._subscription_last_payment_id = ""
         self._subscription_last_payment_session_id = ""
@@ -26049,7 +26058,7 @@ class MainWindow(QtWidgets.QWidget):
 
     def _subscription_selected_provider(self) -> Optional[Tuple[str, str, str]]:
         if bool(getattr(self, "sub_bank_radio", None) and self.sub_bank_radio.isChecked()):
-            return "flutterwave", "bank_transfer", "bank_transfer"
+            return "flutterwave", "bank_transfer", "bank_payment"
         return None
 
     def _subscription_plan_buttons(self) -> List[Tuple[str, QtWidgets.QPushButton, str, Tuple[str, ...]]]:
@@ -26094,13 +26103,30 @@ class MainWindow(QtWidgets.QWidget):
                 if plan:
                     price = int(plan.get("price_usd_cents") or 0)
                     label = f"{plan.get('display_name', fallback_label)} - ${price / 100:.2f}"
-                    button.setText(label)
+                    button._plan_label_base = label  # type: ignore[attr-defined]
                     button._plan_code = str(plan.get("plan_code") or aliases[0])  # type: ignore[attr-defined]
                     button.setEnabled(bool(plan.get("is_active", True)))
                 else:
-                    button.setText(f"{fallback_label} - unavailable")
+                    button._plan_label_base = f"{fallback_label} - unavailable"  # type: ignore[attr-defined]
                     button._plan_code = aliases[0]  # type: ignore[attr-defined]
                     button.setEnabled(False)
+            self._subscription_refresh_plan_selection_ui()
+        except Exception:
+            pass
+
+    def _subscription_refresh_plan_selection_ui(self) -> None:
+        selected_label = "○ None"
+        for _interval, button, fallback_label, _aliases in self._subscription_plan_buttons():
+            base_label = str(getattr(button, "_plan_label_base", "") or "").strip()
+            if not base_label:
+                base_label = fallback_label
+            if bool(getattr(button, "isChecked", lambda: False)()):
+                button.setText(f"◉ {base_label}")
+                selected_label = base_label
+            else:
+                button.setText(f"○ {base_label}")
+        try:
+            self.sub_plan_selected_label.setText(f"Selected plan: {selected_label}")
         except Exception:
             pass
 
@@ -26224,6 +26250,8 @@ class MainWindow(QtWidgets.QWidget):
                 if other_interval != interval:
                     button.setChecked(False)
 
+        self._subscription_refresh_plan_selection_ui()
+
         selected_plan = self._subscription_plan_interval()
         has_plan = bool(selected_plan)
 
@@ -26236,7 +26264,7 @@ class MainWindow(QtWidgets.QWidget):
         self.sub_payment_methods_panel.setVisible(has_plan)
 
         if has_plan:
-            self.sub_payment_methods_hint.setText("Select Bank Transfer. FlameBot will confirm your payment automatically.")
+            self.sub_payment_methods_hint.setText("Select Bank Payment. You can pay with card, bank transfer, and other Flutterwave options.")
             self.sub_steps_label.setText("Select a payment option, then click Continue with Payment.")
             self._subscription_reset_payment_details("Select a payment method, then click Continue with Payment.")
             self._update_subscription_continue_button_state()
@@ -26866,7 +26894,7 @@ class MainWindow(QtWidgets.QWidget):
                 guide = resp.get("guide") if isinstance(resp.get("guide"), dict) else None
                 if guide is None:
                     fallback_guides = {
-                        "bank_transfer": {"title": "Bank transfer checkout", "steps": ["Open the secure checkout page and complete the transfer."]},
+                        "bank_payment": {"title": "Bank payment checkout", "steps": ["Open the secure Flutterwave checkout page and choose card, transfer, or another available method."]},
                     }
                     guide = fallback_guides.get(guide_key)
                 self._render_checkout_steps(guide)

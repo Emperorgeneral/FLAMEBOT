@@ -335,10 +335,33 @@ _MANAGED_TG_APP_CACHE: dict = {
 
 _MANAGED_TG_APP_LOCK = threading.Lock()
 
-# Embedded fallback credentials (used if no env vars or telegram_app.json are found).
-# To rotate without rebuilding, prefer placing a new file at SESSION_DIR/telegram_app.json.
-EMBEDDED_TG_API_ID: int = 29469742
-EMBEDDED_TG_API_HASH: str = "74dc4ae153e1222ad40fafdd30126d00"
+# Embedded fallback credentials.
+#
+# IMPORTANT: These are intentionally blank. The previous build shipped a real
+# Telegram api_id / api_hash compiled into the binary; that pair is now
+# considered PUBLICLY COMPROMISED and has been (must be) rotated.
+#
+# The supported ways to provide credentials, in order of precedence:
+#   1. Environment vars FLAMEBOT_TG_EXPORT_API_ID / _API_HASH (developer escape hatch).
+#   2. A `telegram_app.json` file shipped next to the EXE
+#      (PyInstaller `--add-data telegram_app.json;.`) or placed under SESSION_DIR.
+#   3. A backend-issued credential fetched at runtime over authenticated HTTPS
+#      (see _fetch_managed_tg_app_from_backend below) and cached at
+#      SESSION_DIR/telegram_app.json.
+#
+# Do NOT re-introduce hard-coded credentials in source. Any value committed
+# here must be treated as published to the world.
+EMBEDDED_TG_API_ID: int = 0
+EMBEDDED_TG_API_HASH: str = ""
+
+# Build-time bearer for /v1/telegram_app_credentials. Leave empty in source.
+# The release build script (e.g. build_windows.ps1) is expected to overwrite
+# this line with the production token before invoking PyInstaller, e.g.:
+#   (Get-Content app\text5.py) -replace '_BUILD_TG_APP_FETCH_TOKEN = ""',
+#       "_BUILD_TG_APP_FETCH_TOKEN = ""$env:FLAMEBOT_TG_APP_FETCH_TOKEN""" |
+#       Set-Content app\text5.py
+# At runtime FLAMEBOT_TG_APP_FETCH_TOKEN env var still takes precedence.
+_BUILD_TG_APP_FETCH_TOKEN: str = ""
 
 
 def _find_telegram_app_config_file() -> Optional[Path]:
@@ -402,6 +425,94 @@ def _find_telegram_app_config_file() -> Optional[Path]:
     return None
 
 
+def _fetch_managed_tg_app_from_backend(*, timeout: float = 8.0) -> Tuple[int, str]:
+    """Best-effort: ask the backend for current Telegram app credentials.
+
+    Returns (api_id, api_hash) on success, or (0, "") on any failure.
+
+    Security notes:
+    - HTTPS-only. The URL is taken from BACKEND_BASE_URL (env-overridable).
+    - Sends the shared bearer (FLAMEBOT_TG_APP_FETCH_TOKEN) in the
+      ``X-FlameBot-App-Token`` header.  Without a configured bearer the
+      function does not even hit the network: the backend would reject us
+      anyway.  The bearer is read from one of, in order:
+        1. env var FLAMEBOT_TG_APP_FETCH_TOKEN
+        2. embedded build-time constant ``_BUILD_TG_APP_FETCH_TOKEN``
+           (populated by the installer build script; see build_windows.ps1)
+    - The response is cached on disk at SESSION_DIR/telegram_app.json so we
+      do not refetch on every launch and remain functional offline once
+      provisioned.
+    - We never log api_hash, the bearer, or the request URL with credentials.
+    - We never raise; all failures collapse to (0, "").
+    - This function does NOT bypass the existing env / file precedence; it is
+      called only as a last-resort fallback when no other source is present.
+    """
+    try:
+        base = str(BACKEND_BASE_URL or "").rstrip("/")
+        if not base:
+            return 0, ""
+        if not base.lower().startswith("https://"):
+            # Refuse to fetch credentials over plaintext.
+            return 0, ""
+
+        # Resolve the shared bearer.  Without it, do not contact the server.
+        bearer = ""
+        try:
+            bearer = str(os.environ.get("FLAMEBOT_TG_APP_FETCH_TOKEN", "") or "").strip()
+        except Exception:
+            bearer = ""
+        if not bearer:
+            try:
+                bearer = str(_BUILD_TG_APP_FETCH_TOKEN or "").strip()  # type: ignore[name-defined]
+            except Exception:
+                bearer = ""
+        if not bearer:
+            return 0, ""
+
+        url = base + "/v1/telegram_app_credentials"
+
+        req = urllib.request.Request(  # type: ignore[name-defined]
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "FlameBot-Desktop",
+                "X-FlameBot-App-Token": bearer,
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=float(timeout)) as resp:  # type: ignore[name-defined]
+            raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw or "{}") or {}
+
+        api_id_val = 0
+        try:
+            api_id_val = int(str(data.get("api_id", "") or "").strip() or 0)
+        except Exception:
+            api_id_val = 0
+        api_hash_val = str(data.get("api_hash", "") or "").strip()
+
+        if api_id_val <= 0 or not api_hash_val:
+            return 0, ""
+
+        # Persist for offline reuse. Best-effort, do not fail the call.
+        try:
+            SESSION_DIR.mkdir(parents=True, exist_ok=True)
+            target = SESSION_DIR / "telegram_app.json"
+            payload = json.dumps({"api_id": int(api_id_val), "api_hash": str(api_hash_val)})
+            target.write_text(payload, encoding="utf-8")
+            try:
+                # POSIX: tighten to user-only. No-op on Windows.
+                os.chmod(str(target), 0o600)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        return int(api_id_val), str(api_hash_val)
+    except Exception:
+        return 0, ""
+
+
 def _get_managed_telegram_app_credentials() -> Tuple[int, str, str]:
     """Return (api_id, api_hash, source).
 
@@ -426,10 +537,17 @@ def _get_managed_telegram_app_credentials() -> Tuple[int, str, str]:
 
     cfg = _find_telegram_app_config_file()
     if not cfg:
-        # Fallback to embedded credentials when no file is present
+        # Fallback 1: embedded constants (intentionally blank in production builds).
         try:
             if int(EMBEDDED_TG_API_ID or 0) > 0 and str(EMBEDDED_TG_API_HASH or "").strip():
                 return int(EMBEDDED_TG_API_ID), str(EMBEDDED_TG_API_HASH).strip(), "embedded"
+        except Exception:
+            pass
+        # Fallback 2: ask the backend (HTTPS) and cache the result on disk.
+        try:
+            api_id_b, api_hash_b = _fetch_managed_tg_app_from_backend()
+            if api_id_b > 0 and api_hash_b:
+                return int(api_id_b), str(api_hash_b), "backend"
         except Exception:
             pass
         return 0, "", ""
@@ -473,10 +591,16 @@ def _get_managed_telegram_app_credentials() -> Tuple[int, str, str]:
         api_hash_val = ""
 
     if api_id_val <= 0 or not api_hash_val:
-        # If the JSON is missing/invalid, use embedded fallback
+        # If the JSON is missing/invalid, try embedded constants then backend.
         try:
             if int(EMBEDDED_TG_API_ID or 0) > 0 and str(EMBEDDED_TG_API_HASH or "").strip():
                 return int(EMBEDDED_TG_API_ID), str(EMBEDDED_TG_API_HASH).strip(), "embedded"
+        except Exception:
+            pass
+        try:
+            api_id_b, api_hash_b = _fetch_managed_tg_app_from_backend()
+            if api_id_b > 0 and api_hash_b:
+                return int(api_id_b), str(api_hash_b), "backend"
         except Exception:
             pass
         return 0, "", ""

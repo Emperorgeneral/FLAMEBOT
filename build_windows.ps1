@@ -21,6 +21,45 @@ if ($SkipDeps) {
 Write-Host "[2/4] Building with PyInstaller" -ForegroundColor Cyan
 $entry = Join-Path $root 'app\flamebot_entry.py'
 
+# ---------------------------------------------------------------------------
+# Inject the production fetch bearer for /v1/telegram_app_credentials so the
+# shipped EXE can request the managed Telegram api_id/api_hash from the backend
+# without users having to set FLAMEBOT_TG_APP_FETCH_TOKEN themselves.
+#
+# Required: $env:FLAMEBOT_TG_APP_FETCH_TOKEN must be set in this shell before
+# running this script. The script restores text5.py to its committed state
+# after PyInstaller finishes (success or failure), so the token is never left
+# in the source tree on disk.
+# ---------------------------------------------------------------------------
+$text5Path = Join-Path $root 'app\text5.py'
+$text5Backup = "$text5Path.buildbak"
+$text5Patched = $false
+$buildToken = [string]$env:FLAMEBOT_TG_APP_FETCH_TOKEN
+if ([string]::IsNullOrWhiteSpace($buildToken)) {
+  Write-Host "WARNING: FLAMEBOT_TG_APP_FETCH_TOKEN is not set in this shell." -ForegroundColor Yellow
+  Write-Host "         The built EXE will NOT be able to fetch managed Telegram credentials" -ForegroundColor Yellow
+  Write-Host "         from the backend on first launch. Users would have to set the env" -ForegroundColor Yellow
+  Write-Host "         var manually. Aborting build to avoid shipping a broken installer." -ForegroundColor Yellow
+  throw "FLAMEBOT_TG_APP_FETCH_TOKEN env var is required for release builds."
+}
+if ($buildToken -match '"') {
+  throw "FLAMEBOT_TG_APP_FETCH_TOKEN must not contain double-quote characters."
+}
+
+Copy-Item -LiteralPath $text5Path -Destination $text5Backup -Force
+$text5Patched = $true
+$content = Get-Content -LiteralPath $text5Path -Raw
+$placeholder = '_BUILD_TG_APP_FETCH_TOKEN: str = ""'
+$replacement = "_BUILD_TG_APP_FETCH_TOKEN: str = `"$buildToken`""
+if (-not $content.Contains($placeholder)) {
+  Remove-Item -LiteralPath $text5Backup -Force -ErrorAction SilentlyContinue
+  throw "Could not find _BUILD_TG_APP_FETCH_TOKEN placeholder in app\text5.py."
+}
+# Use literal replacement (single occurrence expected).
+$patched = [string]$content.Replace($placeholder, $replacement)
+Set-Content -LiteralPath $text5Path -Value $patched -Encoding UTF8 -NoNewline
+Write-Host "Injected build-time fetch token into app\text5.py (will be reverted after build)." -ForegroundColor DarkGray
+
 $pyiArgs = @(
   '--noconfirm',
   '--clean',
@@ -46,8 +85,16 @@ if (Test-Path -LiteralPath (Join-Path $root 'app\telegram_app.json')) {
 }
 
 # Add bundled EA binaries into the dist folder under "eas/".
-& $Python -m PyInstaller @pyiArgs $entry
-if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+try {
+  & $Python -m PyInstaller @pyiArgs $entry
+  if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+}
+finally {
+  if ($text5Patched -and (Test-Path -LiteralPath $text5Backup)) {
+    Move-Item -LiteralPath $text5Backup -Destination $text5Path -Force
+    Write-Host "Restored app\text5.py to its pre-build state." -ForegroundColor DarkGray
+  }
+}
 
 Write-Host "[3/4] Copying helper installer script" -ForegroundColor Cyan
 Copy-Item -Force .\Install_EAs.ps1 .\dist\FlameBot\Install_EAs.ps1

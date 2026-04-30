@@ -12,3 +12,7 @@ signals.ndjson
 signals.json
 .tmp_git_state.txt
 .tmp_git_*.txt
+.env
+.env.local
+*.env
+!*.env.example

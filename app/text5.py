@@ -5601,6 +5601,7 @@ class TelegramWorker(QtCore.QThread):
 
         # Persist per-chat cursors so app restarts don't skip messages.
         self._persisted_last_ids: Dict[str, int] = {}
+        self._cursor_api_context: Dict[str, Any] = {"api_id": 0, "api_hash_fp": ""}
         self._cursor_save_handle = None
         self._load_persisted_cursors()
 
@@ -5788,6 +5789,63 @@ class TelegramWorker(QtCore.QThread):
                 continue
             cleaned[cid] = mid
         self._persisted_last_ids = cleaned
+        try:
+            ctx = obj.get("api_context") if isinstance(obj, dict) else None
+            if isinstance(ctx, dict):
+                self._cursor_api_context = {
+                    "api_id": int(ctx.get("api_id") or 0),
+                    "api_hash_fp": str(ctx.get("api_hash_fp") or "").strip(),
+                }
+        except Exception:
+            self._cursor_api_context = {"api_id": 0, "api_hash_fp": ""}
+
+    def _cursor_api_fingerprint(self, api_id: Optional[int], api_hash: Optional[str]) -> Dict[str, Any]:
+        try:
+            aid = int(api_id or 0)
+        except Exception:
+            aid = 0
+        try:
+            ah = str(api_hash or "")
+        except Exception:
+            ah = ""
+        fp = ""
+        if ah:
+            try:
+                fp = hashlib.sha256(ah.encode("utf-8", errors="ignore")).hexdigest()
+            except Exception:
+                fp = ""
+        return {"api_id": aid, "api_hash_fp": fp}
+
+    def _clear_persisted_cursors(self) -> None:
+        try:
+            self._persisted_last_ids.clear()
+        except Exception:
+            self._persisted_last_ids = {}
+        try:
+            self._last_message_ids.clear()
+        except Exception:
+            self._last_message_ids = {}
+        try:
+            self._cursor_api_context = {"api_id": 0, "api_hash_fp": ""}
+        except Exception:
+            pass
+        self._schedule_cursor_persist()
+
+    def _invalidate_persisted_cursors_if_api_changed(self, api_id: Optional[int], api_hash: Optional[str]) -> None:
+        current = self._cursor_api_fingerprint(api_id, api_hash)
+        try:
+            previous = dict(getattr(self, "_cursor_api_context", {}) or {})
+        except Exception:
+            previous = {}
+        previous_id = int(previous.get("api_id") or 0)
+        previous_fp = str(previous.get("api_hash_fp") or "").strip()
+        current_id = int(current.get("api_id") or 0)
+        current_fp = str(current.get("api_hash_fp") or "").strip()
+
+        # If Telegram app context changed, old cursors are unsafe and can replay history.
+        if (previous_id > 0 or previous_fp) and ((previous_id != current_id) or (previous_fp != current_fp)):
+            self._clear_persisted_cursors()
+        self._cursor_api_context = current
 
     def _get_persisted_last_id(self, chat_id: int) -> int:
         try:
@@ -5860,8 +5918,9 @@ class TelegramWorker(QtCore.QThread):
 
     async def _flush_cursors_to_disk(self) -> None:
         payload = {
-            "version": 1,
+            "version": 2,
             "updated_at": int(time.time()),
+            "api_context": self._cursor_api_fingerprint(getattr(self, "api_id", None), getattr(self, "api_hash", None)),
             "last_ids": dict(self._persisted_last_ids or {}),
         }
 
@@ -7083,6 +7142,7 @@ class TelegramWorker(QtCore.QThread):
         self.api_id = api_id
         self.api_hash = api_hash
         self.phone = phone
+        self._invalidate_persisted_cursors_if_api_changed(self.api_id, self.api_hash)
         # If the user was previously listening to chats, re-attach handlers to
         # this new client instance so messages keep showing.
         await self._restore_listeners_unlocked()
@@ -8947,6 +9007,7 @@ class TelegramWorker(QtCore.QThread):
         self.api_id = None
         self.api_hash = None
         self.phone = None
+        self._clear_persisted_cursors()
         self._message_handlers.clear()
         self._last_message_ids.clear()
         self._last_message_text.clear()
@@ -14970,7 +15031,7 @@ class MainWindow(QtWidgets.QWidget):
                 ids_to_resume = [gid for gid in self.group_order if gid in saved_listening_set]
                 def _resume_saved_listeners() -> None:
                     for g in ids_to_resume:
-                        self.worker.start_listening(g)
+                        self.worker.start_listening(g, catch_up=False)
 
                 QtCore.QTimer.singleShot(0, _resume_saved_listeners)
         except Exception:
@@ -27670,6 +27731,12 @@ class MainWindow(QtWidgets.QWidget):
                         platform_state[target_acct]["known"] = True
                         if is_logged_out:
                             platform_state[target_acct]["ea_authorized"] = False
+                    else:
+                        selected_acct = self._normalize_account_type(getattr(self, "current_account_type", None) or "prop") or "prop"
+                        platform_state[selected_acct]["ea_active"] = False
+                        platform_state[selected_acct]["known"] = True
+                        if is_logged_out:
+                            platform_state[selected_acct]["ea_authorized"] = False
                 else:
                     acct_to_set = active or target_acct
                     if acct_to_set in {"prop", "normal"}:
@@ -27732,6 +27799,9 @@ class MainWindow(QtWidgets.QWidget):
         ctx_state = self._get_ea_context_state(platform, selected_account)
         ea_active = ctx_state.get("ea_active") is True
         known = bool(ctx_state.get("known", False))
+        if not known:
+            # Avoid spinner flicker after we already observed this context before.
+            known = bool(ctx_state.get("ea_authorized") is True or ctx_state.get("last_seen_at"))
 
         # Keep logout button in sync with EA active context.
         self._update_logout_ea_button_state()
